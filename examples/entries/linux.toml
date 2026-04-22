@@ -1,0 +1,8 @@
+# Linux Unified Kernel Image Entry
+
+id = "linux"
+name = "Linux 6.11 (Fedora)"
+type = "uki"
+efi_path = "\\EFI\\Linux\\fedora-6.11.efi"
+options = "root=UUID=your-uuid-here rw quiet splash"
+icon = "linux"

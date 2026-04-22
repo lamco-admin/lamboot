@@ -1,0 +1,18 @@
+[package]
+name = "lamboot-core"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+uefi.workspace = true
+uefi-raw.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "lambootx64"
+path = "src/main.rs"

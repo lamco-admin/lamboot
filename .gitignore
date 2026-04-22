@@ -1,0 +1,45 @@
+# Rust build artifacts
+target/
+dist/
+**/*.rs.bk
+*.pdb
+
+# ESP images for testing
+*.img
+*.vhd
+
+# OVMF temp vars
+*_VARS.fd
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Reports
+reports/
+
+# Backup files
+*.bak
+*.orig
+
+# Signing keys — NEVER commit private key material
+# All key-related directories are ignored; public certs are distributed via
+# dist/ and release artifacts, not tracked in source. If you need to track a
+# specific public cert, use `git add -f keys/<name>.crt` deliberately.
+keys/
+keys-gen/
+keys-archive/
+*.key
+*.pem
+*_priv*
+
+# Root-level test signing artifacts (clean up stray certs from prior testing)
+PK-*.pem
+KEK-*.pem
+db-*.pem

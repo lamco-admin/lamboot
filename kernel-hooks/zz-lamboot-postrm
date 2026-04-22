@@ -1,0 +1,8 @@
+#!/bin/bash
+# /etc/kernel/postrm.d/zz-lamboot
+# Called by dpkg after a kernel is removed.
+# Arguments: KERNEL_VERSION
+
+[ -x /usr/local/bin/lamboot-kernel-hook ] || exit 0
+
+/usr/local/bin/lamboot-kernel-hook remove "$@"

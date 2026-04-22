@@ -1,0 +1,35 @@
+LamBoot is dual-licensed under the MIT License and the Apache License, Version 2.0,
+at your option.
+
+    SPDX-License-Identifier: MIT OR Apache-2.0
+
+The full license texts are in:
+
+    LICENSE-MIT     — MIT License
+    LICENSE-APACHE  — Apache License, Version 2.0
+
+You may choose either license for your use. Contributions to this project are
+accepted under the same dual license (inbound = outbound) unless stated
+otherwise in writing.
+
+=========================================================================
+Third-party binary notice
+=========================================================================
+
+Filesystem drivers distributed in dist/EFI/LamBoot/drivers/*.efi (ext4, btrfs,
+ntfs, xfs, zfs, f2fs, iso9660) are derived from the rEFInd project and are
+licensed GPL-2.0. They are distributed as separate binaries under the GPL
+linking exception and are not statically linked into the LamBoot bootloader
+binary. The LamBoot bootloader itself contains no GPL-licensed code.
+
+Source for the rEFInd filesystem drivers is available at:
+    https://www.rodsbooks.com/refind/
+
+=========================================================================
+Trademark notice
+=========================================================================
+
+"LamBoot" and the LamBoot logo are claimed marks of Lamco Development.
+Source-code forks are welcome under the MIT/Apache-2.0 license. Redistribution
+using the "LamBoot" name or logo for packaged binaries requires notice; see
+docs/WEBSITE-CONTENT.md §18 for details.

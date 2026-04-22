@@ -1,0 +1,2104 @@
+#!/bin/bash
+# lamboot-install — Install, update, or remove the LamBoot UEFI bootloader.
+#
+# Usage: lamboot-install [OPTIONS]
+#
+# See --help for full option list.
+# See docs/specs/SPEC-LAMBOOT-INSTALL.md for the complete specification.
+#
+# REQUIREMENTS
+# ============
+# Shell:       bash 4.0+ (for associative arrays, arithmetic evaluation)
+#              Will NOT work with dash, ash, busybox sh, or bash 3.x.
+#
+# Coreutils:   GNU coreutils OR Rust uutils/coreutils
+#              Used: basename, cat, chmod, cp, cut, date, df (--output),
+#                    dirname, head, mkdir, mktemp, mv, od, readlink (-f),
+#                    rm, rmdir, sha256sum, stat (-c), tail, touch, tr, xargs
+#
+# util-linux:  findmnt, lsblk, mount, mountpoint
+#              Present on all mainstream Linux distributions.
+#
+# UEFI tools:  efibootmgr (checked at runtime with distro-specific install hint)
+#
+# Optional:    systemctl (systemd — for service enable/disable; skipped if absent)
+#              file (for Arch Linux kernel version detection; skipped if absent)
+#              grep, sed, awk (POSIX-compatible versions sufficient)
+#
+# TESTED ON
+# =========
+# Fedora 43, Debian 13, Ubuntu 24.04, Arch Linux, openSUSE Tumbleweed
+# Alpine Linux (requires: apk add bash)
+#
+# NOT SUPPORTED
+# =============
+# - Non-Linux systems (macOS, FreeBSD — no UEFI ESP)
+# - RHEL 6 / CentOS 6 (bash 3.x)
+# - Environments without util-linux (findmnt, lsblk required)
+
+set -uo pipefail
+
+# Requires bash 4.0+ for associative arrays (declare -A)
+if [ "${BASH_VERSINFO[0]}" -lt 4 ] 2>/dev/null; then
+    echo "ERROR: lamboot-install requires bash 4.0 or later (found ${BASH_VERSION})." >&2
+    exit 1
+fi
+
+# --- Constants ---
+
+readonly LAMBOOT_VERSION="0.8.3"
+readonly LAMBOOT_LABEL="LamBoot"
+
+readonly EFI_DIR="EFI/LamBoot"
+readonly EFI_LOADER_PATH="\\EFI\\LamBoot\\lambootx64.efi"
+readonly EFI_LOADER_PATH_AA64="\\EFI\\LamBoot\\lambootaa64.efi"
+readonly FALLBACK_DIR="EFI/BOOT"
+readonly FALLBACK_NAME_X64="BOOTX64.EFI"
+readonly FALLBACK_NAME_AA64="BOOTAA64.EFI"
+
+readonly MANIFEST_FILE=".install-manifest"
+readonly MANIFEST_PATH="EFI/LamBoot/${MANIFEST_FILE}"
+
+readonly ESP_PARTTYPE_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+readonly MIN_ESP_SPACE_KIB=2048
+
+readonly SYSTEMD_UNIT_DIR="/usr/lib/systemd/system"
+readonly KERNEL_INSTALL_DIR="/usr/lib/kernel/install.d"
+
+readonly BLS_DIR="loader/entries"
+
+readonly EXIT_OK=0
+readonly EXIT_ERROR=1
+readonly EXIT_PARTIAL=2
+readonly EXIT_NOOP=3
+
+# --- Global State ---
+
+OPT_ESP=""
+OPT_NO_EFI_ENTRY=0
+OPT_SET_DEFAULT=1   # Install makes LamBoot the default boot entry; override with --no-make-default
+OPT_FALLBACK=0
+OPT_WITH_DRIVERS=-1  # -1=auto, 0=no, 1=yes
+OPT_WITH_MODULES=0
+OPT_REMOVE=0
+OPT_UPDATE=0
+OPT_DRY_RUN=0
+OPT_FORCE=0
+OPT_NO_BLS=0
+OPT_KEEP_ENTRIES=0
+OPT_QUIET=0
+OPT_VERBOSE=0
+OPT_REPLACE=0
+OPT_SIGNED=0
+OPT_KERNEL_DB_SIGNED=0   # asserts kernel is firmware-DB-signed (rare); allows --no-shim under SB
+OPT_NO_SHIM=0
+OPT_NO_MOK=0
+
+ESP=""
+ARCH=""
+DISTRO_ID=""
+DISTRO_NAME=""
+DISTRO_VERSION=""
+HAS_EXISTING=0
+SECURE_BOOT=0
+IS_CHROOT=0
+
+ESP_DISK=""
+ESP_PARTNUM=""
+
+SRC_DIR=""
+
+BOOT_FSTYPE=""
+NEED_FS_DRIVER=0
+
+declare -a KERNEL_VERSIONS=()
+declare -a KERNEL_PATHS=()
+declare -a INITRD_PATHS=()
+declare -a EXISTING_BLS=()
+declare -a EXISTING_UKI=()
+KERNEL_CMDLINE=""
+ENTRY_TOKEN=""
+HAS_BLS_NATIVE=0
+
+declare -a MANIFEST_ENTRIES=()
+
+# For --remove: manifest reading
+declare -A MANIFEST_HASHES=()
+MANIFEST_VERSION=""
+MANIFEST_ARCH=""
+
+PARTIAL_FAILURE=0
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+msg() {
+    (( OPT_QUIET )) || printf '%s\n' "$1"
+}
+
+detail() {
+    (( OPT_VERBOSE )) && printf '  %s\n' "$1" || true
+}
+
+warn() {
+    printf 'WARNING: %s\n' "$1" >&2
+}
+
+die() {
+    printf 'ERROR: %s\n' "$1" >&2
+    exit $EXIT_ERROR
+}
+
+ok() {
+    (( OPT_QUIET )) || printf '  \xe2\x9c\x93 %s\n' "$1"
+}
+
+fail() {
+    printf '  \xe2\x9c\x97 %s\n' "$1" >&2
+}
+
+run() {
+    local desc="$1"; shift
+    if (( OPT_DRY_RUN )); then
+        msg "  [dry-run] ${desc}"
+        return 0
+    fi
+    detail "exec: $*"
+    "$@"
+}
+
+atomic_copy() {
+    local src="$1" dst="$2"
+    local dst_dir
+    dst_dir=$(dirname "$dst")
+
+    run "mkdir -p ${dst_dir}" mkdir -p "$dst_dir" || return 1
+
+    local tmp="${dst}.lamboot-tmp.$$"
+    run "copy ${src} -> ${dst}" cp -- "$src" "$tmp" || { rm -f "$tmp"; return 1; }
+    run "atomic rename" mv -f -- "$tmp" "$dst" || { rm -f "$tmp"; return 1; }
+    return 0
+}
+
+file_sha256() {
+    sha256sum -- "$1" 2>/dev/null | cut -d' ' -f1
+}
+
+manifest_add() {
+    local rel="$1"
+    local hash
+    hash=$(file_sha256 "${ESP}/${rel}")
+    MANIFEST_ENTRIES+=("sha256:${hash}  ${rel}")
+}
+
+# find_dist_file(relative_path) — search for a dist file across multiple layouts
+# SRC_DIR may point to dist/ (repo) or /usr/share/lamboot/ (system).
+# Ancillary files (systemd units, kernel-install plugins) may be:
+#   - Inside SRC_DIR (flat packaging)
+#   - Sibling to SRC_DIR's parent (repo layout: dist/../kernel-install/)
+#   - In system paths (/usr/lib/...)
+# Prints the found path or nothing. Returns 0 if found, 1 if not.
+find_dist_file() {
+    local rel="$1"
+    local candidate
+
+    # Search in SRC_DIR itself
+    candidate="${SRC_DIR}/${rel}"
+    [ -f "$candidate" ] && echo "$candidate" && return 0
+
+    # Search in script's repo root (tools/../dist/../<rel>)
+    local script_path="$0"
+    if command -v readlink >/dev/null 2>&1; then
+        script_path=$(readlink -f "$0" 2>/dev/null) || script_path="$0"
+    fi
+    local script_dir
+    script_dir=$(cd "$(dirname "$script_path")" && pwd)
+    candidate="${script_dir}/../dist/${rel}"
+    [ -f "$candidate" ] && echo "$candidate" && return 0
+
+    # Search in repo root directly (tools/../<rel> — e.g., tools/../systemd/...)
+    candidate="${script_dir}/../${rel}"
+    [ -f "$candidate" ] && echo "$candidate" && return 0
+
+    return 1
+}
+
+needs_update() {
+    local src="$1" dst="$2"
+    [ -f "$dst" ] || return 0
+    local src_hash dst_hash
+    src_hash=$(file_sha256 "$src")
+    dst_hash=$(file_sha256 "$dst")
+    [ "$src_hash" != "$dst_hash" ]
+}
+
+# ============================================================================
+# Phase 1: Environment Detection
+# ============================================================================
+
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64)  ARCH="x86_64" ;;
+        aarch64) ARCH="aarch64" ;;
+        *)       die "Unsupported architecture: $(uname -m)" ;;
+    esac
+}
+
+efi_binary() {
+    case "$ARCH" in
+        x86_64)  echo "lambootx64.efi" ;;
+        aarch64) echo "lambootaa64.efi" ;;
+    esac
+}
+
+# Source binary filename in the dist/ tree — may be the signed variant
+efi_source_binary() {
+    if (( OPT_SIGNED )); then
+        case "$ARCH" in
+            x86_64)  echo "lambootx64-signed.efi" ;;
+            aarch64) echo "lambootaa64-signed.efi" ;;
+        esac
+    else
+        efi_binary
+    fi
+}
+
+efi_loader_path() {
+    if (( SECURE_BOOT )) && [ -n "$SHIM_SOURCE" ] && ! (( OPT_NO_SHIM )); then
+        # Secure Boot: boot entry points to shim, which loads LamBoot
+        echo "\\EFI\\LamBoot\\shimx64.efi"
+    else
+        case "$ARCH" in
+            x86_64)  echo "$EFI_LOADER_PATH" ;;
+            aarch64) echo "$EFI_LOADER_PATH_AA64" ;;
+        esac
+    fi
+}
+
+# Find the distro's shim binary for Secure Boot chain loading
+find_distro_shim() {
+    local shim_paths=(
+        "${ESP}/EFI/ubuntu/shimx64.efi"
+        "${ESP}/EFI/debian/shimx64.efi"
+        "${ESP}/EFI/fedora/shimx64.efi"
+        "${ESP}/EFI/centos/shimx64.efi"
+        "${ESP}/EFI/rhel/shimx64.efi"
+        "${ESP}/EFI/opensuse/shimx64.efi"
+        "${ESP}/EFI/BOOT/BOOTX64.EFI"
+    )
+
+    for path in "${shim_paths[@]}"; do
+        if [ -f "$path" ]; then
+            # Verify it's actually shim (check for MokManager reference or shim signature)
+            if file "$path" 2>/dev/null | grep -q "PE32+"; then
+                SHIM_SOURCE="$path"
+                return 0
+            fi
+        fi
+    done
+
+    SHIM_SOURCE=""
+    return 1
+}
+
+SHIM_SOURCE=""
+
+fallback_name() {
+    case "$ARCH" in
+        x86_64)  echo "$FALLBACK_NAME_X64" ;;
+        aarch64) echo "$FALLBACK_NAME_AA64" ;;
+    esac
+}
+
+find_source_dir() {
+    local binary="EFI/LamBoot/$(efi_binary)"
+
+    # Method 0: Environment variable override
+    if [ -n "${LAMBOOT_DIST:-}" ] && [ -f "${LAMBOOT_DIST}/${binary}" ]; then
+        echo "$LAMBOOT_DIST"
+        return 0
+    fi
+
+    # Resolve the real path of this script (follow symlinks)
+    local script_path="$0"
+    if command -v readlink >/dev/null 2>&1; then
+        script_path=$(readlink -f "$0" 2>/dev/null) || script_path="$0"
+    fi
+    local script_dir
+    script_dir=$(cd "$(dirname "$script_path")" && pwd)
+
+    # Method 1: Repo layout — script is in tools/, dist/ is sibling
+    local repo_root="${script_dir}/.."
+    if [ -f "${repo_root}/dist/${binary}" ]; then
+        echo "${repo_root}/dist"
+        return 0
+    fi
+
+    # Method 2: Flat tarball — dist/ is sibling of script
+    if [ -f "${script_dir}/dist/${binary}" ]; then
+        echo "${script_dir}/dist"
+        return 0
+    fi
+
+    # Method 3: Script alongside EFI/ directly (tarball extracted flat)
+    if [ -f "${script_dir}/${binary}" ]; then
+        echo "$script_dir"
+        return 0
+    fi
+
+    # Method 4: System-installed paths
+    local sys_path
+    for sys_path in /usr/share/lamboot /usr/local/share/lamboot /opt/lamboot; do
+        if [ -f "${sys_path}/${binary}" ]; then
+            echo "$sys_path"
+            return 0
+        fi
+    done
+
+    # Method 5: Working directory (last resort)
+    if [ -f "dist/${binary}" ]; then
+        echo "$(pwd)/dist"
+        return 0
+    fi
+
+    return 1
+}
+
+detect_chroot() {
+    if [ ! -d /sys/firmware/efi ]; then
+        if [ -e /proc/1/root ] && [ "$(stat -c %d:%i /)" != "$(stat -c %d:%i /proc/1/root 2>/dev/null)" ]; then
+            IS_CHROOT=1
+        fi
+    fi
+}
+
+detect_secure_boot() {
+    local sb_var="/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+    if [ -f "$sb_var" ]; then
+        local val
+        val=$(od -An -t u1 -j4 -N1 "$sb_var" 2>/dev/null | tr -d ' ')
+        (( val == 1 )) && SECURE_BOOT=1 || true
+    fi
+}
+
+detect_distro() {
+    if [ -r /etc/os-release ]; then
+        # shellcheck source=/dev/null
+        . /etc/os-release
+        DISTRO_ID="${ID:-unknown}"
+        DISTRO_NAME="${PRETTY_NAME:-Linux}"
+        DISTRO_VERSION="${VERSION_ID:-}"
+    else
+        DISTRO_ID="unknown"
+        DISTRO_NAME="Linux"
+        DISTRO_VERSION=""
+    fi
+}
+
+is_vfat() {
+    local fstype
+    fstype=$(findmnt -n -o FSTYPE "$1" 2>/dev/null)
+    [ "$fstype" = "vfat" ]
+}
+
+is_esp_partition() {
+    local dev
+    dev=$(findmnt -n -o SOURCE "$1" 2>/dev/null)
+    [ -n "$dev" ] || return 1
+    local parttype
+    parttype=$(lsblk -nro PARTTYPE "$dev" 2>/dev/null)
+    echo "$parttype" | grep -qi "$ESP_PARTTYPE_GUID"
+}
+
+validate_esp() {
+    local mp="$1"
+
+    mountpoint -q "$mp" 2>/dev/null || { detail "not a mountpoint: ${mp}"; return 1; }
+    is_vfat "$mp"                   || { detail "not vfat: ${mp}"; return 1; }
+
+    if ! (( OPT_FORCE )); then
+        is_esp_partition "$mp"      || { detail "not ESP partition type: ${mp}"; return 1; }
+    fi
+
+    if ! (( OPT_DRY_RUN )); then
+        touch "${mp}/.lamboot-write-test" 2>/dev/null && rm -f "${mp}/.lamboot-write-test" \
+            || { detail "not writable: ${mp}"; return 1; }
+    fi
+
+    local avail
+    avail=$(df -k --output=avail "$mp" 2>/dev/null | tail -1 | tr -d ' ')
+    if [ -n "$avail" ] && (( avail < MIN_ESP_SPACE_KIB )) && ! (( OPT_FORCE )); then
+        warn "ESP has only ${avail} KiB free (need ${MIN_ESP_SPACE_KIB} KiB)"
+        return 1
+    fi
+
+    return 0
+}
+
+_resolve_esp_device() {
+    local dev
+    dev=$(findmnt -n -o SOURCE "$ESP" 2>/dev/null)
+    [ -n "$dev" ] || return 0
+
+    ESP_DISK="/dev/$(lsblk -nro PKNAME "$dev" 2>/dev/null)"
+    ESP_PARTNUM=$(lsblk -nro PARTN "$dev" 2>/dev/null)
+
+    if [ -z "$ESP_PARTNUM" ]; then
+        ESP_PARTNUM=$(echo "$dev" | sed 's/.*[^0-9]\([0-9]\+\)$/\1/')
+    fi
+}
+
+find_esp() {
+    # Method 0: User override
+    if [ -n "$OPT_ESP" ]; then
+        if validate_esp "$OPT_ESP"; then
+            ESP="$OPT_ESP"
+        else
+            die "Specified ESP path '${OPT_ESP}' is not a valid EFI System Partition."
+        fi
+        _resolve_esp_device
+        return 0
+    fi
+
+    # Method 1: Standard mount points (bootctl order)
+    local mp
+    for mp in /efi /boot/efi /boot; do
+        if mountpoint -q "$mp" 2>/dev/null && validate_esp "$mp"; then
+            ESP="$mp"
+            detail "ESP found via standard mount point: ${ESP}"
+            _resolve_esp_device
+            return 0
+        fi
+    done
+
+    # Method 2: findmnt by filesystem type
+    mp=$(findmnt -n -o TARGET -t vfat --first-only 2>/dev/null) || true
+    if [ -n "$mp" ] && validate_esp "$mp"; then
+        ESP="$mp"
+        detail "ESP found via findmnt: ${ESP}"
+        _resolve_esp_device
+        return 0
+    fi
+
+    # Method 3: /etc/fstab for unmounted ESPs
+    if [ -r /etc/fstab ]; then
+        mp=$(awk '$3 == "vfat" && ($2 ~ /boot|efi/) { print $2; exit }' /etc/fstab)
+        if [ -n "$mp" ] && ! mountpoint -q "$mp" 2>/dev/null; then
+            detail "Attempting to mount ESP from fstab: ${mp}"
+            mount "$mp" 2>/dev/null || true
+            if validate_esp "$mp"; then
+                ESP="$mp"
+                detail "ESP found via fstab: ${ESP}"
+                _resolve_esp_device
+                return 0
+            fi
+        fi
+    fi
+
+    # Method 4: Block device scan by partition type GUID
+    local esp_part
+    esp_part=$(lsblk -nrpo NAME,PARTTYPE 2>/dev/null \
+        | grep -i "$ESP_PARTTYPE_GUID" \
+        | awk '{print $1}' | head -1) || true
+    if [ -n "$esp_part" ]; then
+        mp=$(findmnt -n -o TARGET "$esp_part" 2>/dev/null) || true
+        if [ -z "$mp" ]; then
+            mp=$(mktemp -d /tmp/lamboot-esp-XXXXXX)
+            detail "Mounting ESP from block scan: ${esp_part} -> ${mp}"
+            mount "$esp_part" "$mp" 2>/dev/null || { rmdir "$mp" 2>/dev/null; mp=""; }
+        fi
+        if [ -n "$mp" ] && validate_esp "$mp"; then
+            ESP="$mp"
+            detail "ESP found via block scan: ${ESP}"
+            _resolve_esp_device
+            return 0
+        fi
+    fi
+
+    die "EFI System Partition not found. Tried: standard mounts, findmnt, fstab, block scan.
+  Mount your ESP and retry, or specify it with --esp PATH."
+}
+
+detect_existing() {
+    if [ -f "${ESP}/${EFI_DIR}/$(efi_binary)" ]; then
+        HAS_EXISTING=1
+        detail "Existing LamBoot installation found on ESP"
+    fi
+}
+
+phase1_detect_environment() {
+    msg "Phase 1: Detecting environment..."
+
+    detect_arch
+    detail "Architecture: ${ARCH}"
+
+    SRC_DIR=$(find_source_dir) || die "Cannot find LamBoot distribution files.
+  Run from the repository root or install to /usr/share/lamboot."
+
+    local bin="${SRC_DIR}/EFI/LamBoot/$(efi_binary)"
+    [ -f "$bin" ] || die "EFI binary not found: ${bin}
+  Run ./build.sh first."
+
+    detect_chroot
+    (( IS_CHROOT )) && detail "Chroot environment detected" || true
+
+    detect_distro
+    detail "Distro: ${DISTRO_NAME} (${DISTRO_ID})"
+
+    find_esp
+    ok "ESP: ${ESP} ($(df -h --output=avail "${ESP}" 2>/dev/null | tail -1 | tr -d ' ') free)"
+
+    detect_existing
+    detect_secure_boot
+    (( SECURE_BOOT )) && detail "Secure Boot: enabled" || true
+
+    if (( OPT_UPDATE )) && ! (( HAS_EXISTING )); then
+        warn "No existing LamBoot installation found; performing fresh install."
+    fi
+}
+
+# ============================================================================
+# Phase 2: Filesystem Driver Assessment
+# ============================================================================
+
+driver_files_for_arch() {
+    case "$ARCH" in
+        x86_64)
+            case "$BOOT_FSTYPE" in
+                ext2) echo "ext2_x64.efi" ;;
+                ext3|ext4) echo "ext4_x64.efi" ;;
+                btrfs) echo "btrfs_x64.efi" ;;
+                f2fs) echo "f2fs_x64.efi" ;;
+                xfs) echo "xfs_x64.efi" ;;
+                zfs) echo "zfs_x64.efi" ;;
+                ntfs) echo "ntfs_x64.efi" ;;
+                iso9660) echo "iso9660_x64.efi" ;;
+                *) warn "No filesystem driver available for ${BOOT_FSTYPE}"; return 0 ;;
+            esac
+            ;;
+        aarch64)
+            case "$BOOT_FSTYPE" in
+                ext2) echo "aarch64/ext2_aa64.efi" ;;
+                ext3|ext4) echo "aarch64/ext4_aa64.efi" ;;
+                btrfs) echo "aarch64/btrfs_aa64.efi" ;;
+                f2fs) echo "aarch64/f2fs_aa64.efi" ;;
+                xfs) echo "aarch64/xfs_aa64.efi" ;;
+                zfs) echo "aarch64/zfs_aa64.efi" ;;
+                ntfs) echo "aarch64/ntfs_aa64.efi" ;;
+                *) warn "No aarch64 filesystem driver available for ${BOOT_FSTYPE}" ;;
+            esac
+            ;;
+    esac
+}
+
+phase2_assess_drivers() {
+    msg "Phase 2: Assessing filesystem drivers..."
+
+    if mountpoint -q /boot 2>/dev/null; then
+        BOOT_FSTYPE=$(findmnt -n -o FSTYPE /boot 2>/dev/null)
+        local boot_src esp_src
+        boot_src=$(findmnt -n -o SOURCE /boot 2>/dev/null)
+        esp_src=$(findmnt -n -o SOURCE "$ESP" 2>/dev/null)
+        if [ "$boot_src" = "$esp_src" ]; then
+            NEED_FS_DRIVER=0
+        elif [ "$BOOT_FSTYPE" != "vfat" ]; then
+            NEED_FS_DRIVER=1
+        fi
+    else
+        BOOT_FSTYPE=$(findmnt -n -o FSTYPE / 2>/dev/null)
+        if [ "$BOOT_FSTYPE" != "vfat" ]; then
+            NEED_FS_DRIVER=1
+        fi
+    fi
+
+    if (( OPT_WITH_DRIVERS == 1 )); then
+        NEED_FS_DRIVER=1
+    fi
+
+    if (( NEED_FS_DRIVER )); then
+        detail "/boot filesystem: ${BOOT_FSTYPE} (driver required)"
+        local drivers
+        drivers=$(driver_files_for_arch)
+        if [ -z "$drivers" ]; then
+            warn "Filesystem driver needed for ${BOOT_FSTYPE} but none available."
+            warn "LamBoot may not be able to read kernels on /boot."
+        else
+            ok "Filesystem driver: ${BOOT_FSTYPE} (will install)"
+        fi
+    else
+        detail "/boot filesystem: ${BOOT_FSTYPE:-vfat} (no driver needed)"
+    fi
+}
+
+# ============================================================================
+# Phase 3: Boot Entry Discovery
+# ============================================================================
+
+get_kernel_cmdline() {
+    if [ -r /etc/kernel/cmdline ]; then
+        KERNEL_CMDLINE=$(cat /etc/kernel/cmdline)
+    elif [ -r /proc/cmdline ]; then
+        KERNEL_CMDLINE=$(sed 's/\bBOOT_IMAGE=[^ ]* *//;s/\binitrd=[^ ]* *//' /proc/cmdline)
+    fi
+    KERNEL_CMDLINE=$(echo "$KERNEL_CMDLINE" | xargs)
+}
+
+get_entry_token() {
+    if [ -r /etc/kernel/entry-token ]; then
+        ENTRY_TOKEN=$(cat /etc/kernel/entry-token)
+    elif [ -r /etc/os-release ]; then
+        # shellcheck source=/dev/null
+        ENTRY_TOKEN=$(. /etc/os-release && echo "${IMAGE_ID:-${ID}}")
+    fi
+    ENTRY_TOKEN="${ENTRY_TOKEN:-$(cat /etc/machine-id 2>/dev/null)}"
+    ENTRY_TOKEN="${ENTRY_TOKEN:-linux}"
+}
+
+scan_existing_bls() {
+    local bls_dir="${ESP}/${BLS_DIR}"
+    if [ -d "$bls_dir" ]; then
+        local f
+        for f in "$bls_dir"/*.conf; do
+            [ -f "$f" ] || continue
+            EXISTING_BLS+=("$(basename "$f")")
+        done
+    fi
+
+    if [ -d /boot/loader/entries ]; then
+        local f
+        for f in /boot/loader/entries/*.conf; do
+            [ -f "$f" ] || continue
+            EXISTING_BLS+=("$(basename "$f")")
+        done
+    fi
+
+    # Deduplicate
+    if (( ${#EXISTING_BLS[@]} > 0 )); then
+        local -A seen=()
+        local -a deduped=()
+        local entry
+        for entry in "${EXISTING_BLS[@]}"; do
+            if [ -z "${seen[$entry]+x}" ]; then
+                seen[$entry]=1
+                deduped+=("$entry")
+            fi
+        done
+        EXISTING_BLS=("${deduped[@]}")
+    fi
+
+    # HAS_BLS_NATIVE is only true if there are BLS entries NOT owned by us
+    # (i.e. not in our install manifest). Entries we previously generated are
+    # "ours" and may need regeneration if their referenced kernels are gone.
+    HAS_BLS_NATIVE=0
+    if (( ${#EXISTING_BLS[@]} == 0 )); then
+        return 0
+    fi
+    # If a manifest exists, only count entries NOT tracked by us
+    local manifest_path="${ESP}/${MANIFEST_PATH}"
+    if [ -f "$manifest_path" ]; then
+        local e
+        for e in "${EXISTING_BLS[@]}"; do
+            if ! grep -qF "${BLS_DIR}/${e}" "$manifest_path"; then
+                HAS_BLS_NATIVE=1
+                break
+            fi
+        done
+    else
+        # No manifest => first install or unknown state. Treat all as native.
+        HAS_BLS_NATIVE=1
+    fi
+}
+
+# Check BLS entries we own for stale kernel references. Returns 0 if any
+# of our entries references a missing kernel (caller should regenerate).
+our_bls_entries_are_stale() {
+    local manifest_path="${ESP}/${MANIFEST_PATH}"
+    [ -f "$manifest_path" ] || return 1
+
+    local bls_dir="${ESP}/${BLS_DIR}"
+    local entry conf_path linux_line kpath
+    for entry in "${EXISTING_BLS[@]}"; do
+        grep -qF "${BLS_DIR}/${entry}" "$manifest_path" || continue
+        conf_path="${bls_dir}/${entry}"
+        [ -f "$conf_path" ] || continue
+        linux_line=$(awk '/^linux[[:space:]]/{print $2; exit}' "$conf_path")
+        [ -n "$linux_line" ] || continue
+        # BLS `linux /boot/vmlinuz-x.y.z` — absolute path on ext4 root
+        kpath="$linux_line"
+        if [ ! -f "$kpath" ]; then
+            detail "Stale BLS entry ${entry}: kernel ${kpath} missing"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Remove BLS entries we own that reference missing kernels. Called only on
+# --update when we've detected staleness and plan to regenerate.
+remove_stale_our_bls_entries() {
+    local manifest_path="${ESP}/${MANIFEST_PATH}"
+    [ -f "$manifest_path" ] || return 0
+
+    local bls_dir="${ESP}/${BLS_DIR}"
+    local entry conf_path linux_line kpath
+    for entry in "${EXISTING_BLS[@]}"; do
+        grep -qF "${BLS_DIR}/${entry}" "$manifest_path" || continue
+        conf_path="${bls_dir}/${entry}"
+        [ -f "$conf_path" ] || continue
+        linux_line=$(awk '/^linux[[:space:]]/{print $2; exit}' "$conf_path")
+        kpath="$linux_line"
+        if [ -n "$kpath" ] && [ ! -f "$kpath" ]; then
+            run "remove stale ${entry}" rm -f "$conf_path" \
+                || warn "Failed to remove stale BLS entry ${entry}"
+            ok "Removed stale BLS entry: ${entry}"
+        fi
+    done
+}
+
+scan_existing_uki() {
+    local uki_dir="${ESP}/EFI/Linux"
+    if [ -d "$uki_dir" ]; then
+        local f
+        for f in "$uki_dir"/*.efi; do
+            [ -f "$f" ] || continue
+            EXISTING_UKI+=("$(basename "$f")")
+        done
+    fi
+}
+
+find_initrd() {
+    local ver="$1"
+
+    local -a patterns=()
+    case "$DISTRO_ID" in
+        fedora|rhel|centos|rocky|alma)
+            patterns=("/boot/initramfs-${ver}.img") ;;
+        debian|ubuntu|linuxmint|pop)
+            patterns=("/boot/initrd.img-${ver}") ;;
+        opensuse*|sles)
+            patterns=("/boot/initrd-${ver}") ;;
+        void)
+            patterns=("/boot/initramfs-${ver}.img") ;;
+        gentoo)
+            patterns=(
+                "/boot/initramfs-${ver}.img"
+                "/boot/initramfs-genkernel-*-${ver}"
+            ) ;;
+        alpine)
+            patterns=("/boot/initramfs-${ver}") ;;
+        *)
+            patterns=(
+                "/boot/initramfs-${ver}.img"
+                "/boot/initrd.img-${ver}"
+                "/boot/initrd-${ver}"
+            ) ;;
+    esac
+
+    local p match
+    for p in "${patterns[@]}"; do
+        for match in $p; do
+            [ -f "$match" ] && echo "$match" && return 0
+        done
+    done
+
+    echo ""
+}
+
+find_initrd_arch() {
+    if [ -f /boot/initramfs-linux.img ]; then
+        echo "/boot/initramfs-linux.img"
+    elif [ -f /boot/initramfs-linux-fallback.img ]; then
+        echo "/boot/initramfs-linux-fallback.img"
+    else
+        echo ""
+    fi
+}
+
+discover_kernels() {
+    local kpath version initrd
+
+    for kpath in /boot/vmlinuz-*; do
+        [ -f "$kpath" ] || continue
+        version="${kpath#/boot/vmlinuz-}"
+        initrd=$(find_initrd "$version")
+
+        KERNEL_VERSIONS+=("$version")
+        KERNEL_PATHS+=("$kpath")
+        INITRD_PATHS+=("$initrd")
+    done
+
+    # Arch Linux: /boot/vmlinuz-linux
+    if [ -f /boot/vmlinuz-linux ] && [ "$DISTRO_ID" = "arch" ]; then
+        local uname_ver
+        uname_ver=$(file /boot/vmlinuz-linux 2>/dev/null | sed -n 's/.*version \([^ ]*\).*/\1/p' || true)
+        if [ -z "$uname_ver" ]; then
+            uname_ver=$(uname -r)
+        fi
+        local dup=0 v
+        for v in "${KERNEL_VERSIONS[@]}"; do
+            [ "$v" = "$uname_ver" ] && dup=1 && break
+        done
+        if ! (( dup )); then
+            KERNEL_VERSIONS+=("$uname_ver")
+            KERNEL_PATHS+=("/boot/vmlinuz-linux")
+            INITRD_PATHS+=("$(find_initrd_arch)")
+        fi
+    fi
+}
+
+phase3_discover_entries() {
+    msg "Phase 3: Discovering boot entries..."
+
+    get_kernel_cmdline
+    get_entry_token
+    scan_existing_bls
+    scan_existing_uki
+    discover_kernels
+
+    detail "Entry token: ${ENTRY_TOKEN}"
+    detail "Kernel cmdline: ${KERNEL_CMDLINE}"
+
+    if (( ${#EXISTING_BLS[@]} > 0 )); then
+        ok "${#EXISTING_BLS[@]} existing BLS entries found"
+    fi
+    if (( ${#EXISTING_UKI[@]} > 0 )); then
+        ok "${#EXISTING_UKI[@]} UKIs found in \\EFI\\Linux\\"
+    fi
+    if (( ${#KERNEL_VERSIONS[@]} > 0 )); then
+        ok "${#KERNEL_VERSIONS[@]} kernels found in /boot"
+    else
+        warn "No kernels found in /boot."
+    fi
+
+    if [ "$DISTRO_ID" = "nixos" ]; then
+        warn "NixOS detected. NixOS uses a generation-based boot model."
+        warn "Automatic BLS generation is not supported. Use --no-bls."
+        if ! (( OPT_NO_BLS )); then
+            OPT_NO_BLS=1
+        fi
+    fi
+}
+
+# ============================================================================
+# Phase 4: File Installation
+# ============================================================================
+
+install_efi_binary() {
+    local src="${SRC_DIR}/EFI/LamBoot/$(efi_source_binary)"
+    local dst="${ESP}/${EFI_DIR}/$(efi_binary)"
+
+    if (( OPT_SIGNED )) && [ ! -f "$src" ]; then
+        die "--signed requested but signed binary not found: $src
+  Build with signing first: ./build.sh && ./tools/sign-lamboot.sh
+  (see docs/SECURE-BOOT-DEPLOYMENT.md)"
+    fi
+
+    if (( SECURE_BOOT )) && ! (( OPT_SIGNED )) && ! (( OPT_FORCE )); then
+        die "Secure Boot is enabled but --signed was not specified.
+  Installing an unsigned binary will not boot on this system.
+  Use --signed (recommended), or --force to proceed anyway, or disable Secure Boot.
+  See docs/SECURE-BOOT-DEPLOYMENT.md for the decision tree."
+    fi
+
+    # Validate the binary before installing
+    validate_efi_binary "$src"
+
+    if needs_update "$src" "$dst"; then
+        atomic_copy "$src" "$dst" || die "Failed to install $(efi_binary) to ESP."
+        ok "Installed $(efi_binary) ($(( $(stat -c %s "$src") / 1024 )) KiB)$( (( OPT_SIGNED )) && echo ' [signed]' )"
+    else
+        detail "$(efi_binary) unchanged, skipping"
+    fi
+    manifest_add "${EFI_DIR}/$(efi_binary)"
+}
+
+# validate_efi_binary(path) — verify this is a valid PE binary before installing
+# Checks: minimum size, MZ magic, PE signature, architecture match
+# Dies on failure unless --force is set
+validate_efi_binary() {
+    local path="$1"
+    local size
+    size=$(stat -c %s "$path" 2>/dev/null)
+
+    # Minimum size: a real UEFI bootloader should be at least 20KB
+    # (the smallest useful EFI app is ~15KB; LamBoot is 90-190KB)
+    if [ -z "$size" ] || (( size < 20480 )); then
+        if (( OPT_FORCE )); then
+            warn "EFI binary is suspiciously small (${size:-0} bytes): ${path}"
+        else
+            die "EFI binary is too small (${size:-0} bytes): ${path}
+  Expected at least 20 KiB for a valid UEFI bootloader.
+  This may indicate a failed or incomplete build.
+  Run ./build.sh to rebuild, or use --force to override."
+        fi
+    fi
+
+    # Check PE header: MZ magic at offset 0
+    local magic
+    magic=$(od -An -t x1 -N2 "$path" 2>/dev/null | tr -d ' ')
+    if [ "$magic" != "4d5a" ]; then
+        if (( OPT_FORCE )); then
+            warn "File does not have PE/MZ header: ${path}"
+        else
+            die "File is not a valid PE binary (no MZ header): ${path}
+  This is not a UEFI EFI application.
+  Use --force to override."
+        fi
+    fi
+
+    # Check PE signature at e_lfanew offset
+    local lfanew pe_off pe_sig
+    lfanew=$(od -An -t u4 -j60 -N4 "$path" 2>/dev/null | tr -d ' ')
+    if [ -n "$lfanew" ] && (( lfanew > 0 && lfanew < size )); then
+        pe_sig=$(od -An -t x1 -j"$lfanew" -N4 "$path" 2>/dev/null | tr -d ' ')
+        if [ "$pe_sig" != "50450000" ]; then
+            warn "PE signature mismatch at offset ${lfanew} (got: ${pe_sig})"
+        fi
+    fi
+
+    detail "Binary validated: ${size} bytes, PE header OK"
+}
+
+install_fallback() {
+    (( OPT_FALLBACK )) || return 0
+
+    local src="${ESP}/${EFI_DIR}/$(efi_binary)"
+    local dst="${ESP}/${FALLBACK_DIR}/$(fallback_name)"
+    local backup="${dst}.lamboot-backup"
+
+    run "mkdir -p ${ESP}/${FALLBACK_DIR}" mkdir -p "${ESP}/${FALLBACK_DIR}"
+
+    # Backup existing fallback if not ours
+    if [ -f "$dst" ] && [ ! -f "$backup" ]; then
+        local dst_hash src_hash
+        dst_hash=$(file_sha256 "$dst")
+        src_hash=$(file_sha256 "$src")
+        if [ "$dst_hash" != "$src_hash" ]; then
+            run "backup $(fallback_name)" cp -- "$dst" "$backup" \
+                || warn "Failed to backup existing $(fallback_name)"
+            ok "Backed up existing $(fallback_name)"
+        fi
+    fi
+
+    atomic_copy "$src" "$dst" || warn "Failed to install fallback $(fallback_name)"
+    ok "Installed fallback $(fallback_name)"
+    manifest_add "${FALLBACK_DIR}/$(fallback_name)"
+}
+
+install_drivers() {
+    (( NEED_FS_DRIVER )) || return 0
+
+    local drivers
+    drivers=$(driver_files_for_arch)
+    [ -n "$drivers" ] || return 0
+
+    local drv
+    while IFS= read -r drv; do
+        # Under Secure Boot (--signed), prefer the signed variant of the driver
+        # so firmware accepts it. Destination filename is always the unsigned
+        # name so LamBoot's driver-load code can find it.
+        local src_name="${drv}"
+        if (( OPT_SIGNED )); then
+            local signed_name="${drv%.efi}-signed.efi"
+            if [ -f "${SRC_DIR}/EFI/LamBoot/drivers/${signed_name}" ]; then
+                src_name="$signed_name"
+            else
+                warn "Signed driver not found, falling back to unsigned: ${drv}"
+            fi
+        fi
+        local src="${SRC_DIR}/EFI/LamBoot/drivers/${src_name}"
+        local dst="${ESP}/${EFI_DIR}/drivers/${drv}"
+        if [ ! -f "$src" ]; then
+            warn "Driver not found: ${src}"
+            continue
+        fi
+        if needs_update "$src" "$dst"; then
+            atomic_copy "$src" "$dst" || { warn "Failed to install driver ${drv}"; continue; }
+            ok "Installed driver: ${drv}"
+        else
+            detail "Driver ${drv} unchanged, skipping"
+        fi
+        manifest_add "${EFI_DIR}/drivers/${drv}"
+    done <<< "$drivers"
+
+    local lic_src="${SRC_DIR}/EFI/LamBoot/drivers/LICENSE-GPL-2.0.txt"
+    local lic_dst="${ESP}/${EFI_DIR}/drivers/LICENSE-GPL-2.0.txt"
+    if [ -f "$lic_src" ]; then
+        atomic_copy "$lic_src" "$lic_dst" 2>/dev/null || true
+    fi
+}
+
+install_modules() {
+    (( OPT_WITH_MODULES )) || return 0
+
+    local manifest_src="${SRC_DIR}/EFI/LamBoot/modules/manifest.toml"
+    if [ -f "$manifest_src" ]; then
+        local dst="${ESP}/${EFI_DIR}/modules/manifest.toml"
+        atomic_copy "$manifest_src" "$dst" || warn "Failed to install module manifest"
+        manifest_add "${EFI_DIR}/modules/manifest.toml"
+    fi
+
+    # Iterate modules by UNSIGNED names — for each, pick signed variant when
+    # --signed is set so firmware accepts the binary under Secure Boot.
+    local mod
+    for mod in "${SRC_DIR}"/EFI/LamBoot/modules/*.efi; do
+        [ -f "$mod" ] || continue
+        local name
+        name=$(basename "$mod")
+        # Skip -signed.efi files in iteration — they're handled via the unsigned name
+        case "$name" in *-signed.efi) continue;; esac
+
+        local src="$mod"
+        if (( OPT_SIGNED )); then
+            local signed_src="${SRC_DIR}/EFI/LamBoot/modules/${name%.efi}-signed.efi"
+            if [ -f "$signed_src" ]; then
+                src="$signed_src"
+            else
+                warn "Signed module not found, falling back to unsigned: ${name}"
+            fi
+        fi
+        local dst="${ESP}/${EFI_DIR}/modules/${name}"
+        if needs_update "$src" "$dst"; then
+            atomic_copy "$src" "$dst" || { warn "Failed to install module ${name}"; continue; }
+            ok "Installed module: ${name}"
+        fi
+        manifest_add "${EFI_DIR}/modules/${name}"
+    done
+}
+
+install_policy() {
+    local src="${SRC_DIR}/EFI/LamBoot/policy.toml"
+    local dst="${ESP}/${EFI_DIR}/policy.toml"
+
+    [ -f "$src" ] || return 0
+
+    if [ -f "$dst" ]; then
+        local new="${dst}.new"
+        if needs_update "$src" "$dst"; then
+            atomic_copy "$src" "$new" || true
+            detail "New policy template written to policy.toml.new (existing config preserved)"
+        fi
+    else
+        atomic_copy "$src" "$dst" || warn "Failed to install policy.toml"
+        ok "Installed policy.toml"
+    fi
+    manifest_add "${EFI_DIR}/policy.toml"
+}
+
+# ============================================================================
+# Phase 3b: Backup and Migration (--replace only)
+# ============================================================================
+
+phase3b_backup_and_migrate() {
+    msg "Phase 3b: Backup and migration..."
+
+    local timestamp
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    local backup_dir="/root/lamboot-migration-${timestamp}"
+    mkdir -p "$backup_dir"
+
+    # Full ESP backup
+    local esp_backup="${backup_dir}/esp-backup.tar.gz"
+    if tar czf "$esp_backup" -C "$(dirname "$ESP")" "$(basename "$ESP")" 2>/dev/null; then
+        ok "ESP backed up to ${esp_backup}"
+    else
+        warn "Failed to backup ESP — continuing anyway"
+    fi
+
+    # NVRAM dump
+    local nvram_backup="${backup_dir}/efibootmgr.txt"
+    efibootmgr -v > "$nvram_backup" 2>/dev/null || true
+    ok "NVRAM boot entries saved to ${nvram_backup}"
+
+    # Extract GRUB kernel parameters if GRUB is present
+    if [ -f /etc/default/grub ]; then
+        local grub_backup="${backup_dir}/grub-default.txt"
+        cp /etc/default/grub "$grub_backup"
+        ok "GRUB config backed up to ${grub_backup}"
+
+        # Extract kernel cmdline for LamBoot
+        local cmdline=""
+        # shellcheck disable=SC1091
+        . /etc/default/grub 2>/dev/null || true
+        cmdline="${GRUB_CMDLINE_LINUX:-} ${GRUB_CMDLINE_LINUX_DEFAULT:-}"
+        cmdline=$(echo "$cmdline" | sed 's/^ *//;s/ *$//')
+
+        if [ -n "$cmdline" ] && [ ! -f /etc/kernel/cmdline ]; then
+            echo "$cmdline" > /etc/kernel/cmdline
+            ok "Extracted kernel cmdline to /etc/kernel/cmdline: ${cmdline}"
+        elif [ -f /etc/kernel/cmdline ]; then
+            detail "Existing /etc/kernel/cmdline preserved"
+        fi
+    fi
+
+    ok "Migration backup complete: ${backup_dir}"
+    detail "To restore: tar xzf ${esp_backup} -C $(dirname "$ESP")"
+}
+
+# ============================================================================
+# Phase 4: Install Files
+# ============================================================================
+
+phase4_install_files() {
+    msg "Phase 4: Installing files..."
+
+    local dir
+    for dir in "" "/drivers" "/modules" "/reports"; do
+        run "mkdir -p ${ESP}/${EFI_DIR}${dir}" mkdir -p "${ESP}/${EFI_DIR}${dir}"
+    done
+    run "mkdir -p ${ESP}/${BLS_DIR}" mkdir -p "${ESP}/${BLS_DIR}"
+
+    install_efi_binary
+    install_secure_boot_chain
+    install_mok_enrollment
+    install_fallback
+    install_drivers
+    install_modules
+    install_policy
+}
+
+install_secure_boot_chain() {
+    if (( OPT_NO_SHIM )); then
+        detail "Secure Boot shim chain skipped (--no-shim)"
+        return 0
+    fi
+    if ! (( SECURE_BOOT )); then
+        return 0
+    fi
+
+    # Find the distro's shim for chain loading
+    if ! find_distro_shim; then
+        warn "Secure Boot is enabled but no shim binary found on ESP."
+        warn "LamBoot may not load without shim. Consider disabling Secure Boot"
+        warn "or installing the shim-signed package for your distribution."
+        return 0
+    fi
+
+    detail "Secure Boot enabled — setting up shim chain"
+    detail "Using shim: ${SHIM_SOURCE}"
+
+    # Copy shim to LamBoot's directory
+    local shim_dst="${ESP}/${EFI_DIR}/shimx64.efi"
+    if needs_update "$SHIM_SOURCE" "$shim_dst"; then
+        atomic_copy "$SHIM_SOURCE" "$shim_dst" || warn "Failed to copy shim"
+    fi
+    manifest_add "${EFI_DIR}/shimx64.efi"
+
+    # Deploy LamBoot as grubx64.efi (shim's expected follow-on loader name)
+    # The destination lambootx64.efi is already the signed variant when --signed
+    # was used, so chain-copying it works for shim verification.
+    local lamboot_src="${ESP}/${EFI_DIR}/$(efi_binary)"
+    local lamboot_shim_dst="${ESP}/${EFI_DIR}/grubx64.efi"
+    if [ -f "$lamboot_src" ]; then
+        cp -f "$lamboot_src" "$lamboot_shim_dst" \
+            || warn "Failed to create grubx64.efi shim chain link"
+        manifest_add "${EFI_DIR}/grubx64.efi"
+    fi
+
+    ok "Secure Boot shim chain configured"
+
+    set_shim_retain_protocol
+}
+
+# Pre-populate ShimRetainProtocol NVRAM variable so shim 15.8+ retains its
+# ShimLock protocol across child StartImage calls (ext4 driver load, etc.)
+# rather than uninstalling it — which would leave the kernel unverifiable.
+# See rhboot/shim#444 and docs/analysis/CONFIG-4-TRUST-CHAIN-GAP-2026-04-21.md.
+#
+# The LamBoot runtime also calls runtime::set_variable for this, but shim
+# reads the variable at shim-init time (before LamBoot runs), so a runtime
+# set only takes effect on the SECOND boot. Pre-populating here from
+# userspace ensures the first post-install boot already has it.
+set_shim_retain_protocol() {
+    local var="/sys/firmware/efi/efivars/ShimRetainProtocol-605dab50-e046-4300-abb6-3dd810dd8b23"
+    # Attributes: NON_VOLATILE(1) | BOOTSERVICE_ACCESS(2) | RUNTIME_ACCESS(4) = 7
+    # Data: single byte 0x01 meaning "retain ShimLock across StartImage".
+    if [ -e "$var" ]; then
+        detail "ShimRetainProtocol already present — leaving as is"
+        return 0
+    fi
+    if (( OPT_DRY_RUN )); then
+        detail "[dry-run] would set ShimRetainProtocol NVRAM variable"
+        return 0
+    fi
+    if printf '\x07\x00\x00\x00\x01' 2>/dev/null | tee "$var" >/dev/null 2>&1; then
+        ok "Set ShimRetainProtocol NVRAM variable (shim will retain ShimLock across driver loads)"
+    else
+        warn "Failed to set ShimRetainProtocol — kernel verification may fail if LamBoot loads filesystem drivers before kernel.
+  Workaround: run once, reboot into LamBoot; LamBoot will set the variable for subsequent boots.
+  Manual fix: printf '\\x07\\x00\\x00\\x00\\x01' | sudo tee $var"
+    fi
+}
+
+# Copy LamBoot's public signing cert to the ESP and offer MOK enrollment.
+# Only meaningful in Config 3 (shim + MOK) — skipped for --no-shim.
+install_mok_enrollment() {
+    if (( OPT_NO_SHIM )) || (( OPT_NO_MOK )); then
+        return 0
+    fi
+    if ! (( SECURE_BOOT )) || ! (( OPT_SIGNED )); then
+        return 0
+    fi
+
+    # Publish db.der onto the ESP so it is accessible if the user needs to
+    # re-import after rollback or fresh install.
+    local cert_src="${SRC_DIR}/EFI/LamBoot/db.der"
+    local cert_dst="${ESP}/${EFI_DIR}/db.der"
+    if [ -f "$cert_src" ]; then
+        if needs_update "$cert_src" "$cert_dst"; then
+            atomic_copy "$cert_src" "$cert_dst" \
+                || warn "Failed to copy db.der to ESP"
+        fi
+        manifest_add "${EFI_DIR}/db.der"
+    else
+        warn "Signing cert not found at $cert_src — cannot enroll MOK."
+        warn "Shim will reject the bootloader until the cert is enrolled by hand."
+        return 0
+    fi
+
+    if ! command -v mokutil >/dev/null 2>&1; then
+        warn "mokutil not found — cannot auto-enroll MOK."
+        warn "Install shim-signed (Debian/Ubuntu) or mokutil (Fedora), then run:"
+        warn "  sudo mokutil --import ${cert_dst}"
+        return 0
+    fi
+
+    # Skip re-import if this exact cert is already staged or enrolled
+    if mokutil --list-enrolled 2>/dev/null | grep -qF "LamBoot Release Signing"; then
+        detail "LamBoot signing cert already enrolled in MOK — skipping import"
+        return 0
+    fi
+    if mokutil --list-new 2>/dev/null | grep -qF "LamBoot Release Signing"; then
+        detail "LamBoot signing cert already staged for enrollment on next reboot"
+        return 0
+    fi
+
+    echo ""
+    echo "========================================================================"
+    echo "  MOK ENROLLMENT REQUIRED"
+    echo "========================================================================"
+    echo "  Secure Boot is enabled and LamBoot is deployed behind the distro"
+    echo "  shim. For shim to trust the LamBoot binary, its signing certificate"
+    echo "  must be enrolled into the Machine Owner Key list (MOK)."
+    echo ""
+    echo "  mokutil will now prompt for a one-time password. Choose any password"
+    echo "  and remember it — you will need to type it into the blue MokManager"
+    echo "  screen during the NEXT reboot to confirm the enrollment."
+    echo ""
+    echo "  After this install finishes and you reboot:"
+    echo "    1. The blue MokManager screen will appear automatically."
+    echo "    2. Choose: Enroll MOK -> View key 0 -> Continue -> Yes"
+    echo "    3. Enter the password you are about to set."
+    echo "    4. Choose: Reboot."
+    echo ""
+    echo "  After that second reboot, LamBoot will load normally."
+    echo ""
+    echo "  Full walkthrough: docs/MOK-ENROLLMENT-GUIDE.md"
+    echo "========================================================================"
+    echo ""
+
+    if (( OPT_DRY_RUN )); then
+        detail "[dry-run] Would: mokutil --import ${cert_dst}"
+        return 0
+    fi
+
+    if mokutil --import "$cert_dst"; then
+        ok "MOK enrollment staged. Reboot to complete via MokManager."
+    else
+        warn "mokutil --import failed. Enroll manually later with:"
+        warn "  sudo mokutil --import ${cert_dst}"
+    fi
+}
+
+# ============================================================================
+# Phase 5: BLS Entry Generation
+# ============================================================================
+
+kernel_esp_path() {
+    local hpath="$1"
+    [ -n "$hpath" ] || { echo ""; return; }
+
+    # If /boot IS the ESP, path is relative to ESP root
+    if [ "$ESP" = "/boot" ]; then
+        echo "/${hpath#/boot/}"
+        return
+    fi
+
+    # If kernel lives under the ESP mount
+    if [[ "$hpath" == "${ESP}"/* ]]; then
+        echo "/${hpath#${ESP}/}"
+        return
+    fi
+
+    # If /boot is a separate mount point (its own partition),
+    # the path is relative to that partition's root
+    if mountpoint -q /boot 2>/dev/null; then
+        echo "/${hpath#/boot/}"
+        return
+    fi
+
+    # /boot is on the root filesystem — keep the full /boot/ prefix
+    # LamBoot reads this via filesystem driver from the root partition
+    echo "$hpath"
+}
+
+generate_bls_entry() {
+    local idx="$1"
+    local version="${KERNEL_VERSIONS[$idx]}"
+    local kpath="${KERNEL_PATHS[$idx]}"
+    local ipath="${INITRD_PATHS[$idx]}"
+
+    local conf_name="${ENTRY_TOKEN}-${version}.conf"
+    local conf_path="${ESP}/${BLS_DIR}/${conf_name}"
+
+    if [ -f "$conf_path" ]; then
+        detail "BLS entry exists: ${conf_name}"
+        manifest_add "${BLS_DIR}/${conf_name}"
+        return 0
+    fi
+
+    local linux_rel initrd_rel
+    linux_rel=$(kernel_esp_path "$kpath")
+    initrd_rel=$(kernel_esp_path "$ipath")
+
+    local machine_id
+    machine_id=$(cat /etc/machine-id 2>/dev/null || echo "unknown")
+
+    local content
+    content="title      ${DISTRO_NAME} (${version})
+version    ${version}
+machine-id ${machine_id}
+sort-key   ${ENTRY_TOKEN}
+linux      ${linux_rel}
+initrd     ${initrd_rel}
+options    ${KERNEL_CMDLINE}"
+
+    if (( OPT_DRY_RUN )); then
+        msg "  [dry-run] Generate BLS entry: ${conf_name}"
+        detail "    title: ${DISTRO_NAME} (${version})"
+        return 0
+    fi
+
+    local tmp="${conf_path}.lamboot-tmp.$$"
+    printf '%s\n' "$content" > "$tmp" || { rm -f "$tmp"; warn "Failed to write BLS entry ${conf_name}"; return 1; }
+    mv -f "$tmp" "$conf_path" || { rm -f "$tmp"; warn "Failed to finalize BLS entry ${conf_name}"; return 1; }
+
+    ok "Generated BLS entry: ${conf_name}"
+    manifest_add "${BLS_DIR}/${conf_name}"
+}
+
+phase5_generate_bls() {
+    msg "Phase 5: BLS entry generation..."
+
+    if (( OPT_NO_BLS )); then
+        detail "BLS generation skipped (--no-bls)"
+        return 0
+    fi
+
+    if (( HAS_BLS_NATIVE )) && ! (( OPT_FORCE )); then
+        ok "Distro provides native BLS entries; skipping generation"
+        local e
+        for e in "${EXISTING_BLS[@]}"; do
+            if [ -f "${ESP}/${BLS_DIR}/${e}" ]; then
+                manifest_add "${BLS_DIR}/${e}"
+            fi
+        done
+        return 0
+    fi
+
+    # BLS entries that we own may reference kernels that have since been
+    # purged (common on Ubuntu/Debian where apt upgrades remove old kernels
+    # between lamboot-install invocations). Regenerate our entries if stale.
+    if our_bls_entries_are_stale; then
+        detail "Detected stale LamBoot-owned BLS entries; regenerating"
+        remove_stale_our_bls_entries
+    fi
+
+    if (( ${#KERNEL_VERSIONS[@]} == 0 )); then
+        detail "No kernels discovered; skipping BLS generation"
+        return 0
+    fi
+
+    local i
+    for i in "${!KERNEL_VERSIONS[@]}"; do
+        generate_bls_entry "$i" || PARTIAL_FAILURE=1
+    done
+}
+
+# ============================================================================
+# Phase 6: UEFI Boot Entry
+# ============================================================================
+
+check_efi_prerequisites() {
+    [ -d /sys/firmware/efi ] \
+        || die "Not booted in EFI mode. LamBoot requires UEFI firmware."
+
+    command -v efibootmgr >/dev/null 2>&1 \
+        || die "efibootmgr not found. Install it:
+  Fedora/RHEL: dnf install efibootmgr
+  Debian/Ubuntu: apt install efibootmgr
+  Arch: pacman -S efibootmgr
+  openSUSE: zypper install efibootmgr"
+
+    if ! grep -q 'efivarfs' /proc/mounts 2>/dev/null; then
+        die "efivarfs not mounted. Mount it:
+  mount -t efivarfs efivarfs /sys/firmware/efi/efivars"
+    fi
+
+    ls /sys/firmware/efi/efivars/ >/dev/null 2>&1 \
+        || die "Cannot access EFI variables. Check permissions or efivarfs mount."
+
+    [ -n "$ESP_DISK" ] && [ -n "$ESP_PARTNUM" ] \
+        || die "Cannot determine ESP disk and partition number for efibootmgr.
+  ESP device: $(findmnt -n -o SOURCE "$ESP" 2>/dev/null)
+  Specify --no-efi-entry to skip boot entry creation."
+}
+
+find_lamboot_entry() {
+    efibootmgr 2>/dev/null \
+        | grep -i 'LamBoot' \
+        | head -1 \
+        | sed -n 's/.*Boot\([0-9A-Fa-f]\{4\}\).*/\1/p' | head -1
+}
+
+create_efi_entry() {
+    local existing
+    existing=$(find_lamboot_entry)
+
+    if [ -n "$existing" ]; then
+        ok "UEFI boot entry already exists: Boot${existing}"
+    else
+        # Capture current boot order BEFORE creating entry
+        # efibootmgr --create puts the new entry FIRST by default — we must undo this
+        local previous_order
+        previous_order=$(efibootmgr 2>/dev/null | grep '^BootOrder:' | cut -d: -f2 | tr -d ' ')
+
+        local loader
+        loader=$(efi_loader_path)
+
+        run "create UEFI boot entry" \
+            efibootmgr --create \
+                --disk "$ESP_DISK" \
+                --part "$ESP_PARTNUM" \
+                --loader "$loader" \
+                --label "$LAMBOOT_LABEL" \
+                --quiet \
+            || die "efibootmgr failed to create boot entry.
+  This may indicate NVRAM is full. Try removing unused entries with:
+    efibootmgr -b XXXX -B
+  Or install with --fallback --no-efi-entry to use the removable media path."
+
+        existing=$(find_lamboot_entry)
+        ok "Created UEFI boot entry: Boot${existing}"
+
+        # Install default: LamBoot becomes the first entry in BootOrder —
+        # matches grub-install, bootctl install, refind-install. The previous
+        # default is preserved as the next entry so there's a one-keystroke
+        # fallback if LamBoot ever fails.
+        # Users who want to preserve the existing default can pass --no-make-default.
+        if ! (( OPT_SET_DEFAULT )) && [ -n "$previous_order" ] && [ -n "$existing" ]; then
+            local safe_order="${previous_order},${existing}"
+            run "preserve existing boot default (LamBoot last)" \
+                efibootmgr --bootorder "$safe_order" --quiet \
+                || warn "Failed to reorder — LamBoot may still be first in boot sequence"
+            detail "Boot order: ${safe_order} (LamBoot last, existing bootloader still default)"
+        fi
+    fi
+
+    if (( OPT_SET_DEFAULT )); then
+        set_default_entry "$existing"
+    fi
+}
+
+set_default_entry() {
+    local bootnum="$1"
+    [ -n "$bootnum" ] || { warn "No boot entry to set as default"; return 1; }
+
+    local total_entries=0
+    (( ${#EXISTING_BLS[@]} > 0 )) && total_entries=${#EXISTING_BLS[@]}
+    (( ${#EXISTING_UKI[@]} > 0 )) && total_entries=$(( total_entries + ${#EXISTING_UKI[@]} ))
+    (( ${#KERNEL_VERSIONS[@]} > 0 )) && total_entries=$(( total_entries + ${#KERNEL_VERSIONS[@]} ))
+
+    if (( total_entries == 0 )) && ! (( OPT_FORCE )); then
+        warn "Refusing --set-default: no boot entries (BLS, UKI, or kernel) detected."
+        warn "LamBoot would show an empty menu. Use --force to override."
+        PARTIAL_FAILURE=1
+        return 1
+    fi
+
+    local current_order
+    current_order=$(efibootmgr 2>/dev/null | grep '^BootOrder:' | cut -d: -f2 | tr -d ' ')
+
+    local new_order="${bootnum}"
+    local entry
+    IFS=',' read -ra entries <<< "$current_order"
+    for entry in "${entries[@]}"; do
+        [ "$entry" != "$bootnum" ] && new_order="${new_order},${entry}"
+    done
+
+    run "set boot order: ${new_order}" \
+        efibootmgr --bootorder "$new_order" --quiet \
+        || { warn "Failed to set boot order"; PARTIAL_FAILURE=1; return 1; }
+
+    ok "Set LamBoot as default boot option"
+}
+
+phase6_efi_boot_entry() {
+    msg "Phase 6: UEFI boot entry..."
+
+    if (( OPT_NO_EFI_ENTRY )); then
+        detail "Skipped (--no-efi-entry)"
+        return 0
+    fi
+
+    if (( IS_CHROOT )); then
+        detail "Skipped (chroot environment detected)"
+        return 0
+    fi
+
+    check_efi_prerequisites
+    create_efi_entry
+}
+
+# ============================================================================
+# Phase 7: Systemd Integration
+# ============================================================================
+
+install_mark_success_service() {
+    local src
+    src=$(find_dist_file "systemd/lamboot-mark-success.service")
+    local dst="${SYSTEMD_UNIT_DIR}/lamboot-mark-success.service"
+
+    [ -n "$src" ] || { detail "lamboot-mark-success.service not found in dist, skipping"; return 0; }
+
+    if needs_update "$src" "$dst"; then
+        run "install mark-success service" cp -- "$src" "$dst" \
+            || { warn "Failed to install lamboot-mark-success.service"; PARTIAL_FAILURE=1; return 1; }
+        ok "Installed lamboot-mark-success.service"
+    else
+        detail "lamboot-mark-success.service unchanged"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 && ! (( IS_CHROOT )); then
+        run "reload systemd" systemctl daemon-reload 2>/dev/null || true
+        run "enable mark-success service" systemctl enable lamboot-mark-success.service 2>/dev/null \
+            || { warn "Failed to enable lamboot-mark-success.service"; PARTIAL_FAILURE=1; }
+    fi
+}
+
+install_kernel_install_plugin() {
+    local src
+    src=$(find_dist_file "kernel-install/90-lamboot.install")
+    local dst="${KERNEL_INSTALL_DIR}/90-lamboot.install"
+
+    [ -n "$src" ] || { detail "90-lamboot.install not found in dist, skipping"; return 0; }
+
+    if [ -d "$KERNEL_INSTALL_DIR" ]; then
+        if needs_update "$src" "$dst"; then
+            run "install kernel-install plugin" cp -- "$src" "$dst" \
+                || { warn "Failed to install 90-lamboot.install"; PARTIAL_FAILURE=1; return 1; }
+            run "chmod +x ${dst}" chmod 755 "$dst" || true
+            ok "Installed 90-lamboot.install kernel-install plugin"
+        else
+            detail "90-lamboot.install unchanged"
+        fi
+    else
+        detail "kernel-install not present on system, skipping plugin"
+    fi
+}
+
+install_kernel_hook_tool() {
+    local src
+    src=$(find_dist_file "../tools/lamboot-kernel-hook" 2>/dev/null) \
+        || src=$(find_dist_file "lamboot-kernel-hook" 2>/dev/null) \
+        || {
+            warn "lamboot-kernel-hook NOT FOUND in install tree — the Debian/Ubuntu kernel hooks (zz-lamboot-postinst/postrm) will be installed but will silently no-op when kernels are installed via apt, so new-kernel BLS entries WILL NOT be generated automatically. Expected location: ./lamboot-kernel-hook relative to the install script, or tools/lamboot-kernel-hook in a dev checkout. If installing from a release tarball, this is a packaging bug — please report it."
+            PARTIAL_FAILURE=1
+            return 0
+        }
+
+    run "install kernel hook tool" install -m 755 -- "$src" /usr/local/bin/lamboot-kernel-hook \
+        || warn "Failed to install lamboot-kernel-hook"
+    ok "Installed lamboot-kernel-hook"
+}
+
+install_debian_kernel_hooks() {
+    # Only install on Debian/Ubuntu-style systems with /etc/kernel/postinst.d/
+    if [ ! -d /etc/kernel/postinst.d ]; then
+        detail "No /etc/kernel/postinst.d/, skipping Debian kernel hooks"
+        return 0
+    fi
+
+    local postinst_src postrm_src
+    postinst_src=$(find_dist_file "kernel-hooks/zz-lamboot-postinst" 2>/dev/null) \
+        || postinst_src=$(find_dist_file "../kernel-hooks/zz-lamboot-postinst" 2>/dev/null) \
+        || { detail "postinst hook not found"; return 0; }
+    postrm_src=$(find_dist_file "kernel-hooks/zz-lamboot-postrm" 2>/dev/null) \
+        || postrm_src=$(find_dist_file "../kernel-hooks/zz-lamboot-postrm" 2>/dev/null) \
+        || { detail "postrm hook not found"; return 0; }
+
+    run "install postinst hook" install -m 755 -- "$postinst_src" /etc/kernel/postinst.d/zz-lamboot \
+        || warn "Failed to install postinst hook"
+    run "install postrm hook" install -m 755 -- "$postrm_src" /etc/kernel/postrm.d/zz-lamboot \
+        || warn "Failed to install postrm hook"
+    ok "Installed Debian/Ubuntu kernel hooks"
+}
+
+phase7_systemd_integration() {
+    msg "Phase 7: Systemd integration..."
+
+    install_mark_success_service
+    install_kernel_install_plugin
+    install_kernel_hook_tool
+    install_debian_kernel_hooks
+}
+
+# ============================================================================
+# Phase 8: Post-Install Verification
+# ============================================================================
+
+verify_file() {
+    local rel="$1" desc="$2"
+    if [ -f "${ESP}/${rel}" ]; then
+        local size_kib=$(( $(stat -c %s "${ESP}/${rel}") / 1024 ))
+        ok "${desc} (${size_kib} KiB)"
+        return 0
+    else
+        fail "${desc} — MISSING"
+        return 1
+    fi
+}
+
+verify_bls_entry() {
+    local conf="$1"
+    local title linux_path initrd_path problems=0
+
+    title=$(grep '^title ' "$conf" 2>/dev/null | sed 's/^title  *//')
+    linux_path=$(grep '^linux ' "$conf" 2>/dev/null | sed 's/^linux  *//')
+    initrd_path=$(grep '^initrd ' "$conf" 2>/dev/null | sed 's/^initrd  *//')
+
+    local prefix=""
+    for base in "$ESP" /boot; do
+        if [ -f "${base}${linux_path}" ]; then
+            prefix="$base"
+            break
+        fi
+    done
+
+    local k_status i_status
+    k_status="\xe2\x9c\x93 kernel"
+    i_status="\xe2\x9c\x93 initrd"
+
+    if [ -n "$linux_path" ] && [ ! -f "${prefix}${linux_path}" ]; then
+        k_status="\xe2\x9c\x97 kernel MISSING"
+        problems=1
+    fi
+
+    if [ -n "$initrd_path" ] && [ ! -f "${prefix}${initrd_path}" ]; then
+        i_status="\xe2\x9c\x97 initrd MISSING"
+        problems=1
+    fi
+
+    printf '    %-55s %b  %b\n' "${title:-$(basename "$conf")}" "$k_status" "$i_status"
+    return $problems
+}
+
+phase8_verify() {
+    msg ""
+    msg "Phase 8: Verification"
+    msg "---------------------"
+
+    local errors=0
+
+    verify_file "${EFI_DIR}/$(efi_binary)" "$(efi_binary) on ESP" || errors=$((errors+1))
+
+    if (( OPT_FALLBACK )); then
+        verify_file "${FALLBACK_DIR}/$(fallback_name)" "Fallback $(fallback_name)" || errors=$((errors+1))
+    fi
+
+    if (( NEED_FS_DRIVER )); then
+        local drv
+        while IFS= read -r drv; do
+            [ -n "$drv" ] || continue
+            verify_file "${EFI_DIR}/drivers/${drv}" "Driver: ${drv}" || errors=$((errors+1))
+        done <<< "$(driver_files_for_arch)"
+    fi
+
+    if ! (( OPT_NO_EFI_ENTRY )) && ! (( IS_CHROOT )); then
+        local bootnum
+        bootnum=$(find_lamboot_entry)
+        if [ -n "$bootnum" ]; then
+            ok "UEFI boot entry Boot${bootnum}: ${LAMBOOT_LABEL}"
+        else
+            fail "UEFI boot entry — NOT FOUND"
+            errors=$((errors+1))
+        fi
+    fi
+
+    local bls_count=0 bls_problems=0
+    local conf
+    for conf in "${ESP}/${BLS_DIR}"/*.conf; do
+        [ -f "$conf" ] || continue
+        bls_count=$((bls_count+1))
+        verify_bls_entry "$conf" || bls_problems=$((bls_problems+1))
+    done
+    if (( bls_count > 0 )); then
+        ok "${bls_count} BLS entries (${bls_problems} with problems)"
+    else
+        if (( ${#EXISTING_UKI[@]} == 0 )); then
+            warn "No BLS entries or UKIs found. LamBoot will show an empty menu."
+            errors=$((errors+1))
+        fi
+    fi
+
+    if [ -f "${SYSTEMD_UNIT_DIR}/lamboot-mark-success.service" ]; then
+        if command -v systemctl >/dev/null 2>&1 && \
+           systemctl is-enabled lamboot-mark-success.service >/dev/null 2>&1; then
+            ok "lamboot-mark-success.service enabled"
+        else
+            detail "lamboot-mark-success.service installed but not enabled"
+        fi
+    fi
+    if [ -f "${KERNEL_INSTALL_DIR}/90-lamboot.install" ]; then
+        ok "90-lamboot.install kernel-install plugin"
+    fi
+
+    msg ""
+    if (( errors == 0 )); then
+        msg "LamBoot installed successfully."
+    else
+        msg "LamBoot installed with ${errors} issue(s). Review warnings above."
+    fi
+
+    if ! (( OPT_SET_DEFAULT )); then
+        local current_default
+        current_default=$(efibootmgr 2>/dev/null | grep '^BootOrder:' | cut -d: -f2 | cut -d, -f1 | tr -d ' ') || true
+        local current_label
+        current_label=$(efibootmgr 2>/dev/null | grep "^Boot${current_default}" | sed 's/^Boot[0-9A-Fa-f]*[* ] //') || true
+        if [ -n "$current_label" ] && ! echo "$current_label" | grep -qi 'lamboot'; then
+            msg "Preserved existing default bootloader: ${current_label}"
+            msg "To make LamBoot the default later: lamboot-install --update (without --no-make-default)"
+        fi
+    fi
+    msg "To test: reboot and select LamBoot from the UEFI boot menu."
+}
+
+# ============================================================================
+# Install Manifest
+# ============================================================================
+
+write_manifest() {
+    (( OPT_DRY_RUN )) && return 0
+
+    local dst="${ESP}/${MANIFEST_PATH}"
+    local tmp="${dst}.lamboot-tmp.$$"
+    local ts
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%S')
+
+    {
+        echo "# LamBoot Install Manifest"
+        echo "# Generated: ${ts}"
+        echo "# Version: ${LAMBOOT_VERSION}"
+        echo "# Arch: ${ARCH}"
+        echo "# Distro: ${DISTRO_ID}"
+        local entry
+        for entry in "${MANIFEST_ENTRIES[@]}"; do
+            echo "$entry"
+        done
+    } > "$tmp" || { rm -f "$tmp"; warn "Failed to write install manifest"; return 1; }
+
+    mv -f "$tmp" "$dst" || { rm -f "$tmp"; warn "Failed to finalize install manifest"; return 1; }
+    detail "Wrote install manifest: ${MANIFEST_PATH}"
+}
+
+read_manifest() {
+    local mf="${ESP}/${MANIFEST_PATH}"
+    [ -f "$mf" ] || return 1
+
+    MANIFEST_HASHES=()
+    local line
+    while IFS= read -r line; do
+        case "$line" in
+            "# Version: "*)  MANIFEST_VERSION="${line#\# Version: }" ;;
+            "# Arch: "*)     MANIFEST_ARCH="${line#\# Arch: }" ;;
+            "#"*|"")         continue ;;
+            sha256:*)
+                local hash path
+                hash="${line%%  *}"
+                path="${line#*  }"
+                hash="${hash#sha256:}"
+                MANIFEST_HASHES["$path"]="$hash"
+                ;;
+        esac
+    done < "$mf"
+    return 0
+}
+
+# ============================================================================
+# Removal (--remove)
+# ============================================================================
+
+do_remove() {
+    msg "Removing LamBoot installation..."
+
+    phase1_detect_environment
+
+    if ! read_manifest; then
+        # Check if LamBoot looks entirely absent (idempotent-remove friendly path).
+        if [ ! -d "${ESP}/${EFI_DIR}" ] && ! efibootmgr 2>/dev/null | grep -qi 'LamBoot'; then
+            ok "LamBoot is not installed; nothing to remove."
+            return 0
+        fi
+        if (( OPT_FORCE )); then
+            warn "No install manifest found. Removing known files with --force."
+        else
+            die "No install manifest found at ${ESP}/${MANIFEST_PATH}.
+  Cannot safely determine which files to remove.
+  Use --force to remove known default paths."
+        fi
+    fi
+
+    # Remove UEFI boot entry
+    if ! (( OPT_NO_EFI_ENTRY )) && ! (( IS_CHROOT )); then
+        local bootnum
+        bootnum=$(find_lamboot_entry)
+        if [ -n "$bootnum" ]; then
+            run "remove UEFI boot entry Boot${bootnum}" \
+                efibootmgr -b "$bootnum" -B --quiet \
+                || warn "Failed to remove UEFI boot entry Boot${bootnum}"
+            ok "Removed UEFI boot entry Boot${bootnum}"
+        fi
+    fi
+
+    # Remove manifest-tracked files
+    local path
+    for path in "${!MANIFEST_HASHES[@]}"; do
+        local full="${ESP}/${path}"
+        [ -f "$full" ] || continue
+
+        if (( OPT_KEEP_ENTRIES )) && [[ "$path" == "${BLS_DIR}/"* ]]; then
+            detail "Keeping BLS entry: ${path}"
+            continue
+        fi
+
+        local current_hash expected_hash
+        current_hash=$(file_sha256 "$full")
+        expected_hash="${MANIFEST_HASHES[$path]}"
+
+        if [ "$current_hash" = "$expected_hash" ] || (( OPT_FORCE )); then
+            run "remove ${path}" rm -f "$full" || warn "Failed to remove ${path}"
+            detail "Removed: ${path}"
+        else
+            warn "File modified since install, skipping: ${path}"
+        fi
+    done
+
+    # Restore fallback backup
+    local fb_backup="${ESP}/${FALLBACK_DIR}/$(fallback_name).lamboot-backup"
+    if [ -f "$fb_backup" ]; then
+        local fb_dst="${ESP}/${FALLBACK_DIR}/$(fallback_name)"
+        run "restore fallback backup" mv -f "$fb_backup" "$fb_dst" \
+            || warn "Failed to restore fallback backup"
+        ok "Restored original $(fallback_name)"
+    fi
+
+    # Disable systemd service
+    if command -v systemctl >/dev/null 2>&1 && ! (( IS_CHROOT )); then
+        run "disable mark-success service" \
+            systemctl disable lamboot-mark-success.service 2>/dev/null || true
+    fi
+    run "remove mark-success service" \
+        rm -f "${SYSTEMD_UNIT_DIR}/lamboot-mark-success.service" 2>/dev/null || true
+
+    run "remove kernel-install plugin" \
+        rm -f "${KERNEL_INSTALL_DIR}/90-lamboot.install" 2>/dev/null || true
+
+    # Remove empty directories
+    local dir
+    for dir in reports modules drivers ""; do
+        rmdir "${ESP}/${EFI_DIR}/${dir}" 2>/dev/null || true
+    done
+
+    rm -f "${ESP}/${MANIFEST_PATH}" 2>/dev/null
+
+    # Clean up empty LamBoot subdirectories that held only manifest-tracked
+    # files. Run rmdir on each in bottom-up order; rmdir fails harmlessly on
+    # non-empty directories. Keeps the ESP tidy after --remove.
+    local lb_dir="${ESP}/${EFI_DIR}"
+    if [ -d "$lb_dir" ]; then
+        local d
+        for d in drivers modules reports; do
+            [ -d "${lb_dir}/${d}" ] && rmdir "${lb_dir}/${d}" 2>/dev/null || true
+        done
+        rmdir "$lb_dir" 2>/dev/null || true
+    fi
+
+    ok "LamBoot removed."
+}
+
+# ============================================================================
+# CLI Parsing and Main
+# ============================================================================
+
+usage() {
+    cat <<'USAGE'
+Usage: lamboot-install [OPTIONS]
+
+Install, update, or remove the LamBoot UEFI bootloader.
+
+Options:
+  --esp PATH        Override ESP mount point detection
+  --no-efi-entry    Don't create UEFI boot entry (file copy only)
+  --no-make-default Do NOT make LamBoot the default boot entry.
+                    (Default behavior is to promote LamBoot to first in
+                    BootOrder — same as grub-install / bootctl install.)
+  --set-default     Explicitly make LamBoot default (now the install default;
+                    retained for backward compatibility and scripts).
+  --replace         Replace existing bootloader (backup + make-default)
+  --fallback        Also install as \EFI\BOOT\BOOTX64.EFI
+  --signed          Use pre-signed binary (required for Secure Boot)
+  --no-shim         Skip shim chain setup even if Secure Boot is on.
+                    REQUIRES the kernel to be firmware-DB-signed. For stock
+                    Linux distro kernels (Ubuntu/Debian/Fedora/etc. which are
+                    MOK-chained) this will lead to kernel-load failure inside
+                    LamBoot. If you genuinely have a firmware-DB-signed kernel
+                    (self-signed UKI / custom shop), pair with
+                    --kernel-firmware-db-signed. See
+                    docs/analysis/CONFIG-4-TRUST-CHAIN-GAP-2026-04-21.md.
+  --no-mok          Skip MOK enrollment prompt (advanced; implies manual
+                    enrollment by the operator). Shim is STILL deployed in the
+                    boot chain; pre-enrolled MokList from the guest OS install
+                    continues to provide kernel trust.
+  --kernel-firmware-db-signed
+                    Assert the kernel is signed by a cert in firmware DB.
+                    Unblocks --no-shim under Secure Boot. Rare — only use if
+                    you know your kernel signature chain terminates in
+                    firmware DB, not MOK.
+  --with-drivers    Install filesystem drivers (auto-detected by default)
+  --with-modules    Install diagnostic modules
+  --remove          Remove LamBoot installation (reads install manifest)
+  --update          Update existing installation (preserve config)
+  --dry-run         Show what would happen without doing it
+  --force           Skip safety checks
+  --no-bls          Don't generate BLS entries
+  --keep-entries    With --remove: keep generated BLS entries
+  --quiet           Minimal output
+  --verbose         Detailed output
+  --version         Print version and exit
+  --help            Print this help
+
+Exit codes:
+  0  Success
+  1  Fatal error
+  2  Partial success (non-critical step failed)
+  3  Nothing to do (already up to date)
+USAGE
+}
+
+parse_options() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --esp)          [ -n "${2:-}" ] || die "--esp requires a path argument"; OPT_ESP="$2"; shift ;;
+            --no-efi-entry) OPT_NO_EFI_ENTRY=1 ;;
+            --set-default)    OPT_SET_DEFAULT=1 ;;
+            --no-make-default) OPT_SET_DEFAULT=0 ;;
+            --make-default)   OPT_SET_DEFAULT=1 ;;
+            --fallback)     OPT_FALLBACK=1 ;;
+            --with-drivers) OPT_WITH_DRIVERS=1 ;;
+            --with-modules) OPT_WITH_MODULES=1 ;;
+            --remove)       OPT_REMOVE=1 ;;
+            --update)       OPT_UPDATE=1 ;;
+            --dry-run)      OPT_DRY_RUN=1 ;;
+            --force)        OPT_FORCE=1 ;;
+            --no-bls)       OPT_NO_BLS=1 ;;
+            --keep-entries) OPT_KEEP_ENTRIES=1 ;;
+            --quiet)        OPT_QUIET=1 ;;
+            --verbose)      OPT_VERBOSE=1 ;;
+            --replace)      OPT_REPLACE=1; OPT_SET_DEFAULT=1 ;;
+            --signed)       OPT_SIGNED=1 ;;
+            --no-shim)      OPT_NO_SHIM=1 ;;
+            --no-mok)       OPT_NO_MOK=1 ;;
+            --kernel-firmware-db-signed) OPT_KERNEL_DB_SIGNED=1 ;;
+            --version)      echo "lamboot-install ${LAMBOOT_VERSION}"; exit 0 ;;
+            --help|-h)      usage; exit 0 ;;
+            *)              die "Unknown option: $1" ;;
+        esac
+        shift
+    done
+
+    # Mutual exclusion — note that OPT_SET_DEFAULT defaults to 1 under install
+    # mode; for --remove it must be silently disabled (not treated as conflict)
+    # unless the user explicitly asked for --set-default on a remove (nonsense).
+    if (( OPT_REMOVE )); then
+        OPT_SET_DEFAULT=0
+        (( OPT_FALLBACK ))    && die "--remove and --fallback are mutually exclusive."
+        (( OPT_UPDATE ))      && die "--remove and --update are mutually exclusive."
+    fi
+    (( OPT_QUIET && OPT_VERBOSE )) && die "--quiet and --verbose are mutually exclusive."
+
+    # Config-4 / --no-shim trust-chain guardrail.
+    # Under Secure Boot, if the user asks to skip shim, the kernel must be
+    # firmware-DB-signed (otherwise LamBoot will load but fail to boot the
+    # kernel because MOK-chained kernels can't be verified without shim's
+    # ShimLock protocol). Stock Ubuntu/Debian/Fedora kernels are MOK-chained,
+    # not firmware-DB-signed.
+    # See docs/analysis/CONFIG-4-TRUST-CHAIN-GAP-2026-04-21.md for the
+    # full root-cause narrative.
+    if (( OPT_NO_SHIM )) && (( SECURE_BOOT )) && ! (( OPT_KERNEL_DB_SIGNED )); then
+        die "--no-shim under Secure Boot requires a firmware-DB-signed kernel.
+Stock Linux distro kernels (Ubuntu, Debian, Fedora, openSUSE, Arch) are NOT
+firmware-DB-signed — they use shim + MOK. Without shim in the chain, LamBoot
+cannot verify them and they will fail to boot.
+
+If you truly have a firmware-DB-signed kernel (e.g. self-signed UKI with your
+cert in firmware DB), re-run with:
+    lamboot-install --signed --no-shim --kernel-firmware-db-signed
+
+For stock distro installs on SB-enabled systems, the correct flow is:
+    lamboot-install --signed              # deploys shim + LamBoot + optional MOK prompt
+    lamboot-install --signed --no-mok     # deploys shim but skips interactive mokutil
+
+See docs/SECURE-BOOT-DEPLOYMENT.md and
+docs/analysis/CONFIG-4-TRUST-CHAIN-GAP-2026-04-21.md."
+    fi
+}
+
+main() {
+    parse_options "$@"
+
+    if (( OPT_REMOVE )); then
+        do_remove
+        exit $(( PARTIAL_FAILURE ? EXIT_PARTIAL : EXIT_OK ))
+    fi
+
+    phase1_detect_environment
+    phase2_assess_drivers
+    phase3_discover_entries
+
+    if (( OPT_REPLACE )); then
+        phase3b_backup_and_migrate
+    fi
+
+    phase4_install_files
+    phase5_generate_bls
+    phase6_efi_boot_entry
+    phase7_systemd_integration
+
+    write_manifest
+    phase8_verify
+
+    exit $(( PARTIAL_FAILURE ? EXIT_PARTIAL : EXIT_OK ))
+}
+
+# Allow --help and --version without root
+for arg in "$@"; do
+    case "$arg" in
+        --help|-h) usage; exit 0 ;;
+        --version) echo "lamboot-install ${LAMBOOT_VERSION}"; exit 0 ;;
+    esac
+done
+
+(( EUID == 0 )) || die "This script must be run as root."
+
+main "$@"

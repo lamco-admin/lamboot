@@ -1,0 +1,199 @@
+#!/bin/bash
+# lamboot-kernel-hook — BLS entry generator for kernel install/remove events.
+#
+# Called by:
+#   /usr/lib/kernel/install.d/90-lamboot.install (kernel-install framework)
+#   /etc/kernel/postinst.d/zz-lamboot (Debian/Ubuntu hook)
+#   /etc/kernel/postrm.d/zz-lamboot (Debian/Ubuntu hook)
+#
+# Usage:
+#   lamboot-kernel-hook add KERNEL_VERSION [KERNEL_IMAGE]
+#   lamboot-kernel-hook remove KERNEL_VERSION
+#
+# BLS entries are written to /boot/efi/loader/entries/ (or wherever the ESP
+# is mounted). The entry filename is {distro}-{version}.conf.
+
+set -uo pipefail
+
+# --- Configuration ---
+
+# ESP mount point (auto-detected)
+ESP=""
+BLS_DIR=""
+CMDLINE_FILE="/etc/kernel/cmdline"
+
+# --- Functions ---
+
+die() { printf "lamboot-kernel-hook: ERROR: %s\n" "$1" >&2; exit 1; }
+
+find_esp() {
+    for mp in /boot/efi /efi; do
+        if mountpoint -q "$mp" 2>/dev/null; then
+            ESP="$mp"
+            BLS_DIR="$ESP/loader/entries"
+            return 0
+        fi
+    done
+    die "Cannot find ESP mount point (/boot/efi or /efi)"
+}
+
+get_distro_id() {
+    if [ -f /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        echo "${ID:-linux}"
+    else
+        echo "linux"
+    fi
+}
+
+get_distro_name() {
+    if [ -f /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        echo "${PRETTY_NAME:-${NAME:-Linux}}"
+    else
+        echo "Linux"
+    fi
+}
+
+get_kernel_cmdline() {
+    # Priority: /etc/kernel/cmdline > /proc/cmdline (filtered)
+    if [ -f "$CMDLINE_FILE" ]; then
+        cat "$CMDLINE_FILE"
+        return
+    fi
+
+    # Fall back to /proc/cmdline, stripping boot-specific params
+    if [ -f /proc/cmdline ]; then
+        sed 's/BOOT_IMAGE=[^ ]* //; s/initrd=[^ ]* //' /proc/cmdline
+    fi
+}
+
+find_initrd() {
+    local version="$1"
+    local initrd_paths=""
+
+    # Check for microcode first
+    for ucode in /boot/intel-ucode.img /boot/amd-ucode.img; do
+        if [ -f "$ucode" ]; then
+            initrd_paths="/$(basename "$ucode")"
+            break
+        fi
+    done
+
+    # Distro-specific initrd naming
+    for pattern in \
+        "/boot/initramfs-${version}.img" \
+        "/boot/initrd.img-${version}" \
+        "/boot/initrd-${version}" \
+        "/boot/initramfs-${version}-fallback.img"; do
+        if [ -f "$pattern" ]; then
+            if [ -n "$initrd_paths" ]; then
+                initrd_paths="${initrd_paths}
+    /${pattern#/boot/}"
+            else
+                initrd_paths="/${pattern#/boot/}"
+            fi
+            break
+        fi
+    done
+
+    echo "$initrd_paths"
+}
+
+# --- Actions ---
+
+do_add() {
+    local version="$1"
+    local kernel_image="${2:-}"
+
+    find_esp
+    mkdir -p "$BLS_DIR"
+
+    local distro_id
+    distro_id=$(get_distro_id)
+    local distro_name
+    distro_name=$(get_distro_name)
+    local entry_file="${BLS_DIR}/${distro_id}-${version}.conf"
+
+    # Skip if entry already exists (deduplication with kernel-install)
+    if [ -f "$entry_file" ]; then
+        return 0
+    fi
+
+    # Find kernel path
+    local kernel_path=""
+    if [ -n "$kernel_image" ] && [ -f "$kernel_image" ]; then
+        kernel_path="/${kernel_image#/boot/}"
+    elif [ -f "/boot/vmlinuz-${version}" ]; then
+        kernel_path="/vmlinuz-${version}"
+    else
+        die "Cannot find kernel image for version ${version}"
+    fi
+
+    # Find initrd
+    local initrd_lines
+    initrd_lines=$(find_initrd "$version")
+
+    # Get kernel command line
+    local cmdline
+    cmdline=$(get_kernel_cmdline)
+
+    # Get machine ID
+    local machine_id=""
+    if [ -f /etc/machine-id ]; then
+        machine_id=$(cat /etc/machine-id)
+    fi
+
+    # Write BLS entry
+    {
+        echo "title      ${distro_name} (${version})"
+        echo "version    ${version}"
+        [ -n "$machine_id" ] && echo "machine-id ${machine_id}"
+        echo "linux      ${kernel_path}"
+        if [ -n "$initrd_lines" ]; then
+            echo "$initrd_lines" | while IFS= read -r line; do
+                [ -n "$line" ] && echo "initrd     ${line}"
+            done
+        fi
+        [ -n "$cmdline" ] && echo "options    ${cmdline}"
+    } > "$entry_file"
+
+    echo "lamboot-kernel-hook: created ${entry_file}"
+}
+
+do_remove() {
+    local version="$1"
+
+    find_esp
+
+    local distro_id
+    distro_id=$(get_distro_id)
+    local entry_file="${BLS_DIR}/${distro_id}-${version}.conf"
+
+    if [ -f "$entry_file" ]; then
+        rm -f "$entry_file"
+        echo "lamboot-kernel-hook: removed ${entry_file}"
+    fi
+}
+
+# --- Main ---
+
+action="${1:-}"
+version="${2:-}"
+
+case "$action" in
+    add)
+        [ -n "$version" ] || die "Usage: lamboot-kernel-hook add KERNEL_VERSION [KERNEL_IMAGE]"
+        do_add "$version" "${3:-}"
+        ;;
+    remove)
+        [ -n "$version" ] || die "Usage: lamboot-kernel-hook remove KERNEL_VERSION"
+        do_remove "$version"
+        ;;
+    *)
+        echo "Usage: lamboot-kernel-hook {add|remove} KERNEL_VERSION [KERNEL_IMAGE]" >&2
+        exit 1
+        ;;
+esac

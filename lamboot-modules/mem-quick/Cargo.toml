@@ -1,0 +1,17 @@
+[package]
+name = "mem-quick"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+uefi.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "mem-quick"
+path = "src/main.rs"

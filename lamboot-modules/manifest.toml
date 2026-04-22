@@ -1,0 +1,15 @@
+# LamBoot Module Manifest
+# Place this file alongside .efi modules in \EFI\LamBoot\modules\
+# LamBoot reads this to display module metadata in the boot menu.
+
+[modules.diag-shell]
+name = "Diagnostic Shell"
+
+[modules.pci-inventory]
+name = "PCI Device Inventory"
+
+[modules.mem-quick]
+name = "Quick Memory Test"
+
+[modules.nvme-diag]
+name = "NVMe Health Check"

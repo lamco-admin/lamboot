@@ -1,0 +1,7 @@
+# Windows Boot Manager Entry
+
+id = "windows"
+name = "Windows 11"
+type = "chainload"
+efi_path = "\\EFI\\Microsoft\\Boot\\bootmgfw.efi"
+icon = "windows"

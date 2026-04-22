@@ -1,0 +1,22 @@
+#!/bin/bash
+# Forget the session-unlocked LamBoot db signing key.
+#
+# Usage:
+#   source tools/sign-lock
+
+if [ -z "$BASH_SOURCE" ] || [ "$BASH_SOURCE" = "$0" ]; then
+    echo "Usage: source tools/sign-lock" >&2
+    exit 1
+fi
+
+UNLOCK_DIR="/run/user/${UID}/lamboot-signing"
+UNLOCK_KEY="${UNLOCK_DIR}/db.key"
+
+if [ -f "$UNLOCK_KEY" ]; then
+    shred -u "$UNLOCK_KEY" 2>/dev/null || rm -f "$UNLOCK_KEY"
+    echo "Shredded: $UNLOCK_KEY"
+fi
+
+rmdir "$UNLOCK_DIR" 2>/dev/null || true
+unset LAMBOOT_SIGN_KEY
+echo "Session signing cache cleared."

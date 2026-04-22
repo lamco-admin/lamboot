@@ -1,0 +1,61 @@
+[workspace]
+members = [
+    "lamboot-core",
+    "lamboot-modules/nvme-diag",
+    "lamboot-modules/mem-quick",
+    "lamboot-modules/pci-inventory",
+    "lamboot-modules/diag-shell",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.8.3"
+authors = ["LamBoot Contributors"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+uefi = { version = "0.37", features = ["alloc", "global_allocator", "logger", "panic_handler"] }
+uefi-raw = "0.14"
+log = "0.4"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+elided_lifetimes_in_paths = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+pedantic = { priority = -1, level = "deny" }
+allow_attributes = "deny"
+
+# Pedantic allows — false-positive-prone or low-value for UEFI bootloader code
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+missing_panics_doc = "allow"
+similar_names = "allow"
+items_after_statements = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+too_many_lines = "allow"
+
+# Functional lints
+wildcard_imports = "deny"
+large_futures = "warn"
+
+# Progressive
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+codegen-units = 1
+strip = true

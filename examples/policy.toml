@@ -1,0 +1,59 @@
+# LamBoot Policy Configuration
+# Place this file at: \EFI\LamBoot\policy.toml on your ESP
+#
+# All fields are optional. Missing fields use sensible defaults.
+
+# Config format version (always 1)
+version = 1
+
+# Boot timeout in milliseconds (0 = wait indefinitely)
+default_timeout_ms = 5000
+
+# Default entry to boot when timeout expires.
+# This is the entry ID (filename without .conf for BLS entries,
+# or "windows", "grub", "refind", "fallback" for ESP entries).
+# If not specified, the first entry by sort order is selected.
+# default_entry = "fedora-6.12.0"
+
+[security]
+# Refuse to boot if Secure Boot is disabled
+secure_boot_required = false
+
+# Enable TPM measured boot (PCR 4/5/12)
+measured_boot = true
+
+# Number of failed boots before entering CrashLoop state
+# and automatically selecting a fallback entry.
+crash_threshold = 3
+
+# Entry IDs to try when in crash loop, in order of preference.
+# If all fail or none match, the menu is shown for user intervention.
+# fallback_order = ["fedora-6.11.0", "fallback"]
+fallback_order = []
+
+# Allowed EFI paths (wildcards supported with *).
+# If empty, all paths are allowed (unless denied).
+# allowlist = ["\\EFI\\fedora\\*", "\\EFI\\Microsoft\\*"]
+allowlist = []
+
+# Denied EFI paths (overrides allowlist).
+denylist = []
+
+[ui]
+# Theme: "default" (more themes planned)
+theme = "default"
+
+# Font size: "small", "medium", "large"
+font_size = "medium"
+
+[modules]
+# Enable loading of diagnostic modules from \EFI\LamBoot\modules\
+# Set to false to disable module discovery entirely.
+enabled = true
+
+[watchdog]
+# Enable UEFI watchdog timer (prevents hangs)
+enabled = true
+
+# Watchdog grace period in seconds
+grace_seconds = 15

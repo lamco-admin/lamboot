@@ -1,0 +1,11 @@
+#!/bin/bash
+# /etc/kernel/postinst.d/zz-lamboot
+# Called by dpkg after a kernel is installed.
+# Arguments: KERNEL_VERSION [KERNEL_IMAGE_PATH]
+#
+# The zz- prefix ensures this runs AFTER initramfs generation
+# (initramfs-tools uses z50-* or zz-update-initramfs).
+
+[ -x /usr/local/bin/lamboot-kernel-hook ] || exit 0
+
+/usr/local/bin/lamboot-kernel-hook add "$@"

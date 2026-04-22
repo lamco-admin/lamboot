@@ -1,0 +1,65 @@
+#!/bin/bash
+# Unlock the LamBoot db signing key once per terminal session.
+#
+# Usage:
+#   source tools/sign-unlock
+#
+# This prompts for the db.key passphrase, decrypts it to a user-only
+# tmpfs location (/run/user/$UID/lamboot-signing/db.key), and exports
+# LAMBOOT_SIGN_KEY pointing to it. Subsequent `./build.sh --sign` or
+# `./tools/sign-lamboot.sh` runs in the same shell will use the
+# unlocked key without re-prompting.
+#
+# To forget: source tools/sign-lock (or just close the terminal).
+#
+# The tmpfs mount at /run/user/$UID is backed by RAM and is cleared
+# on logout, so the unlocked key does not persist across reboots.
+
+set -e
+
+if [ -z "$BASH_SOURCE" ]; then
+    echo "ERROR: run with 'source tools/sign-unlock', not './tools/sign-unlock'"
+    exit 1
+fi
+
+if [ "$BASH_SOURCE" = "$0" ]; then
+    echo "ERROR: this script must be sourced, not executed directly"
+    echo "Usage: source tools/sign-unlock"
+    exit 1
+fi
+
+if [ ! -f keys/db.key ]; then
+    echo "ERROR: keys/db.key not found. Run from the repo root." >&2
+    return 1
+fi
+
+UNLOCK_DIR="/run/user/${UID}/lamboot-signing"
+UNLOCK_KEY="${UNLOCK_DIR}/db.key"
+
+mkdir -p "$UNLOCK_DIR"
+chmod 0700 "$UNLOCK_DIR"
+
+# Only re-unlock if the cached copy is missing or stale
+if [ -f "$UNLOCK_KEY" ]; then
+    if [ "keys/db.key" -nt "$UNLOCK_KEY" ]; then
+        echo "keys/db.key is newer than cached copy; re-unlocking."
+    else
+        echo "Already unlocked at $UNLOCK_KEY"
+        export LAMBOOT_SIGN_KEY="$UNLOCK_KEY"
+        return 0
+    fi
+fi
+
+echo "Enter passphrase for keys/db.key (for the current session only):"
+if openssl rsa -in keys/db.key -out "$UNLOCK_KEY" 2>/dev/null; then
+    chmod 0600 "$UNLOCK_KEY"
+    export LAMBOOT_SIGN_KEY="$UNLOCK_KEY"
+    echo "Unlocked: $UNLOCK_KEY"
+    echo "Shells in this terminal will sign without re-prompting."
+    echo "To forget early: source tools/sign-lock"
+else
+    rm -f "$UNLOCK_KEY"
+    unset LAMBOOT_SIGN_KEY
+    echo "ERROR: failed to decrypt keys/db.key (wrong passphrase?)" >&2
+    return 1
+fi
