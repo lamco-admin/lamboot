@@ -1,0 +1,13 @@
+{"seq":0,"event":"boot_start","path":"","size":0,"sha256":"","verified_via":"","status":"","note":"version=0.8.3 arch=x86_64 sb=Enabled crash_counter=0"}
+{"seq":1,"event":"volume_mounted","path":"","size":0,"sha256":"","verified_via":"","verifier_tag":"","status":"SUCCESS","note":"backend=fat fs_uuid=12345678-0000-0000-0000-000000000000 partition_guid=c12a7328-... index=0 label=EFI"}
+{"seq":2,"event":"shimlock_acquired","path":"","size":0,"sha256":"","verified_via":"","status":"SUCCESS","note":"shim-15.8"}
+{"seq":3,"event":"policy_loaded","path":"/EFI/LamBoot/policy.toml","size":512,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verified_via":"","status":"SUCCESS","note":""}
+{"seq":4,"event":"entries_discovered","path":"","size":0,"sha256":"","verified_via":"","status":"SUCCESS","note":"count=3"}
+{"seq":5,"event":"entry_selected","path":"/boot/vmlinuz-6.12.0-fedora","size":0,"sha256":"","verified_via":"","status":"SUCCESS","note":"id=bls-fedora"}
+{"seq":6,"event":"kernel_bytes_read","path":"/boot/vmlinuz-6.12.0-fedora","size":18225512,"sha256":"","verified_via":"","status":"SUCCESS","note":"backend=fat"}
+{"seq":7,"event":"image_verified","path":"/boot/vmlinuz-6.12.0-fedora","size":18225512,"sha256":"3df266502d2443ed68a609a0b7e3febf0d37fca52deb704de15637990e8dea82","verified_via":"shim_mok","verifier_tag":"shim-15.8-0ubuntu2","status":"SUCCESS","note":""}
+{"seq":8,"event":"kernel_measured","path":"/boot/vmlinuz-6.12.0-fedora","size":18225512,"sha256":"3df266502d2443ed68a609a0b7e3febf0d37fca52deb704de15637990e8dea82","verified_via":"","status":"SUCCESS","note":"pcr=4"}
+{"seq":9,"event":"cmdline_measured","path":"","size":0,"sha256":"","verified_via":"","status":"SUCCESS","note":"pcr=12 cmdline=ro quiet splash root=UUID=..."}
+{"seq":10,"event":"image_loaded_native","path":"/boot/vmlinuz-6.12.0-fedora","size":18225512,"sha256":"3df266502d2443ed68a609a0b7e3febf0d37fca52deb704de15637990e8dea82","verified_via":"shim_mok","verifier_tag":"","status":"SUCCESS","note":"entry_rva=0x1000 base=0xffffffff80000000 pages=4449"}
+{"seq":11,"event":"initrd_registered","path":"","size":12345678,"sha256":"","verified_via":"","status":"SUCCESS","note":"count=2"}
+{"seq":12,"event":"boot_attempt","path":"/boot/vmlinuz-6.12.0-fedora","size":0,"sha256":"","verified_via":"","status":"SUCCESS","note":"id=bls-fedora kind=LinuxLegacy"}

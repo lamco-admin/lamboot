@@ -24,6 +24,10 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
 
+# Shared fleet configuration, authoritative schema documented in
+# ~/lamboot-tools-dev/docs/SPEC-LAMBOOT-TOOLKIT-V1.md §16 Appendix C.
+FLEET_TOML_PATH = "/etc/lamboot/fleet.toml"
+
 # LamBoot vendor GUID: 4C414D42-4F4F-5400-0000-000000000001
 LAMBOOT_GUID = "4c414d42-4f4f-5400-0000-000000000001"
 
@@ -299,13 +303,97 @@ def send_webhook(url: str, payload: dict):
         print(f"Webhook failed: {e}", file=sys.stderr)
 
 
+def load_fleet_config(path: str = FLEET_TOML_PATH) -> dict:
+    """Return the [monitor] section of /etc/lamboot/fleet.toml, or {} if absent.
+
+    Schema v1 is defined in ~/lamboot-tools-dev/docs/SPEC-LAMBOOT-TOOLKIT-V1.md
+    §16 Appendix C. This function is tolerant: missing file, missing TOML
+    parser, missing section, or wrong schema version all return {} so the
+    caller can fall back to hardcoded defaults.
+    """
+    if not os.path.exists(path):
+        return {}
+
+    # Python 3.11+: stdlib tomllib. Older: tomli (optional). Fail soft.
+    toml_loader = None
+    try:
+        import tomllib as toml_loader  # type: ignore[import-not-found,no-redef]
+    except ImportError:
+        try:
+            import tomli as toml_loader  # type: ignore[import-not-found,no-redef]
+        except ImportError:
+            print(
+                f"WARN: {path} present but neither tomllib nor tomli is "
+                "installed; ignoring. Install python3-tomli on older distros.",
+                file=sys.stderr,
+            )
+            return {}
+
+    try:
+        with open(path, "rb") as f:
+            data = toml_loader.load(f)
+    except Exception as e:  # TOMLDecodeError in 3.11+, other exceptions otherwise
+        print(f"WARN: failed to parse {path}: {e}; ignoring.", file=sys.stderr)
+        return {}
+
+    schema = data.get("schema_version")
+    if schema not in (None, 1):
+        print(
+            f"WARN: {path} schema_version={schema} is not 1; ignoring "
+            "(update lamboot-dev or downgrade fleet.toml).",
+            file=sys.stderr,
+        )
+        return {}
+
+    monitor = data.get("monitor", {})
+    if not isinstance(monitor, dict):
+        return {}
+    return monitor
+
+
 def main():
+    # Read /etc/lamboot/fleet.toml [monitor] section to seed argparse defaults.
+    # CLI flags always win over the file; the file wins over hardcoded defaults.
+    fleet_monitor = load_fleet_config()
+    default_webhook = fleet_monitor.get("alert_webhook") or None
+    default_log_path = fleet_monitor.get("log_path") or "/var/log/lamboot-monitor.log"
+
     parser = argparse.ArgumentParser(description="LamBoot Proxmox boot health monitor")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--threshold", type=int, default=2, help="Crash count threshold (default: 2)")
-    parser.add_argument("--alert-webhook", help="Webhook URL for critical alerts")
+    parser.add_argument(
+        "--alert-webhook",
+        default=default_webhook,
+        help=(
+            "Webhook URL for critical alerts "
+            f"(default: from {FLEET_TOML_PATH} [monitor].alert_webhook if set)"
+        ),
+    )
+    parser.add_argument(
+        "--log-path",
+        default=default_log_path,
+        help=(
+            "Log file path "
+            f"(reserved; currently unused. Default from {FLEET_TOML_PATH} [monitor].log_path)"
+        ),
+    )
     parser.add_argument("--vmid", type=int, help="Check a specific VM only")
+    parser.add_argument("--fleet-config", help="Override fleet.toml path for debugging")
     args = parser.parse_args()
+
+    # Re-read with override if --fleet-config given (rare; testing only).
+    if args.fleet_config:
+        override = load_fleet_config(args.fleet_config)
+        if args.alert_webhook is None:
+            args.alert_webhook = override.get("alert_webhook")
+
+    # Reject plain-http webhooks per schema validation rule (§16 Appendix C).
+    if args.alert_webhook and not args.alert_webhook.startswith("https://"):
+        print(
+            f"ERROR: alert webhook must use HTTPS: {args.alert_webhook}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     vms = find_ovmf_vms()
     if args.vmid:

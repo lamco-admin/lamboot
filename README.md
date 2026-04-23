@@ -8,9 +8,9 @@
 
 LamBoot is a UEFI bootloader for Linux targeting hypervisor-managed VM environments (Proxmox in particular) and homelab / desktop systems. Eight clean architectural layers, ~8,300 lines of Rust. Graphical menu with mouse. BLS + UKI + `kernel-install` done right. Host-side fleet monitoring without an in-guest agent. An honest Secure Boot posture with a JSON trust-evidence log written to the ESP on every boot.
 
-**v0.8.3 ships the signing + audit layer.** Native read-only ext4 and a native PE loader land in v0.9.x → v1.0 so Secure Boot on stock Ubuntu/Debian/Fedora `/boot` just works. See the [roadmap](docs/ROADMAP.md) and the [integrated plan](docs/INTEGRATED-PLAN-V0.8.3-TO-V1.0.md).
+**v0.8.4 ships the signing + audit layer + coordinated Proxmox-toolkit integration.** v0.8.3 landed the signing pipeline; v0.8.4 adds the fw_cfg file-reference hookscript rewrite, shared `/etc/lamboot/fleet.toml` schema, and `lamboot-install --toolkit-prompt` opt-in for the `lamboot-tools` v0.2.0 companion toolkit. Native read-only ext4 and a native PE loader land in v0.9.x → v1.0 so Secure Boot on stock Ubuntu/Debian/Fedora `/boot` just works. See the [roadmap](docs/ROADMAP.md) and the [integrated plan](docs/INTEGRATED-PLAN-V0.8.3-TO-V1.0.md).
 
-- **Current version:** 0.8.3 (April 2026)
+- **Current version:** 0.8.4 (April 2026)
 - **Binary size:** 215 KB (x86_64 unsigned), 217 KB (signed)
 - **Platforms:** x86_64 UEFI, aarch64 UEFI
 - **License:** MIT OR Apache-2.0
@@ -80,7 +80,7 @@ LamBoot is a UEFI bootloader for Linux targeting hypervisor-managed VM environme
 ### Homelab (Secure Boot off)
 
 ```bash
-tar xzf lamboot-0.8.3-x86_64.tar.gz && cd lamboot-0.8.3
+tar xzf lamboot-0.8.4-x86_64.tar.gz && cd lamboot-0.8.4
 sudo ./lamboot-install
 # Reboot → pick "LamBoot" from firmware boot menu
 ```
@@ -96,12 +96,33 @@ sudo ./lamboot-install --signed
 
 ```bash
 # On host
-cp lamboot-0.8.3/OVMF_VARS_lamboot.fd /var/lib/vz/images/100/OVMF_VARS_100.fd
+cp lamboot-0.8.4/OVMF_VARS_lamboot.fd /var/lib/vz/images/100/OVMF_VARS_100.fd
 # In VM
 sudo ./lamboot-install --signed --no-mok
 ```
 
 Full walkthroughs in [`docs/SECURE-BOOT-DEPLOYMENT.md`](docs/SECURE-BOOT-DEPLOYMENT.md).
+
+---
+
+## Diagnostic and repair utilities
+
+Companion toolkit: **[`lamboot-tools`](https://github.com/lamco-admin/lamboot-tools)** —
+eleven CLI tools for diagnosing, repairing, backing up, and migrating Linux
+UEFI boot configurations. Works on any UEFI system regardless of bootloader;
+has LamBoot-specific subcommands where useful.
+
+Ships as three RPM subpackages from one source tree:
+
+- `lamboot-tools` — core utilities (`lamboot-diagnose`, `lamboot-doctor`, `lamboot-esp`, `lamboot-backup`, `lamboot-repair`, `lamboot-migrate`, `lamboot-uki-build`, `lamboot-signing-keys`, `lamboot-toolkit` dispatcher, and a mirror of this repo's `lamboot-inspect`).
+- `lamboot-migrate` — standalone RPM for operators who want only the BIOS→UEFI migrator.
+- `lamboot-toolkit-pve` — Proxmox host add-on (`lamboot-pve-setup`, `lamboot-pve-fleet`, plus mirrors of `lamboot-monitor.py` and `build-ovmf-vars.sh` from this repo).
+
+See [`docs/LAMBOOT-TOOLS-OVERVIEW.md`](docs/LAMBOOT-TOOLS-OVERVIEW.md) for
+tool-by-tool guidance, [`docs/CROSS-REPO-STATUS.md`](docs/CROSS-REPO-STATUS.md)
+for current v0.8.4 + v0.2.0 coordination state, and the authoritative
+[`SPEC-LAMBOOT-TOOLKIT-V1.md`](https://github.com/lamco-admin/lamboot-tools-dev/blob/main/docs/SPEC-LAMBOOT-TOOLKIT-V1.md)
+for product design.
 
 ---
 

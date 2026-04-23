@@ -46,7 +46,7 @@ fi
 
 # --- Constants ---
 
-readonly LAMBOOT_VERSION="0.8.3"
+readonly LAMBOOT_VERSION="0.8.4"
 readonly LAMBOOT_LABEL="LamBoot"
 
 readonly EFI_DIR="EFI/LamBoot"
@@ -93,6 +93,9 @@ OPT_SIGNED=0
 OPT_KERNEL_DB_SIGNED=0   # asserts kernel is firmware-DB-signed (rare); allows --no-shim under SB
 OPT_NO_SHIM=0
 OPT_NO_MOK=0
+# Tri-state: -1=auto (prompt if interactive TTY, skip otherwise);
+# 0=explicit skip (--no-install-toolkit); 1=explicit install (--install-toolkit).
+OPT_INSTALL_TOOLKIT=-1
 
 ESP=""
 ARCH=""
@@ -1785,6 +1788,81 @@ phase8_verify() {
 }
 
 # ============================================================================
+# Phase 9: Toolkit Recommendation (optional, brand-coherent, no-op by default)
+# ============================================================================
+
+phase9_toolkit_prompt() {
+    # Skip conditions:
+    #   - Dry run or quiet mode — respect the user's environment choices
+    #   - Update path (existing install already prompted at first install)
+    #   - Partial failure — don't add noise on top of an error
+    #   - --no-install-toolkit passed explicitly
+    (( OPT_DRY_RUN )) && return 0
+    (( OPT_QUIET )) && return 0
+    (( OPT_UPDATE )) && return 0
+    (( PARTIAL_FAILURE )) && return 0
+    (( OPT_INSTALL_TOOLKIT == 0 )) && return 0
+
+    # Auto mode: only prompt when stdin is a TTY. Scripts get silent skip.
+    if (( OPT_INSTALL_TOOLKIT == -1 )); then
+        [ -t 0 ] || return 0
+        local reply=""
+        printf '\nInstall lamboot-tools for diagnostic and repair utilities? [y/N] '
+        IFS= read -r reply || reply=""
+        case "${reply,,}" in
+            y|yes) ;;
+            *) return 0 ;;
+        esac
+    fi
+
+    # Explicit install (--install-toolkit) or interactive yes — print guidance.
+    # The toolkit is a separate user-space install, not a post-install action
+    # lamboot-install can complete automatically (different package manager,
+    # may require Copr enablement). Print exact commands per OS-release.
+    local distro_id=""
+    if [ -r /etc/os-release ]; then
+        distro_id=$(awk -F= '/^ID=/{gsub(/"/, "", $2); print $2}' /etc/os-release)
+    fi
+
+    echo
+    msg "To install lamboot-tools (runs as a separate user-space package):"
+    case "${distro_id}" in
+        fedora|rhel|centos|rocky|almalinux)
+            cat <<'EOF'
+  sudo dnf copr enable lamco/lamboot-tools
+  sudo dnf install lamboot-tools
+  # Proxmox host add-on (optional):
+  sudo dnf install lamboot-toolkit-pve
+EOF
+            ;;
+        debian|ubuntu|pop|linuxmint)
+            cat <<'EOF'
+  # Debian / Ubuntu packaging lands in lamboot-tools v0.3.
+  # For now, install from source tarball:
+  #   https://github.com/lamco-admin/lamboot-tools/releases
+EOF
+            ;;
+        arch|endeavouros|manjaro)
+            cat <<'EOF'
+  # Arch / AUR packaging lands in lamboot-tools v0.3.
+  # For now, install from source tarball:
+  #   https://github.com/lamco-admin/lamboot-tools/releases
+EOF
+            ;;
+        *)
+            cat <<'EOF'
+  # Install from source tarball:
+  #   https://github.com/lamco-admin/lamboot-tools/releases
+  # See the README in that repo for distro-specific install paths.
+EOF
+            ;;
+    esac
+    echo
+    msg "Docs: docs/LAMBOOT-TOOLS-OVERVIEW.md (this repo) or"
+    msg "      https://github.com/lamco-admin/lamboot-tools"
+}
+
+# ============================================================================
 # Install Manifest
 # ============================================================================
 
@@ -1977,6 +2055,11 @@ Options:
                     firmware DB, not MOK.
   --with-drivers    Install filesystem drivers (auto-detected by default)
   --with-modules    Install diagnostic modules
+  --install-toolkit Print lamboot-tools install guidance at end of successful
+                    install (non-interactive; suitable for scripts).
+  --no-install-toolkit
+                    Skip the lamboot-tools recommendation entirely.
+                    (Default: prompt [y/N] when stdin is a TTY; skip otherwise.)
   --remove          Remove LamBoot installation (reads install manifest)
   --update          Update existing installation (preserve config)
   --dry-run         Show what would happen without doing it
@@ -2019,6 +2102,8 @@ parse_options() {
             --signed)       OPT_SIGNED=1 ;;
             --no-shim)      OPT_NO_SHIM=1 ;;
             --no-mok)       OPT_NO_MOK=1 ;;
+            --install-toolkit)    OPT_INSTALL_TOOLKIT=1 ;;
+            --no-install-toolkit) OPT_INSTALL_TOOLKIT=0 ;;
             --kernel-firmware-db-signed) OPT_KERNEL_DB_SIGNED=1 ;;
             --version)      echo "lamboot-install ${LAMBOOT_VERSION}"; exit 0 ;;
             --help|-h)      usage; exit 0 ;;
@@ -2087,6 +2172,7 @@ main() {
 
     write_manifest
     phase8_verify
+    phase9_toolkit_prompt
 
     exit $(( PARTIAL_FAILURE ? EXIT_PARTIAL : EXIT_OK ))
 }

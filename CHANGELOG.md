@@ -2,7 +2,60 @@
 
 All notable changes to LamBoot are documented here. Format inspired by Keep a Changelog; semantic versioning is loose during pre-1.0.
 
-## [0.8.3] — 2026-04 (unreleased)
+## [0.8.4] — 2026-04-22
+
+**Release posture:** coordinated `lamboot v0.8.4` + `lamboot-tools v0.2.0`
+per `docs/CROSS-REPO-STATUS.md`. v0.8.3 shipped the signing + audit
+layer; v0.8.4 closes the Proxmox-toolkit coordination gaps so the
+companion `lamboot-tools` v0.2.0 toolkit (11 tools across 3 RPM
+subpackages) can ship alongside.
+
+Tarball SHA256: `4671691f597627ee354f36e945dc5d68a75709af4524a88c5a6aa9ae87056830`
+
+Proxmox integration test on `pve.a.lamco.io` (VM 120): PASS on all 8
+verifications. See `docs/analysis/V0.8.4-PROXMOX-INTEGRATION-TEST-2026-04-22.md`.
+
+See also: `lamco-admin/lamboot-tools v0.2.0`.
+
+### Fixed
+
+- **`tools/lamboot-hookscript.pl` rewritten to fw_cfg file-reference pattern** (commit `2892446`). Pre-0.8.4 hookscript called `qm set --args` during pre-start, which silently failed because Proxmox config-locks the VM config during that lifecycle phase. The rewrite removes all `qm set` calls: `lamboot-pve-setup` from the toolkit sets the permanent `args:` line once on a stopped VM, and this hookscript's pre-start job becomes writing `/var/lib/lamboot/<VMID>.json` for QEMU to expose via fw_cfg. Version header `# version: 0.8.4` allows `lamboot-pve-setup doctor-hookscript` to detect and verify. See `docs/specs/` + `~/lamboot-tools-dev/docs/SPEC-LAMBOOT-TOOLKIT-V1.md` §11.2 for the full protocol.
+
+### Added
+
+- **`lamboot-install --toolkit-prompt`** (commit `c4a9b4e`). Interactive `Install lamboot-tools for diagnostic and repair utilities? [y/N]` prompt at the end of a successful install, plus `--install-toolkit` / `--no-install-toolkit` flag overrides for non-interactive scripts. Distro-aware install guidance: Fedora/RHEL/EPEL shows `dnf copr enable lamco/lamboot-tools`; Debian/Ubuntu/Arch shows the source-tarball URL with a note that native packaging lands in `lamboot-tools v0.3`. Skipped on `--dry-run`, `--update`, `--quiet`, or partial failure.
+- **`/etc/lamboot/fleet.toml` schema v1 consumption** (commits `ada5cb6` + `2892446`). Both `tools/lamboot-monitor.py` and `tools/lamboot-hookscript.pl` now read the shared fleet config authored as canonical in `~/lamboot-tools-dev/docs/SPEC-LAMBOOT-TOOLKIT-V1.md` §16 Appendix C. Monitor seeds argparse defaults for `--alert-webhook` (HTTPS enforced) and `--log-path` from `[monitor]`. Hookscript reads `[hookscript]` inject flags plus `[roles]` explicit VMID mapping and `[tags]` tag-to-role mapping for per-VM role resolution. Additive with graceful fallback: missing file / missing TOML parser / wrong schema version / malformed TOML all fall back to hardcoded defaults so v0.8.4 is safe to deploy before fleet.toml exists.
+- **`docs/CROSS-REPO-STATUS.md`** (commit `51ce546`). Rolling coordination tracker between `lamboot-dev` and `lamboot-tools-dev` per the toolkit spec §14.5. Mirror counterpart lives in the toolkit repo; owner perspectives flipped between them.
+
+### Changed
+
+- **`docs/LAMBOOT-TOOLS-OVERVIEW.md` rewritten** (commit `51ce546`) to reflect the real state of the companion toolkit. Previously described "5 bash CLI utilities"; now describes 11 tools across 3 RPM subpackages (`lamboot-tools`, `lamboot-migrate` dual-pub, `lamboot-toolkit-pve`) with Copr-based install flow and Option 2 packaging architecture.
+- **`README.md` adds "Diagnostic and repair utilities" section** (commit `b812fea`) linking `github.com/lamco-admin/lamboot-tools` and cross-referencing `CROSS-REPO-STATUS.md` + the toolkit spec.
+- **`docs/STATUS-2026-04-22-TOOLKIT-PIVOT.md` §9 "Post-Q state" appendix added** (commit `51ce546`). Captures what happened after the pivot doc was written: the toolkit repo ran its Session A–Q arc the same day, turning 5 v0.1.0 scripts into 11 production-grade tools; all 23 R1–R23 research questions from §4 of the pivot doc are resolved in `~/lamboot-tools-dev/docs/SPEC-LAMBOOT-TOOLKIT-V1.md`; `lamboot-migrate v1.0.0` ships SDS-7 in full. §1-§8 of the pivot doc preserved as historical record.
+- **`docs/ROADMAP.md` "Toolkit Pivot" intro updated** (commit `51ce546`) with current toolkit state and `CROSS-REPO-STATUS.md` pointer.
+- **`docs/specs/SPEC-LAMBOOT-MIGRATE.md` §14 reconciliation flipped to RESOLVED** (commit `51ce546`). The v1.0.0 implementation landed in `lamboot-tools-dev` Session C closes every gap from §14.1–§14.7, plus `--remove-grub` distro-aware cleanup beyond spec. Each row marked `RESOLVED` / `RESOLVED+` / `KEPT`.
+
+### Added — should-have cross-references
+
+- **`docs/KEY-GENERATION.md` §10 "Operator tooling"** (commit `51ce546`) back-links to `lamboot-signing-keys` in the toolkit; lists `generate`/`rotate`/`enroll`/`sign-binary`/`revoke`/`list`/`show`/`verify`/`import`/`export` subcommands.
+- **`docs/SECURE-BOOT-AND-SIGNING-STRATEGY.md` "Operator tooling"** (commit `51ce546`) maps `sign-binary`/`rotate`/`verify` to procedures in the strategy doc.
+- **`docs/OVMF-VARS-PROXMOX.md` §12** (commit `51ce546`) notes `lamboot-pve-ovmf-vars` in the toolkit is a mirror of `tools/build-ovmf-vars.sh` here; canonical source stays in this repo.
+
+## [Unreleased — earlier items carried forward from 2026-04-21]
+
+### Added
+
+- **`lamboot-inspect`** — new diagnostic tool for parsing LamBoot's on-disk artefacts. Stdlib-only Python, six subcommands (`trust-log`, `boot-log`, `summary`, `show`, `verify`, `dump`). Parses the SDS-4 schema-v2 trust log with full validation, renders boot.log with phase timing, produces one-page last-boot summaries, verifies SDS-4 §8.1 website-claims against code-path evidence (CI-ready), and creates diagnostic bundles for bug reports. Includes man page (`lamboot-inspect(1)`), bash + zsh completions, 44-case host test suite, and user guide at `docs/LAMBOOT-INSPECT.md`. Ships in the release tarball alongside `lamboot-install`.
+
+### Changed
+
+- **SDS-7 spec clarified.** `SPEC-LAMBOOT-MIGRATE.md` now correctly frames itself as the v1.0 target for the existing `lamboot-migrate` v0.1.0 tool in `lamco-admin/lamboot-tools-dev`, not a green-field design. Added §14 "Deviations from existing v0.1.0" with a full reconciliation table. **Flipped to RESOLVED status in the v0.8.4 prep section above.**
+
+### Infrastructure
+
+- **Layer-2 FS backend trait** (SDS-1) implemented: `FsBackend` trait with `FatBackend` adapter + `FatStream` streaming, `Volume` dispatch coordinator with 8 MiB LRU cache, `EspWriter` FAT-only-by-construction write path, `Ext4Backend` skeleton (SDS-2 swap-in target). Migrated all 13 consumer files to the new API. Extracted pure value types to `fs_types.rs` for host testing. New `lamboot-fs-tests` host crate with 36 passing tests.
+
+## [0.8.3] — 2026-04-21
 
 Release posture: **the signing + audit layer.** v0.8.3 ships the production signing pipeline, SecurityOverride (Path F), trust-evidence log, and install-script hardening. It is the foundation every later release builds on.
 

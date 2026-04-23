@@ -10,9 +10,9 @@
 
 use alloc::{format, string::String};
 
-use crate::fs::EspVolume;
+use crate::{fs::Volume, fs_backend::PathBuf, fs_writer::EspWriter};
 
-const LOG_PATH: &str = "\\EFI\\LamBoot\\reports\\boot.log";
+const LOG_PATH: &str = "/EFI/LamBoot/reports/boot.log";
 const MAX_LOG_SIZE: usize = 64 * 1024; // 64 KB cap
 
 pub(crate) struct BootLog {
@@ -26,13 +26,12 @@ impl BootLog {
     pub(crate) fn new() -> Self {
         Self {
             buffer: String::new(),
-            write_through: true, // start in write-through mode
+            write_through: true,
             written: 0,
         }
     }
 
-    /// Log a message. In write-through mode, also writes to ESP immediately.
-    pub(crate) fn log(&mut self, esp: Option<&mut EspVolume>, level: &str, message: &str) {
+    pub(crate) fn log(&mut self, esp: Option<&mut Volume>, level: &str, message: &str) {
         let timestamp = get_timestamp();
         let line = format!("[{timestamp}] {level}: {message}\n");
 
@@ -45,34 +44,35 @@ impl BootLog {
         self.buffer.push_str(&line);
     }
 
-    /// Log an info-level message
-    pub(crate) fn info(&mut self, esp: Option<&mut EspVolume>, message: &str) {
+    pub(crate) fn info(&mut self, esp: Option<&mut Volume>, message: &str) {
         self.log(esp, "INFO", message);
     }
 
-    /// Log a warning-level message
-    pub(crate) fn warn(&mut self, esp: Option<&mut EspVolume>, message: &str) {
+    pub(crate) fn warn(&mut self, esp: Option<&mut Volume>, message: &str) {
         self.log(esp, "WARN", message);
     }
 
-    /// Switch to buffered mode (call when entering the menu)
     pub(crate) fn set_buffered(&mut self) {
         self.write_through = false;
     }
 
-    /// Flush any buffered content to ESP (call before booting)
-    pub(crate) fn flush(&mut self, esp: &mut EspVolume) {
-        if !self.buffer.is_empty() {
-            // In buffered mode, the buffer has content not yet on disk.
-            // In write-through mode, everything is already on disk,
-            // but we write the full buffer anyway to ensure completeness.
-            esp.write_file(LOG_PATH, self.buffer.as_bytes())
-                .unwrap_or_else(|_| log::warn!("Failed to write boot log"));
+    pub(crate) fn flush(&mut self, esp: &mut Volume) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        let Some(mut writer) = EspWriter::new(esp) else {
+            log::warn!("bootlog flush skipped: target volume is not FAT");
+            return;
+        };
+        let Ok(path) = PathBuf::from_str(LOG_PATH) else {
+            return;
+        };
+        if let Err(e) = writer.write(path.as_path(), self.buffer.as_bytes()) {
+            log::warn!("Failed to write boot log: {e}");
         }
     }
 
-    /// Start a new boot log (truncate the previous one)
-    pub(crate) fn start(&mut self, esp: &mut EspVolume, version: &str, arch: &str) {
+    pub(crate) fn start(&mut self, esp: &mut Volume, version: &str, arch: &str) {
         let timestamp = get_timestamp();
         let header = format!(
             "=== LamBoot {version} ({arch}) boot log ===\n\
@@ -80,21 +80,32 @@ impl BootLog {
         );
         self.buffer.clone_from(&header);
         self.written = 0;
-        // Truncate and write header
-        esp.write_file(LOG_PATH, header.as_bytes())
-            .unwrap_or_else(|_| log::warn!("Failed to initialize boot log"));
+
+        let Some(mut writer) = EspWriter::new(esp) else {
+            log::warn!("bootlog start skipped: target volume is not FAT");
+            return;
+        };
+        let Ok(path) = PathBuf::from_str(LOG_PATH) else {
+            return;
+        };
+        if let Err(e) = writer.write(path.as_path(), header.as_bytes()) {
+            log::warn!("Failed to initialize boot log: {e}");
+            return;
+        }
         self.written = header.len();
     }
 
-    fn append_to_esp(&mut self, esp: &mut EspVolume, line: &str) {
+    fn append_to_esp(&mut self, esp: &mut Volume, line: &str) {
         if self.written + line.len() > MAX_LOG_SIZE {
-            return; // size cap reached
+            return;
         }
-
-        // Read existing content, append, write back
-        let mut content = esp.read_to_string(LOG_PATH).unwrap_or_default();
-        content.push_str(line);
-        if esp.write_file(LOG_PATH, content.as_bytes()).is_ok() {
+        let Some(mut writer) = EspWriter::new(esp) else {
+            return;
+        };
+        let Ok(path) = PathBuf::from_str(LOG_PATH) else {
+            return;
+        };
+        if writer.append(path.as_path(), line.as_bytes()).is_ok() {
             self.written += line.len();
         }
     }

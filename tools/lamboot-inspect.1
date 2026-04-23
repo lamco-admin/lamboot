@@ -1,0 +1,149 @@
+.TH LAMBOOT-INSPECT 1 "2026-04-22" "LamBoot 0.8.3" "LamBoot"
+.SH NAME
+lamboot-inspect \- parse LamBoot diagnostic artefacts and verify installation claims
+.SH SYNOPSIS
+.B lamboot-inspect
+.RB [ \-\-version ]
+.I subcommand
+.RI [ options ]
+.SH DESCRIPTION
+.B lamboot-inspect
+reads the on-disk artefacts LamBoot writes to the EFI System Partition during
+and after each boot, renders them for human or machine consumption, and
+verifies that LamBoot's public claims are backed by real code paths.
+
+The tool is strictly read-only: no subcommand modifies any file on the ESP or
+any system state. Every subcommand auto-detects the ESP mount point (trying
+.IR /boot/efi ", " /efi ", " /boot )
+or accepts an explicit
+.B \-\-path
+override.
+.SH SUBCOMMANDS
+.TP
+.B trust-log
+Parse
+.I /loader/boot-trust.log
+(JSON-lines per
+.B SPEC-NATIVE-TRUST-CHAIN
+§6) and render events. Supports
+.BR text " (coloured, default), " json " (machine-readable), " timeline " (compact), and " stats " (aggregate counts)."
+.RS
+Options: \fB\-\-path\fR,
+.BR \-\-format = \fItext\fR|\fIjson\fR|\fItimeline\fR|\fIstats\fR,
+.BR \-\-event " " \fIevent_name\fR
+(filter),
+.B \-\-errors-only,
+.B \-\-no-sha,
+.B \-\-strict
+(exit 4 on schema violations).
+.RE
+.TP
+.B boot-log
+Parse the human-readable boot log
+.I /EFI/LamBoot/reports/boot.log
+and render it with optional phase timing.
+.RS
+Options: \fB\-\-path\fR,
+.BR \-\-level " " \fIDEBUG\fR|\fIINFO\fR|\fIWARN\fR|\fIERROR\fR,
+.B \-\-errors-only,
+.BR \-\-format = \fItext\fR|\fIjson\fR.
+.RE
+.TP
+.B summary
+One-screen overview of the last boot. Reads trust log, boot log, boot.json
+report, and audit.log (whichever are present) and renders a condensed view
+including the verify→load SHA-256 invariant check.
+.TP
+.B show \fIidentifier\fR
+Show one event's full detail. The identifier may be a sequence number, an
+event name (returns the first match), or an image path.
+.TP
+.B verify
+Walk the SDS-4 §8.1 permitted-claims table and confirm each is backed by
+code-path evidence in the current checkout. Returns exit code 0 if all
+claims are substantiated, 5 otherwise.
+.RS
+Options: \fB\-\-repo\fR
+.I path
+(defaults to current directory),
+.B \-\-verbose
+(include SDS section references).
+.RE
+.TP
+.B dump
+Produce a diagnostic bundle (.tar.gz) containing every LamBoot artefact plus
+system-context probes (uname, lsblk, blkid, efibootmgr, mokutil state) and
+LamBoot-namespace EFI variables, each with a SHA-256. Intended for attaching
+to bug reports.
+.RS
+Options:
+.BR \-\-output " " \fIpath\fR,
+.BR \-\-esp " " \fIpath\fR
+(override ESP auto-detection),
+.BR \-\-print-manifest .
+.RE
+.SH EXIT CODES
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Usage error (unknown subcommand, bad argument).
+.TP
+.B 2
+Source file unreadable (not found, permission denied).
+.TP
+.B 3
+Parse error (log content malformed beyond recovery).
+.TP
+.B 4
+Schema violation (\fB\-\-strict\fR; records parsed but fail SDS-4 §6 schema).
+.TP
+.B 5
+Verification failed (claims not substantiated).
+.TP
+.B 6
+Dump collection failed.
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+Disable ANSI colour output. Honoured on all subcommands.
+.TP
+.B LAMBOOT_DIAG_FORCE_COLOR
+Set to
+.I 1
+to force colour output even when stdout is not a terminal. Useful for piping
+into \fBless \-R\fR.
+.SH FILES
+.TP
+.I /boot/efi/loader/boot-trust.log
+Trust event log (JSON-lines, schema v2).
+.TP
+.I /boot/efi/EFI/LamBoot/reports/boot.log
+Human-readable boot trace.
+.TP
+.I /boot/efi/EFI/LamBoot/reports/boot.json
+Machine-readable last-boot report.
+.TP
+.I /boot/efi/EFI/LamBoot/reports/audit.log
+Cumulative audit log across boots.
+.TP
+.I /boot/efi/EFI/LamBoot/policy.toml
+Active boot policy.
+.SH SEE ALSO
+.BR lamboot-install (1),
+.BR mokutil (1),
+.BR efibootmgr (8),
+.BR lsblk (8).
+.PP
+.B docs/specs/SPEC-NATIVE-TRUST-CHAIN.md
+for the authoritative trust-chain and event-schema specification.
+.SH AUTHOR
+LamCo. Licensed MIT OR Apache-2.0.
+.SH REPORTING BUGS
+Run
+.B lamboot-inspect dump
+and attach the generated .tar.gz to
+.UR https://github.com/lamco-admin/lamboot/issues
+the issue tracker
+.UE .

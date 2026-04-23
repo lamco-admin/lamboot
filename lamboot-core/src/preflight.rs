@@ -10,7 +10,7 @@ use alloc::{format, string::String, vec::Vec};
 
 use crate::{
     discovery::{EntryKind, Icon},
-    fs::EspVolume,
+    fs::Volume,
     secure::SecureBootState,
 };
 
@@ -85,8 +85,8 @@ fn error(msg: &str) -> CheckResult {
 pub(crate) fn run_preflight(
     kind: &EntryKind,
     icon: Icon,
-    esp: &mut EspVolume,
-    extra_volumes: &mut [EspVolume],
+    esp: &mut Volume,
+    extra_volumes: &mut [Volume],
     sb_state: SecureBootState,
     driver_count: usize,
 ) -> PreflightResult {
@@ -148,8 +148,8 @@ pub(crate) fn run_preflight(
 /// Check if a file exists on any volume (ESP first, then extras).
 /// Targeted lookup only — no directory enumeration.
 fn check_file_exists_any(
-    esp: &mut EspVolume,
-    extra_volumes: &mut [EspVolume],
+    esp: &mut Volume,
+    extra_volumes: &mut [Volume],
     path: &str,
 ) -> CheckResult {
     if file_exists_any(esp, extra_volumes, path) {
@@ -159,33 +159,33 @@ fn check_file_exists_any(
     }
 }
 
-fn file_exists_any(esp: &mut EspVolume, extra_volumes: &mut [EspVolume], path: &str) -> bool {
-    if esp.exists(path) {
+fn file_exists_any(esp: &mut Volume, extra_volumes: &mut [Volume], path: &str) -> bool {
+    if esp.exists_str(path) {
         return true;
     }
-    extra_volumes.iter_mut().any(|vol| vol.exists(path))
+    extra_volumes.iter_mut().any(|vol| vol.exists_str(path))
 }
 
 /// Find the volume that has a specific file. Returns ESP if no volume has it.
 fn find_volume_with_file<'a>(
-    esp: &'a mut EspVolume,
-    extra_volumes: &'a mut [EspVolume],
+    esp: &'a mut Volume,
+    extra_volumes: &'a mut [Volume],
     path: &str,
-) -> &'a mut EspVolume {
-    if esp.exists(path) {
+) -> &'a mut Volume {
+    if esp.exists_str(path) {
         return esp;
     }
     for vol in extra_volumes.iter_mut() {
-        if vol.exists(path) {
+        if vol.exists_str(path) {
             return vol;
         }
     }
     esp // fallback to ESP
 }
 
-fn check_pe_header(esp: &mut EspVolume, path: &str) -> CheckResult {
+fn check_pe_header(esp: &mut Volume, path: &str) -> CheckResult {
     // Only read the first 256 bytes — enough for MZ magic, PE offset, and signature
-    let Ok(data) = esp.read_file_at(path, 0, 256) else {
+    let Ok(data) = esp.read_at_str(path, 0, 256) else {
         return warning("Cannot read file for PE validation");
     };
 
@@ -226,12 +226,12 @@ fn check_pe_header(esp: &mut EspVolume, path: &str) -> CheckResult {
     ok()
 }
 
-fn check_secure_boot(esp: &mut EspVolume, path: &str, sb_state: SecureBootState) -> CheckResult {
+fn check_secure_boot(esp: &mut Volume, path: &str, sb_state: SecureBootState) -> CheckResult {
     if sb_state == SecureBootState::Disabled {
         return ok();
     }
 
-    let Ok(data) = esp.read_to_vec(path) else {
+    let Ok(data) = esp.read_str(path) else {
         return warning("Cannot read file for Secure Boot check");
     };
 
@@ -265,10 +265,15 @@ fn check_root_param(options: &str) -> CheckResult {
 }
 
 fn check_fs_driver(kernel_path: &str, driver_count: usize) -> CheckResult {
-    // If kernel path suggests it's NOT on the ESP (no \EFI\ prefix)
-    // and no filesystem drivers were loaded, warn
+    // If kernel path suggests it's NOT on the ESP (no EFI or loader prefix,
+    // either forward- or backslash-style) and no filesystem drivers were
+    // loaded, warn.
     let p = kernel_path.to_uppercase();
-    if driver_count == 0 && !p.starts_with("\\EFI\\") && !p.starts_with("\\LOADER\\") {
+    let on_esp = p.starts_with("\\EFI\\")
+        || p.starts_with("/EFI/")
+        || p.starts_with("\\LOADER\\")
+        || p.starts_with("/LOADER/");
+    if driver_count == 0 && !on_esp {
         return warning("Path may require a filesystem driver (none loaded)");
     }
     ok()

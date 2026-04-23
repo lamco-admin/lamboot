@@ -9,9 +9,9 @@ use alloc::format;
 
 use uefi::{boot::LoadImageSource, prelude::*, proto::media::fs::SimpleFileSystem};
 
-use crate::{fs::EspVolume, security_override, tpm::TpmContext, trust_log};
+use crate::{fs::Volume, security_override, tpm::TpmContext, trust_log};
 
-const DRIVERS_DIR: &str = "\\EFI\\LamBoot\\drivers";
+const DRIVERS_DIR: &str = "/EFI/LamBoot/drivers";
 
 /// Case-insensitive file extension check for no_std environments
 fn has_extension_ignore_case(filename: &str, ext: &str) -> bool {
@@ -26,11 +26,11 @@ fn has_extension_ignore_case(filename: &str, ext: &str) -> bool {
 /// Failures are logged but non-fatal — missing directory is normal (ESP-only mode).
 pub(crate) fn load_drivers(
     image: Handle,
-    esp: &mut EspVolume,
+    esp: &mut Volume,
     tpm: &TpmContext,
     trust: &mut trust_log::TrustLog,
 ) -> usize {
-    let Ok(filenames) = esp.read_dir(DRIVERS_DIR) else {
+    let Ok(filenames) = esp.read_dir_str(DRIVERS_DIR) else {
         log::info!("No drivers directory found (ESP-only mode)");
         return 0;
     };
@@ -48,7 +48,7 @@ pub(crate) fn load_drivers(
     let mut loaded = 0;
 
     for filename in &driver_files {
-        let path = format!("{DRIVERS_DIR}\\{filename}");
+        let path = format!("{DRIVERS_DIR}/{filename}");
         log::info!("Loading driver: {path}");
 
         match load_single_driver(image, esp, &path, tpm) {
@@ -86,12 +86,12 @@ pub(crate) fn load_drivers(
 /// Load and start a single EFI driver binary
 fn load_single_driver(
     parent_image: Handle,
-    esp: &mut EspVolume,
+    esp: &mut Volume,
     path: &str,
     tpm: &TpmContext,
 ) -> uefi::Result {
     // Read the driver file into memory
-    let driver_data = esp.read_to_vec(path)?;
+    let driver_data = esp.read_str(path)?;
 
     // Measure driver into TPM PCR 4 before execution
     tpm.measure_driver(&driver_data, path);

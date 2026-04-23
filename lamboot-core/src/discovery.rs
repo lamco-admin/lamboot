@@ -4,7 +4,7 @@ use alloc::{
     vec::Vec,
 };
 
-use crate::{bls, fs::EspVolume, policy::Policy, uki};
+use crate::{bls, fs::Volume, policy::Policy, uki};
 
 #[derive(Debug, Clone)]
 pub(crate) struct BootEntry {
@@ -53,8 +53,8 @@ pub(crate) enum Icon {
 ///   2. Custom entries from \EFI\LamBoot\entries\*.toml (future)
 ///   3. ESP scanning: Windows, UKI, GRUB, rEFInd, tools (fallback)
 pub(crate) fn discover_all_entries(
-    esp: &mut EspVolume,
-    _extra_volumes: &mut [EspVolume],
+    esp: &mut Volume,
+    _extra_volumes: &mut [Volume],
     policy: &Policy,
 ) -> Vec<BootEntry> {
     let mut entries = Vec::new();
@@ -120,10 +120,10 @@ fn extract_filename_lower(path: &str) -> String {
 }
 
 /// Discover Windows Boot Manager
-fn discover_windows(esp: &mut EspVolume, policy: &Policy) -> Vec<BootEntry> {
+fn discover_windows(esp: &mut Volume, policy: &Policy) -> Vec<BootEntry> {
     let mut entries = Vec::new();
     let windows_path = "\\EFI\\Microsoft\\Boot\\bootmgfw.efi";
-    if esp.exists(windows_path) && policy.allowed(windows_path) {
+    if esp.exists_str(windows_path) && policy.allowed(windows_path) {
         log::info!("Found Windows Boot Manager");
         entries.push(BootEntry {
             id: String::from("windows"),
@@ -143,9 +143,9 @@ fn discover_windows(esp: &mut EspVolume, policy: &Policy) -> Vec<BootEntry> {
 /// Discover Linux Unified Kernel Images (UKI) with PE section parsing.
 /// Extracts .osrel (OS name/version), .cmdline (embedded command line),
 /// and .uname (kernel version) for rich menu entries.
-fn discover_linux_uki(esp: &mut EspVolume, policy: &Policy) -> Vec<BootEntry> {
+fn discover_linux_uki(esp: &mut Volume, policy: &Policy) -> Vec<BootEntry> {
     let mut entries = Vec::new();
-    let uki_paths = esp.glob("\\EFI\\Linux\\*.efi");
+    let uki_paths = esp.glob("/EFI/Linux/*.efi");
 
     for path in uki_paths {
         if !policy.allowed(&path) {
@@ -216,7 +216,7 @@ fn extract_uki_version(entry: &BootEntry) -> String {
 }
 
 /// Discover legacy Linux installations (vmlinuz on ESP — fallback only)
-fn discover_linux_legacy(esp: &mut EspVolume, policy: &Policy) -> Vec<BootEntry> {
+fn discover_linux_legacy(esp: &mut Volume, policy: &Policy) -> Vec<BootEntry> {
     let mut entries = Vec::new();
     let distro_paths = [
         "\\EFI\\fedora",
@@ -235,7 +235,7 @@ fn discover_linux_legacy(esp: &mut EspVolume, policy: &Policy) -> Vec<BootEntry>
                 continue;
             }
             let initrd_pattern = kernel_path.replace("vmlinuz", "initrd");
-            let initrd_paths = if esp.exists(&initrd_pattern) {
+            let initrd_paths = if esp.exists_str(&initrd_pattern) {
                 alloc::vec![initrd_pattern]
             } else {
                 Vec::new()
@@ -262,7 +262,7 @@ fn discover_linux_legacy(esp: &mut EspVolume, policy: &Policy) -> Vec<BootEntry>
 }
 
 /// Discover other bootloaders for chainloading
-fn discover_other_loaders(esp: &mut EspVolume, policy: &Policy) -> Vec<BootEntry> {
+fn discover_other_loaders(esp: &mut Volume, policy: &Policy) -> Vec<BootEntry> {
     let mut entries = Vec::new();
 
     let loaders = [
@@ -276,7 +276,7 @@ fn discover_other_loaders(esp: &mut EspVolume, policy: &Policy) -> Vec<BootEntry
     ];
 
     for (path, id, name) in &loaders {
-        if esp.exists(path) && policy.allowed(path) {
+        if esp.exists_str(path) && policy.allowed(path) {
             log::info!("Found {name}");
             entries.push(BootEntry {
                 id: String::from(*id),
@@ -296,7 +296,7 @@ fn discover_other_loaders(esp: &mut EspVolume, policy: &Policy) -> Vec<BootEntry
 /// Discover diagnostic tools and recovery options.
 /// Reads manifest.toml for module metadata if available.
 /// Skipped entirely if `modules.enabled = false` in policy.
-fn discover_tools(esp: &mut EspVolume, policy: &Policy) -> Vec<BootEntry> {
+fn discover_tools(esp: &mut Volume, policy: &Policy) -> Vec<BootEntry> {
     let mut entries = Vec::new();
 
     if !policy.modules_enabled {
@@ -306,7 +306,7 @@ fn discover_tools(esp: &mut EspVolume, policy: &Policy) -> Vec<BootEntry> {
     // Try to load module manifest for friendly names
     let manifest = load_module_manifest(esp);
 
-    let module_paths = esp.glob("\\EFI\\LamBoot\\modules\\*.efi");
+    let module_paths = esp.glob("/EFI/LamBoot/modules/*.efi");
 
     for path in module_paths {
         if !policy.allowed(&path) {
@@ -335,9 +335,9 @@ fn discover_tools(esp: &mut EspVolume, policy: &Policy) -> Vec<BootEntry> {
 
 /// Parse module manifest for friendly names.
 /// Returns Vec<(module_id, display_name)>.
-fn load_module_manifest(esp: &mut EspVolume) -> Vec<(String, String)> {
+fn load_module_manifest(esp: &mut Volume) -> Vec<(String, String)> {
     let manifest_path = "\\EFI\\LamBoot\\modules\\manifest.toml";
-    let Ok(content) = esp.read_to_string(manifest_path) else {
+    let Ok(content) = esp.read_to_string_str(manifest_path) else {
         return Vec::new();
     };
 

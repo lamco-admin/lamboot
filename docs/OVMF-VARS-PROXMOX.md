@@ -292,4 +292,33 @@ Full libvirt coverage: out of scope for this document.
 - `docs/MOK-ENROLLMENT-GUIDE.md` — Config 3 alternative (guest-side enrollment)
 - `docs/SB-RECOVERY.md` — recovery procedures
 - `docs/KEY-GENERATION.md` — how LamBoot's signing keys are created
-- `tools/build-ovmf-vars.sh` — the VARS file generator
+- `tools/build-ovmf-vars.sh` — the VARS file generator (canonical source)
+
+---
+
+## 12. Operator tooling — `lamboot-pve-ovmf-vars`
+
+For Proxmox host operators who prefer a subcommand-style UX over invoking
+`build-ovmf-vars.sh` directly, the companion toolkit ships
+`lamboot-pve-ovmf-vars` in the `lamboot-toolkit-pve` RPM subpackage (see
+[`LAMBOOT-TOOLS-OVERVIEW.md`](LAMBOOT-TOOLS-OVERVIEW.md)).
+
+`lamboot-pve-ovmf-vars` is **a mirror** of `tools/build-ovmf-vars.sh` in
+this repo — canonical source stays here; the mirror is regenerated at
+toolkit release-build time via
+`~/lamboot-tools-dev/publish/mirror-pve-from-lamboot-dev.sh`. Do not edit
+the mirror directly; edit `tools/build-ovmf-vars.sh` here, then re-run the
+mirror script.
+
+Subcommands (from the mirror):
+
+- `build` — build `OVMF_VARS_lamboot.fd` with LamBoot's db cert pre-enrolled
+- `verify` — inspect an existing VARS file for the expected enrollment
+- `show` — print enrolled keys in human-readable form
+
+The tool exists for discoverability in the broader `lamboot-toolkit-pve`
+suite. Operators already running `tools/build-ovmf-vars.sh` from this
+repo's release tarball need not change anything.
+
+Tool-level spec: [`~/lamboot-tools-dev/pve/docs/SPEC-LAMBOOT-PVE-SETUP.md`](https://github.com/lamco-admin/lamboot-tools-dev/blob/main/pve/docs/SPEC-LAMBOOT-PVE-SETUP.md)
+(OVMF-VARS helper is a sub-component of the PVE setup tooling).

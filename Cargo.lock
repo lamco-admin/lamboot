@@ -22,7 +22,7 @@ checksum = "2fd1289c04a9ea8cb22300a459a72a385d7c73d3259e2ed7dcb2af674838cfa9"
 
 [[package]]
 name = "diag-shell"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "log",
  "uefi",
@@ -31,12 +31,16 @@ dependencies = [
 
 [[package]]
 name = "lamboot-core"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "log",
  "uefi",
  "uefi-raw",
 ]
+
+[[package]]
+name = "lamboot-fs-tests"
+version = "0.8.4"
 
 [[package]]
 name = "log"
@@ -46,7 +50,7 @@ checksum = "34080505efa8e45a4b816c349525ebe327ceaa8559756f0356cba97ef3bf7432"
 
 [[package]]
 name = "mem-quick"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "log",
  "uefi",
@@ -54,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "nvme-diag"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "log",
  "uefi",
@@ -62,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "pci-inventory"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "log",
  "uefi",

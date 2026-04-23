@@ -9,7 +9,7 @@ use core::cmp::Ordering;
 
 use crate::{
     discovery::{BootEntry, EntryKind, Icon},
-    fs::EspVolume,
+    fs::Volume,
     policy::Policy,
 };
 
@@ -194,10 +194,10 @@ impl BlsEntry {
 }
 
 /// Discover BLS Type 1 entries on a volume
-pub(crate) fn discover_bls_entries(esp: &mut EspVolume, policy: &Policy) -> Vec<BlsEntry> {
-    let entries_dir = "\\loader\\entries";
+pub(crate) fn discover_bls_entries(esp: &mut Volume, policy: &Policy) -> Vec<BlsEntry> {
+    let entries_dir = "/loader/entries";
 
-    let Ok(filenames) = esp.read_dir(entries_dir) else {
+    let Ok(filenames) = esp.read_dir_str(entries_dir) else {
         return Vec::new();
     };
 
@@ -213,9 +213,9 @@ pub(crate) fn discover_bls_entries(esp: &mut EspVolume, policy: &Policy) -> Vec<
             continue;
         }
 
-        let path = format!("{entries_dir}\\{filename}");
+        let path = format!("{entries_dir}/{filename}");
 
-        let Ok(content) = esp.read_to_string(&path) else {
+        let Ok(content) = esp.read_to_string_str(&path) else {
             continue;
         };
 
@@ -498,7 +498,7 @@ fn is_version_char(b: u8) -> bool {
 /// Renames the .conf file on the FAT filesystem: +3 → +2-1, +2-1 → +1-2, etc.
 /// Returns the new filename and sets the LoaderBootCountPath EFI variable.
 pub(crate) fn decrement_boot_count(
-    esp: &mut crate::fs::EspVolume,
+    esp: &mut crate::fs::Volume,
     entry: &BlsEntry,
 ) -> Option<String> {
     let tries_left = entry.tries_left?;
@@ -528,18 +528,31 @@ pub(crate) fn decrement_boot_count(
 
     let new_filename = format!("{}{}.conf", entry.id, new_suffix);
 
-    let entries_dir = "\\loader\\entries";
-    match esp.rename_file(entries_dir, &entry.filename, &new_filename) {
+    let entries_dir_str = "/loader/entries";
+    let Ok(entries_dir) = crate::fs_backend::PathBuf::from_str(entries_dir_str) else {
+        log::warn!("decrement_boot_count: entries_dir path canonicalization failed");
+        return None;
+    };
+    let Some(mut writer) = crate::fs_writer::EspWriter::new(esp) else {
+        log::warn!(
+            "decrement_boot_count skipped: target volume is not FAT (boot-count \
+             rename cannot be performed on non-FAT backends per SDS-1)"
+        );
+        return None;
+    };
+    match writer.rename(entries_dir.as_path(), &entry.filename, &new_filename) {
         Ok(()) => {
             log::info!("Boot count: {} → {}", entry.filename, new_filename);
-            // Set LoaderBootCountPath for systemd-bless-boot compatibility
-            let boot_count_path = format!("{entries_dir}\\{new_filename}");
+            // Set LoaderBootCountPath for systemd-bless-boot compatibility.
+            // Keep the backslash form since the variable is consumed by
+            // systemd-bless-boot, which expects UEFI-style paths.
+            let boot_count_path = format!("\\loader\\entries\\{new_filename}");
             let _ = crate::health::set_boot_count_path(&boot_count_path);
             Some(new_filename)
         }
         Err(e) => {
             log::warn!(
-                "Failed to rename {} → {}: {:?}",
+                "Failed to rename {} → {}: {}",
                 entry.filename,
                 new_filename,
                 e

@@ -12,6 +12,11 @@ mod console;
 mod discovery;
 mod drivers;
 mod fs;
+mod fs_backend;
+mod fs_backend_ext4;
+mod fs_backend_fat;
+mod fs_types;
+mod fs_writer;
 mod fw_cfg;
 mod gui;
 mod health;
@@ -123,7 +128,10 @@ fn run_bootloader(image: Handle) -> Result<Status> {
 
     // Phase 3: Mount ESP
     info!("Mounting ESP filesystem...");
-    let mut esp = fs::mount_esp(image)?;
+    let mut esp = fs::mount_esp(image).map_err(|e| {
+        log::error!("ESP mount failed: {e}");
+        uefi::Error::from(e)
+    })?;
 
     // Trust-evidence log (v0.8.3 initial version) — records every trust
     // decision to \loader\boot-trust.log for host-side audit. See
@@ -164,10 +172,10 @@ fn run_bootloader(image: Handle) -> Result<Status> {
     });
 
     // Measure boot config into TPM PCR 5
-    if let Ok(config_data) = esp.read_to_vec("\\EFI\\LamBoot\\policy.toml") {
+    if let Ok(config_data) = esp.read_str("/EFI/LamBoot/policy.toml") {
         tpm.measure_config(&config_data);
     }
-    if let Ok(manifest_data) = esp.read_to_vec("\\EFI\\LamBoot\\modules\\manifest.toml") {
+    if let Ok(manifest_data) = esp.read_str("/EFI/LamBoot/modules/manifest.toml") {
         tpm.measure_config(&manifest_data);
     }
 
@@ -363,8 +371,8 @@ fn run_bootloader(image: Handle) -> Result<Status> {
         report::write_boot_report(&mut esp, &selection, &boot_ctx)?;
 
         if let Some(ref bls_file) = selection.bls_filename {
-            let entries_dir = "\\loader\\entries";
-            if let Ok(content) = esp.read_to_string(&format!("{entries_dir}\\{bls_file}")) {
+            let entries_dir = "/loader/entries";
+            if let Ok(content) = esp.read_to_string_str(&format!("{entries_dir}/{bls_file}")) {
                 tpm.measure_bls_entry(content.as_bytes(), &selection.id);
                 if let Some(bls_entry) = bls::BlsEntry::parse(bls_file, &content) {
                     if bls_entry.tries_left.is_some() {

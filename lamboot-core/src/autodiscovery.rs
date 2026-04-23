@@ -5,11 +5,11 @@
 
 use alloc::{format, string::String, vec::Vec};
 
-use crate::fs::EspVolume;
+use crate::fs::Volume;
 
 /// Search for initrd files matching a kernel version on a volume.
 /// Tries common distro-specific patterns.
-pub(crate) fn find_initrd(kernel_path: &str, volume: &mut EspVolume) -> Vec<String> {
+pub(crate) fn find_initrd(kernel_path: &str, volume: &mut Volume) -> Vec<String> {
     let version = extract_kernel_version(kernel_path);
     let dir = extract_directory(kernel_path);
 
@@ -33,7 +33,7 @@ pub(crate) fn find_initrd(kernel_path: &str, volume: &mut EspVolume) -> Vec<Stri
     // Check for microcode first (prepend if found)
     for ucode in ["\\intel-ucode.img", "\\amd-ucode.img"] {
         let ucode_path = format!("{dir}{ucode}");
-        if volume.exists(&ucode_path) {
+        if volume.exists_str(&ucode_path) {
             found.push(ucode_path);
             break;
         }
@@ -41,7 +41,7 @@ pub(crate) fn find_initrd(kernel_path: &str, volume: &mut EspVolume) -> Vec<Stri
 
     // Find main initrd
     for pattern in &patterns {
-        if volume.exists(pattern) {
+        if volume.exists_str(pattern) {
             found.push(pattern.clone());
             return found;
         }
@@ -50,7 +50,7 @@ pub(crate) fn find_initrd(kernel_path: &str, volume: &mut EspVolume) -> Vec<Stri
     // Arch Linux special case
     if version == "linux" || version.starts_with("linux-") {
         let arch_initrd = format!("{dir}\\initramfs-linux.img");
-        if volume.exists(&arch_initrd) {
+        if volume.exists_str(&arch_initrd) {
             found.push(arch_initrd);
             return found;
         }
@@ -64,7 +64,7 @@ pub(crate) fn find_initrd(kernel_path: &str, volume: &mut EspVolume) -> Vec<Stri
     dead_code,
     reason = "disabled until extra volume scanning is re-enabled with type filtering"
 )]
-pub(crate) fn resolve_kernel_path(broken_path: &str, volumes: &mut [EspVolume]) -> Option<String> {
+pub(crate) fn resolve_kernel_path(broken_path: &str, volumes: &mut [Volume]) -> Option<String> {
     let version = extract_kernel_version(broken_path);
 
     // Alternative paths to try
@@ -77,7 +77,7 @@ pub(crate) fn resolve_kernel_path(broken_path: &str, volumes: &mut [EspVolume]) 
 
     for vol in volumes.iter_mut() {
         for alt in &alternatives {
-            if vol.exists(alt) {
+            if vol.exists_str(alt) {
                 log::info!("Resolved kernel path: {broken_path} -> {alt}");
                 return Some(alt.clone());
             }
@@ -108,11 +108,11 @@ fn extract_kernel_version(path: &str) -> &str {
     dead_code,
     reason = "disabled until extra volume scanning is re-enabled with type filtering"
 )]
-pub(crate) fn identify_os(volume: &mut EspVolume) -> Option<(String, String)> {
+pub(crate) fn identify_os(volume: &mut Volume) -> Option<(String, String)> {
     // Try standard path first, then fallback
     let content = volume
-        .read_to_string("\\etc\\os-release")
-        .or_else(|_| volume.read_to_string("\\usr\\lib\\os-release"))
+        .read_to_string_str("/etc/os-release")
+        .or_else(|_| volume.read_to_string_str("/usr/lib/os-release"))
         .ok()?;
 
     let metadata = crate::uki::parse_os_release_text(&content);

@@ -115,15 +115,75 @@ Added f2fs, xfs, zfs, ntfs drivers (EfiFs v1.12) for x86_64 and aarch64. Superbl
 - [ ] Ubuntu kernel hooks (`/etc/kernel/postinst.d/zz-lamboot`)
 - [ ] Session 6 testing (policy.toml feature gating)
 - [ ] Session 9 testing (vmgenid snapshot detection)
-- [ ] Hookscript rewrite to fw_cfg file-reference pattern
 - [ ] VM migrations on 122, 123, 124 (cross-distro validation)
 
 ### Nice to Have (can ship without)
 
-- [ ] Session 8 testing (lamboot-tools suite)
 - [ ] VM 104 BIOS→UEFI migration test
 - [ ] NVMe diagnostic module (currently stub)
 - [ ] Website content and product page
+
+---
+
+## Toolkit Pivot — coordinated v0.8.4 release with lamboot-tools v0.2.0
+
+**Added 2026-04-22.** Per `docs/STATUS-2026-04-22-TOOLKIT-PIVOT.md` (note §9
+post-Q appendix) and the authoritative toolkit spec at
+`~/lamboot-tools-dev/docs/SPEC-LAMBOOT-TOOLKIT-V1.md`, further bootloader
+implementation work (SDS-2 through SDS-6) is paused while the `lamboot-tools`
+toolkit reaches its v0.2.0 publishable milestone.
+
+**Toolkit-side state (2026-04-22 end-of-day):** `lamboot-tools v0.2.0` is
+feature-complete and claim-accurate. Sessions A–Q landed 11 tools, unified
+RPM spec (three subpackages from one source per Option 2), 13 man pages, 24
+website pages, 84-check `verify-claims.sh`, 28/28 release-rehearsal, 11
+Proxmox fixture images. Five founder-gated items remain on the toolkit side
+(self-hosted runner, Tier 1 baseline, this repo's v0.8.4 coordination path
+choice — **resolved: Path A**, release-runbook execution, optional public
+fixture hosting).
+
+**Rolling cross-repo coordination tracker:**
+[`docs/CROSS-REPO-STATUS.md`](CROSS-REPO-STATUS.md). Mirror counterpart lives
+at `~/lamboot-tools-dev/docs/CROSS-REPO-STATUS.md`; keep them in sync.
+
+### What lamboot-dev owes the toolkit's v0.2.0 release
+
+Cross-repo coordination per SPEC-LAMBOOT-TOOLKIT-V1.md §14.3. All items ship in a coordinated v0.8.4 release alongside toolkit v0.2.0:
+
+**Must have (blocks coordinated release):**
+- [ ] **Hookscript rewrite** — `tools/lamboot-hookscript.pl` must use the fw_cfg file-reference pattern per `~/lamboot-tools-dev/docs/PROXMOX-INTEGRATION-ROADMAP.md` Phase 1. Current implementation calls `qm set` mid-pre-start which config-locks. Blocks `lamboot-pve-setup` from functioning. Hookscript reads `/etc/lamboot/fleet.toml` per shared schema in `~/lamboot-tools-dev/docs/SPEC-LAMBOOT-TOOLKIT-V1.md` Appendix C.
+- [ ] **`/etc/lamboot/fleet.toml` consumption** — hookscript + `lamboot-monitor.py` read settings per the `[hookscript]` and `[monitor]` sections of the shared schema.
+- [ ] **`lamboot-install` opt-in toolkit prompt** — adds `Install lamboot-tools for diagnostic and repair utilities? [y/N]` to the interactive path, `--install-toolkit` / `--no-install-toolkit` flag forms. Prompt occurs after successful install.
+- [ ] **README / USER-GUIDE cross-reference** — adds toolkit recommendation and link. Non-functional but brand-coherent.
+
+**Should have:**
+- [ ] **`SECURE-BOOT-AND-SIGNING-STRATEGY.md` cross-reference** — `lamboot-signing-keys` tool Scope 1 mode invokes procedures documented here. Add back-link to the toolkit's tool.
+- [ ] **`KEY-GENERATION.md` cross-reference** — same; authoritative doc for the key-management procedure `lamboot-signing-keys` consumes.
+- [ ] **`OVMF-VARS-PROXMOX.md` cross-reference** — `lamboot-pve-ovmf-vars` is the mirror of `build-ovmf-vars.sh` for tooling; doc remains authoritative.
+
+**Release coordination:**
+- [ ] Combined release announcement covers lamboot v0.8.4 bootloader changes + lamboot-tools v0.2.0 + lamboot-toolkit-pve v0.2.0
+- [ ] Release notes cross-link between repos
+
+### Files mirrored at toolkit release-build time
+
+**Canonical source stays in lamboot-dev. Never edit in toolkit:**
+- `tools/lamboot-inspect` → mirrored unchanged into `lamboot-tools` core
+- `tools/lamboot_inspect/` (Python package dir) → mirrored unchanged
+- `tools/lamboot-inspect.1` → mirrored as toolkit man page
+- `tools/lamboot-monitor.py` → mirrored into `lamboot-toolkit-pve` as `lamboot-pve-monitor` (renamed)
+- `tools/build-ovmf-vars.sh` → mirrored into `lamboot-toolkit-pve` as `lamboot-pve-ovmf-vars` (renamed)
+
+### What's paused while the toolkit ships
+
+- SDS-2 (ext4-view integration) implementation
+- SDS-3 (native PE loader) implementation
+- SDS-4 (native trust chain) implementation
+- SDS-5 (BLS multi-FS discovery) implementation
+- SDS-6 (UEFI FS driver deprecation) implementation
+- v0.9.0 release
+
+Resumes after toolkit v0.2.0 ships. Per-SDS implementation order re-evaluated at that point.
 
 ---
 

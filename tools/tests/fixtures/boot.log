@@ -1,0 +1,13 @@
+=== LamBoot 0.8.3 (x86_64) boot log ===
+=== 2026-04-22T00:14:00 ===
+
+[2026-04-22T00:14:00] INFO: Crash counter: 0
+[2026-04-22T00:14:00] INFO: System: QEMU Standard PC (i440FX + PIIX, 1996)
+[2026-04-22T00:14:00] INFO: Hypervisor: kvm
+[2026-04-22T00:14:01] INFO: Loading filesystem drivers...
+[2026-04-22T00:14:01] INFO: Loaded 1 filesystem driver(s)
+[2026-04-22T00:14:02] INFO: Discovering boot entries...
+[2026-04-22T00:14:02] INFO: Found 3 boot entries (4 total with tools)
+[2026-04-22T00:14:03] INFO: Boot init: 3012 ms
+[2026-04-22T00:14:09] INFO: Selected: Fedora Linux 43 (bls-fedora)
+[2026-04-22T00:14:09] WARN: Extra volume enumeration disabled (see partitions.rs)

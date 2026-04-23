@@ -16,7 +16,12 @@ use uefi::{
     Guid,
 };
 
-use crate::{discovery::EntryKind, fs::EspVolume};
+use crate::{
+    discovery::EntryKind,
+    fs::{partition_guid_for, Volume, VolumeIdentity},
+    fs_backend::FsBackend as _,
+    fs_backend_fat::FatBackend,
+};
 
 /// Well-known GPT partition type GUIDs (UAPI.2 Discoverable Partitions)
 #[cfg(target_arch = "x86_64")]
@@ -124,27 +129,35 @@ pub(crate) fn auto_append_root(
     }
 }
 
-/// Try to mount XBOOTLDR partition and return it as an EspVolume.
-/// The XBOOTLDR partition may contain BLS entries and kernels.
-pub(crate) fn mount_xbootldr(partitions: &[DiscoveredPartition]) -> Option<EspVolume> {
+/// Try to mount the XBOOTLDR partition as a `Volume` backed by the FAT
+/// adapter. Returns `None` if no XBOOTLDR partition exists, the handle is
+/// inaccessible, or the filesystem is not FAT (ext4 XBOOTLDR support lands
+/// with SDS-2). The XBOOTLDR partition may contain BLS entries and kernels.
+pub(crate) fn mount_xbootldr(partitions: &[DiscoveredPartition]) -> Option<Volume> {
     let xbootldr = partitions
         .iter()
         .find(|p| p.partition_type == PartType::Xbootldr)?;
 
-    // Try to open SimpleFileSystem on the XBOOTLDR handle
-    let Ok(mut fs) = uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(xbootldr.handle)
-    else {
-        log::warn!("XBOOTLDR partition found but cannot open filesystem");
+    // Open SimpleFileSystem eagerly so we fail fast on non-FAT / missing driver.
+    if uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(xbootldr.handle).is_err() {
+        log::warn!("XBOOTLDR partition found but SimpleFileSystem is unavailable");
         return None;
-    };
+    }
 
-    let Ok(root) = fs.open_volume() else {
-        log::warn!("XBOOTLDR partition found but cannot open volume");
-        return None;
+    let backend = FatBackend::new(xbootldr.handle).ok()?;
+    let identity = VolumeIdentity {
+        partition_guid: partition_guid_for(xbootldr.handle).or(Some(xbootldr.unique_guid)),
+        fs_uuid: backend.uuid(),
+        label: backend.label().map(alloc::string::ToString::to_string),
+        // XBOOTLDR is always numbered after the ESP (which is index 0).
+        // Subsequent extra FAT volumes from `enumerate_volumes()` use higher
+        // indices; a minor overlap is acceptable because the index is only
+        // used for display.
+        index: u32::MAX,
+        backend_tag: FatBackend::TAG,
     };
-
-    log::info!("Mounted XBOOTLDR partition");
-    Some(EspVolume::new(root))
+    log::info!("Mounted XBOOTLDR partition {}", identity.describe());
+    Some(Volume::from_fat(identity, backend))
 }
 
 // ============================================================================

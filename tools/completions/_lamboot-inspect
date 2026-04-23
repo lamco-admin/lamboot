@@ -1,0 +1,82 @@
+#compdef lamboot-inspect
+# zsh completion for lamboot-inspect.
+#
+# Install to any directory in $fpath (e.g. /usr/share/zsh/site-functions/)
+# or source explicitly:
+#   fpath=(/path/to/lamboot-dev/tools/completions $fpath) && autoload -U _lamboot-inspect
+
+_lamboot_inspect() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+
+    _arguments -C \
+        '(-h --help)'{-h,--help}'[show help and exit]' \
+        '--version[show version and exit]' \
+        '1: :->subcommand' \
+        '*:: :->subargs'
+
+    case $state in
+        subcommand)
+            local -a subs
+            subs=(
+                'trust-log:Parse the LamBoot trust log'
+                'boot-log:Parse the human-readable boot log'
+                'summary:One-page summary of the last boot'
+                'show:Show a single trust-log event in detail'
+                'verify:Verify website-claims are backed by code'
+                'dump:Produce a diagnostic bundle'
+            )
+            _describe -t subcommands 'subcommand' subs
+            ;;
+        subargs)
+            case $words[1] in
+                trust-log)
+                    _arguments \
+                        '(-p --path)'{-p,--path}'[path to trust log]:file:_files' \
+                        '(-f --format)'{-f,--format}'[output format]:(text json timeline stats)' \
+                        '(-e --event)'{-e,--event}'[filter by event name]:event' \
+                        '--errors-only[show only failures/warnings]' \
+                        '--no-sha[omit SHA-256 digests]' \
+                        '--strict[exit 4 on schema violations]' \
+                        '(-h --help)'{-h,--help}'[show help]'
+                    ;;
+                boot-log)
+                    _arguments \
+                        '(-p --path)'{-p,--path}'[path to boot.log]:file:_files' \
+                        '(-l --level)'{-l,--level}'[filter by log level]:(DEBUG INFO WARN ERROR)' \
+                        '(-f --format)'{-f,--format}'[output format]:(text json)' \
+                        '--errors-only[show only WARN/ERROR]' \
+                        '(-h --help)'{-h,--help}'[show help]'
+                    ;;
+                summary)
+                    _arguments \
+                        '--trust-path[path to trust log]:file:_files' \
+                        '--boot-path[path to boot log]:file:_files' \
+                        '--report-path[path to boot.json]:file:_files' \
+                        '--audit-path[path to audit log]:file:_files' \
+                        '(-h --help)'{-h,--help}'[show help]'
+                    ;;
+                show)
+                    _arguments \
+                        '1:event id (seq/name/path):' \
+                        '(-p --path)'{-p,--path}'[path to trust log]:file:_files' \
+                        '(-h --help)'{-h,--help}'[show help]'
+                    ;;
+                verify)
+                    _arguments \
+                        '--repo[lamboot-dev checkout]:directory:_directories' \
+                        '(-v --verbose)'{-v,--verbose}'[include SDS references]' \
+                        '(-h --help)'{-h,--help}'[show help]'
+                    ;;
+                dump)
+                    _arguments \
+                        '(-o --output)'{-o,--output}'[output bundle path]:file:_files' \
+                        '--esp[ESP mount point]:directory:_directories' \
+                        '--print-manifest[print SHA-256 manifest]' \
+                        '(-h --help)'{-h,--help}'[show help]'
+                    ;;
+            esac
+            ;;
+    esac
+}
+_lamboot_inspect "$@"

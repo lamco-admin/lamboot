@@ -43,3 +43,6 @@ keys-archive/
 PK-*.pem
 KEK-*.pem
 db-*.pem
+
+__pycache__/
+*.pyc

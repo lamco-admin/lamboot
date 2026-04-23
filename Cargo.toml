@@ -5,11 +5,12 @@ members = [
     "lamboot-modules/mem-quick",
     "lamboot-modules/pci-inventory",
     "lamboot-modules/diag-shell",
+    "lamboot-fs-tests",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.3"
+version = "0.8.4"
 authors = ["LamBoot Contributors"]
 edition = "2021"
 license = "MIT OR Apache-2.0"

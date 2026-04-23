@@ -31,9 +31,9 @@ use alloc::{
     vec::Vec,
 };
 
-use crate::fs::EspVolume;
+use crate::{fs::Volume, fs_backend::PathBuf, fs_writer::EspWriter};
 
-const LOG_PATH: &str = "\\loader\\boot-trust.log";
+const LOG_PATH: &str = "/loader/boot-trust.log";
 
 /// One evidence record, built up as LamBoot progresses and flushed at key points.
 #[derive(Debug, Clone)]
@@ -136,7 +136,7 @@ impl TrustLog {
     /// log on each flush. (write_file overwrites; proper append via
     /// FileProtocol::Write at current EOF is a Path G v0.9.x task.)
     /// Best-effort: errors are logged but do not propagate.
-    pub(crate) fn flush(&mut self, esp: &mut EspVolume) {
+    pub(crate) fn flush(&mut self, esp: &mut Volume) {
         if self.events.is_empty() {
             return;
         }
@@ -172,12 +172,20 @@ impl TrustLog {
             buf.push_str("}\n");
         }
 
-        match esp.write_file(LOG_PATH, buf.as_bytes()) {
+        let Some(mut writer) = EspWriter::new(esp) else {
+            log::warn!("trust-log write skipped: target volume is not FAT");
+            return;
+        };
+        let Ok(path) = PathBuf::from_str(LOG_PATH) else {
+            log::warn!("trust-log write skipped: log path failed canonicalization");
+            return;
+        };
+        match writer.write(path.as_path(), buf.as_bytes()) {
             Ok(()) => log::debug!(
                 "trust-log flushed ({} events cumulative)",
                 self.committed.len()
             ),
-            Err(e) => log::warn!("trust-log write failed: {e:?}"),
+            Err(e) => log::warn!("trust-log write failed: {e}"),
         }
     }
 }

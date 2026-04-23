@@ -89,9 +89,9 @@ fn parse_pe_section_table(header: &[u8]) -> Option<(u16, Vec<SectionLoc>)> {
 /// Read UKI metadata from a file using targeted seeks.
 /// Reads only the PE headers (~4KB) and the small metadata sections,
 /// avoiding loading the entire UKI binary (which can be 60-100MB).
-pub(crate) fn read_uki_metadata(esp: &mut crate::fs::EspVolume, path: &str) -> Option<UkiMetadata> {
+pub(crate) fn read_uki_metadata(esp: &mut crate::fs::Volume, path: &str) -> Option<UkiMetadata> {
     // Pass 1: read PE headers (4KB is enough for DOS + PE + section table)
-    let header = esp.read_file_at(path, 0, 4096).ok()?;
+    let header = esp.read_at_str(path, 0, 4096).ok()?;
     let (machine, sections) = parse_pe_section_table(&header)?;
 
     // Pass 2: read only the small metadata sections we need
@@ -107,11 +107,11 @@ pub(crate) fn read_uki_metadata(esp: &mut crate::fs::EspVolume, path: &str) -> O
         }
 
         if section_name_eq(&sec.name, SECTION_OSREL) {
-            osrel_data = esp.read_file_at(path, sec.offset, sec.size).ok();
+            osrel_data = esp.read_at_str(path, sec.offset, sec.size).ok();
         } else if section_name_eq(&sec.name, SECTION_CMDLINE) {
-            cmdline_data = esp.read_file_at(path, sec.offset, sec.size).ok();
+            cmdline_data = esp.read_at_str(path, sec.offset, sec.size).ok();
         } else if section_name_eq(&sec.name, SECTION_UNAME) {
-            uname_data = esp.read_file_at(path, sec.offset, sec.size).ok();
+            uname_data = esp.read_at_str(path, sec.offset, sec.size).ok();
         }
     }
 

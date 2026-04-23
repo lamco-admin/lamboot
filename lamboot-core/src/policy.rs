@@ -2,7 +2,7 @@ use alloc::{string::String, vec::Vec};
 
 use uefi::Result;
 
-use crate::fs::EspVolume;
+use crate::fs::Volume;
 
 const DEFAULT_TIMEOUT_MS: u32 = 4000;
 const DEFAULT_CRASH_THRESHOLD: u8 = 2;
@@ -89,9 +89,8 @@ impl Policy {
 }
 
 /// Load policy from ESP
-pub(crate) fn load_policy(esp: &mut EspVolume) -> Result<Policy> {
-    let policy_path = "\\EFI\\LamBoot\\policy.toml";
-    let content = esp.read_to_string(policy_path)?;
+pub(crate) fn load_policy(esp: &mut Volume) -> Result<Policy> {
+    let content = esp.read_to_string_str("/EFI/LamBoot/policy.toml")?;
     Ok(parse_policy_toml(&content))
 }
 

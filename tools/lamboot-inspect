@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""lamboot-inspect — LamBoot diagnostic tool.
+
+Thin entry-point shim. All logic lives in the lamboot_inspect package.
+"""
+import os
+import sys
+
+
+def _bootstrap() -> None:
+    """Make the sibling ``lamboot_inspect`` package importable.
+
+    This script may be invoked:
+      * From a source checkout (e.g. ``tools/lamboot-inspect``)
+      * From ``dist/`` after package-release.sh stages it
+      * Symlinked onto ``PATH`` (``/usr/local/bin/lamboot-inspect``)
+
+    Resolve the real script path (following any symlinks) and add the
+    containing directory to ``sys.path`` so ``import lamboot_inspect``
+    succeeds in every layout.
+    """
+    here = os.path.dirname(os.path.realpath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+
+
+def _require_python(major: int, minor: int) -> None:
+    if sys.version_info < (major, minor):
+        sys.stderr.write(
+            f"lamboot-inspect requires Python {major}.{minor} or newer "
+            f"(you have {sys.version.split()[0]})\n"
+        )
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    _require_python(3, 9)
+    _bootstrap()
+    try:
+        from lamboot_inspect.cli import main
+    except ImportError as e:
+        sys.stderr.write(
+            f"lamboot-inspect: could not load lamboot_inspect package: {e}\n"
+            "Is the tools/lamboot_inspect/ directory adjacent to this script?\n"
+        )
+        sys.exit(1)
+    sys.exit(main(sys.argv[1:]))

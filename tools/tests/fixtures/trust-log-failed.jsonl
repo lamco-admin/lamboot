@@ -1,0 +1,6 @@
+{"seq":0,"event":"boot_start","path":"","size":0,"sha256":"","verified_via":"","status":"","note":"version=0.8.3 arch=x86_64 sb=Enabled crash_counter=1"}
+{"seq":1,"event":"volume_mounted","path":"","size":0,"sha256":"","verified_via":"","status":"SUCCESS","note":"backend=fat index=0"}
+{"seq":2,"event":"driver_loaded","path":"/EFI/LamBoot/drivers/ext4_x64.efi","size":0,"sha256":"","verified_via":"security_override","verifier_tag":"","status":"SUCCESS","note":""}
+{"seq":3,"event":"kernel_bytes_read","path":"/boot/vmlinuz-6.12","size":18225512,"sha256":"","verified_via":"","status":"SUCCESS","note":"backend=ext4-view@0.9.3"}
+{"seq":4,"event":"image_load_failed","path":"/boot/vmlinuz-6.12","size":18225512,"sha256":"3df266502d2443ed68a609a0b7e3febf0d37fca52deb704de15637990e8dea82","verified_via":"shim_sbat_rejected","verifier_tag":"shim-15.8-0ubuntu2","status":"ACCESS_DENIED","note":"SBAT generation too low"}
+{"seq":5,"event":"kernel_load_failed","path":"/boot/vmlinuz-6.12","size":0,"sha256":"","verified_via":"","status":"ACCESS_DENIED","note":"shim rejected SBAT; see docs"}

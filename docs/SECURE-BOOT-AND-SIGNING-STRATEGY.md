@@ -223,3 +223,29 @@ Both are complementary. LamBoot implements both.
 - [Install Reference](INSTALL-REFERENCE.md) — lamboot-install CLI
 - [Proxmox Guide](PROXMOX-GUIDE.md) — VM deployment
 - [Roadmap](ROADMAP.md) — integration timeline
+
+---
+
+## Operator tooling — `lamboot-signing-keys`
+
+The strategy described in this document is consumed at the user level by
+the `lamboot-signing-keys` tool in the companion toolkit (shipped via the
+`lamboot-tools` RPM; see [`LAMBOOT-TOOLS-OVERVIEW.md`](LAMBOOT-TOOLS-OVERVIEW.md)).
+
+Relevant subcommands:
+
+- **`sign-binary`** — signs a PE binary with `.sbat` injection per the
+  policy described in §3 "SBAT" here. Resolution order for SBAT contents:
+  `--sbat-file PATH > --sbat "csv"` > `/etc/lamboot/sbat.csv` > built-in
+  default. Preserves any existing `.sbat` section.
+- **`rotate {db,kek,pk}`** — rotates a key per §4 "Key lifecycle" here.
+  Cross-signs with the parent key (db ← KEK, KEK ← PK, PK self-signed with
+  warning). Records a `rotation.json` manifest.
+- **`verify`** — verifies a signed binary against the currently enrolled
+  keys, reporting which key signed it and whether SBAT allows it.
+
+The tool is one safe execution path; hand-run `sbsign` + `objcopy` remains
+equally valid. Canonical key-handling procedure lives in
+[`KEY-GENERATION.md`](KEY-GENERATION.md).
+
+Tool-level spec: [`~/lamboot-tools-dev/docs/SPEC-LAMBOOT-SIGNING-KEYS.md`](https://github.com/lamco-admin/lamboot-tools-dev/blob/main/docs/SPEC-LAMBOOT-SIGNING-KEYS.md).

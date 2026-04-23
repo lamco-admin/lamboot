@@ -1,0 +1,18 @@
+{
+  "lamboot_version": "0.8.3",
+  "lamboot_arch": "x86_64",
+  "timestamp": "2026-04-22T00:14:09",
+  "entry_id": "bls-fedora",
+  "entry_name": "Fedora Linux 43",
+  "entry_type": "linux_legacy",
+  "path": "/boot/vmlinuz-6.12.0-fedora",
+  "system_manufacturer": "QEMU",
+  "system_product": "Standard PC (i440FX + PIIX, 1996)",
+  "fleet_id": "fleet-test",
+  "vmid": "201",
+  "os_name": "Fedora Linux",
+  "hypervisor": "kvm",
+  "iommu": "",
+  "iommu_units": 0,
+  "boot_timing_ms": "{\"health\":10,\"drivers\":842,\"discovery\":421}"
+}

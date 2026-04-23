@@ -69,6 +69,16 @@ cp -a /home/greg/lamboot-dev/tools/sign-unlock ./sign-unlock
 cp -a /home/greg/lamboot-dev/tools/sign-lock ./sign-lock
 cp -a /home/greg/lamboot-dev/tools/build-ovmf-vars.sh ./build-ovmf-vars.sh 2>/dev/null || true
 
+# lamboot-inspect — diagnostic suite (trust log / boot log / verify / dump).
+# Bundled with the implementation package so the script can import
+# lamboot_inspect.cli without an install step.
+cp -a /home/greg/lamboot-dev/tools/lamboot-inspect ./lamboot-inspect
+cp -a /home/greg/lamboot-dev/tools/lamboot_inspect ./lamboot_inspect
+mkdir -p man/man1 completions
+cp -a /home/greg/lamboot-dev/tools/lamboot-inspect.1 ./man/man1/lamboot-inspect.1
+cp -a /home/greg/lamboot-dev/tools/completions/lamboot-inspect.bash ./completions/lamboot-inspect.bash
+cp -a /home/greg/lamboot-dev/tools/completions/_lamboot-inspect ./completions/_lamboot-inspect
+
 # EFI artifacts
 mkdir -p EFI/LamBoot
 cp -a /home/greg/lamboot-dev/dist/EFI/LamBoot/* EFI/LamBoot/
@@ -112,6 +122,7 @@ for d in \
     DIAGNOSTIC-MODULES.md \
     ARCHITECTURE.md \
     LAMBOOT-TOOLS-OVERVIEW.md \
+    LAMBOOT-INSPECT.md \
     ROADMAP.md; do
     if [[ -f "/home/greg/lamboot-dev/docs/$d" ]]; then
         cp "/home/greg/lamboot-dev/docs/$d" "docs/$d"

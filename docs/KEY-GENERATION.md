@@ -335,3 +335,32 @@ rm -rf keys-gen   # db.key has already been moved to signing host location
 - [Debian Bug #1013320 — the RSA 4096 MOK constraint](https://groups.google.com/g/linux.debian.bugs.dist/c/VYecNquj5mk)
 - [`docs/analysis/RSA-4096-COMPATIBILITY-ANALYSIS-2026-04-20.md`](analysis/RSA-4096-COMPATIBILITY-ANALYSIS-2026-04-20.md) — the research behind the algorithm split
 - [`docs/SECURE-BOOT-DEPLOYMENT.md`](SECURE-BOOT-DEPLOYMENT.md) — deployment guide consuming these keys
+
+---
+
+## 10. Operator tooling — `lamboot-signing-keys`
+
+This document is the **authoritative procedure** for creating and managing
+LamBoot's Secure Boot signing keys. The operator-facing implementation
+lives in the companion toolkit as `lamboot-signing-keys`, shipped via the
+`lamboot-tools` RPM (see [`LAMBOOT-TOOLS-OVERVIEW.md`](LAMBOOT-TOOLS-OVERVIEW.md)).
+
+The tool wraps the OpenSSL / efitools / sbsigntool commands this document
+specifies; when a step here calls for `openssl req ...`, the tool invokes
+it with the right flags and records the result in a `rotation.json`
+manifest under a timestamped directory. Subcommands:
+
+- `generate` — initial PK / KEK / db keypair creation per §3–§5 here
+- `rotate db|kek|pk` — cross-signed rotation (db ← KEK, KEK ← PK, PK
+  self-signed with warning)
+- `enroll` — enrollment into firmware NVRAM per `docs/SECURE-BOOT-DEPLOYMENT.md`
+- `sign-binary` — SBAT-injected signing per `docs/SECURE-BOOT-AND-SIGNING-STRATEGY.md`
+- `revoke`, `list`, `show`, `verify`, `import`, `export` — lifecycle support
+
+This doc remains authoritative for **what** and **why**; the tool is one
+safe way to execute **how**. Other execution paths (hand-run OpenSSL,
+existing `tools/sign-lamboot.sh` + `tools/sign-lock` / `sign-unlock` in
+this repo, vendor automation) remain valid.
+
+See [`~/lamboot-tools-dev/docs/SPEC-LAMBOOT-SIGNING-KEYS.md`](https://github.com/lamco-admin/lamboot-tools-dev/blob/main/docs/SPEC-LAMBOOT-SIGNING-KEYS.md)
+for the tool-level spec.

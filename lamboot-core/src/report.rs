@@ -2,7 +2,15 @@ use alloc::{format, string::String};
 
 use uefi::Result;
 
-use crate::{acpi::IommuInfo, discovery::BootEntry, fs::EspVolume, smbios::SystemInfo};
+use crate::{
+    acpi::IommuInfo, discovery::BootEntry, fs::Volume, fs_backend::PathBuf, fs_writer::EspWriter,
+    smbios::SystemInfo,
+};
+
+const REPORTS_DIR: &str = "/EFI/LamBoot/reports";
+const BOOT_REPORT: &str = "/EFI/LamBoot/reports/boot.json";
+const AUDIT_LOG: &str = "/EFI/LamBoot/reports/audit.log";
+const ERROR_REPORT: &str = "/EFI/LamBoot/reports/error.json";
 
 /// Boot context carried from early phases into the report
 pub(crate) struct BootContext {
@@ -31,13 +39,22 @@ fn get_timestamp() -> String {
     }
 }
 
+fn writer_for(esp: &mut Volume) -> Result<EspWriter<'_>> {
+    EspWriter::new(esp).ok_or_else(|| uefi::Error::from(uefi::Status::UNSUPPORTED))
+}
+
+fn path(s: &str) -> Result<PathBuf> {
+    PathBuf::from_str(s).map_err(|_| uefi::Error::from(uefi::Status::INVALID_PARAMETER))
+}
+
 /// Write a boot report in JSON format
-pub(crate) fn write_boot_report(
-    esp: &mut EspVolume,
-    entry: &BootEntry,
-    ctx: &BootContext,
-) -> Result {
-    let _ = esp.ensure_dir("\\EFI\\LamBoot\\reports");
+pub(crate) fn write_boot_report(esp: &mut Volume, entry: &BootEntry, ctx: &BootContext) -> Result {
+    let reports_dir = path(REPORTS_DIR)?;
+    let boot_report = path(BOOT_REPORT)?;
+    {
+        let mut w = writer_for(esp)?;
+        let _ = w.ensure_dir(reports_dir.as_path());
+    }
 
     let sys_manufacturer = ctx.sys_info.manufacturer.as_deref().unwrap_or("");
     let sys_product = ctx.sys_info.product_name.as_deref().unwrap_or("");
@@ -53,7 +70,6 @@ pub(crate) fn write_boot_report(
         ""
     };
 
-    // Create simple JSON manually (no_std compatible)
     let json = format!(
         r#"{{
   "lamboot_version": "{}",
@@ -100,9 +116,11 @@ pub(crate) fn write_boot_report(
         ctx.telemetry_json,
     );
 
-    esp.write_file("\\EFI\\LamBoot\\reports\\boot.json", json.as_bytes())?;
+    {
+        let mut w = writer_for(esp)?;
+        w.write(boot_report.as_path(), json.as_bytes())?;
+    }
 
-    // Also append to audit log
     append_audit_log(
         esp,
         &format!(
@@ -117,23 +135,20 @@ pub(crate) fn write_boot_report(
 }
 
 /// Append a line to the audit log
-pub(crate) fn append_audit_log(esp: &mut EspVolume, message: &str) -> Result {
-    let log_path = "\\EFI\\LamBoot\\reports\\audit.log";
+pub(crate) fn append_audit_log(esp: &mut Volume, message: &str) -> Result {
+    let audit = path(AUDIT_LOG)?;
 
-    // Read existing log
-    let mut log = esp.read_to_string(log_path).unwrap_or_default();
+    let mut log = esp.read_to_string(audit.as_path()).unwrap_or_default();
 
-    // Limit log size (keep last 10KB)
     if log.len() > 10240 {
         let keep_from = log.len() - 8192;
         log = String::from(&log[keep_from..]);
     }
 
-    // Append new message
     log.push_str(message);
 
-    // Write back
-    esp.write_file(log_path, log.as_bytes())?;
+    let mut w = writer_for(esp)?;
+    w.write(audit.as_path(), log.as_bytes())?;
 
     Ok(())
 }
@@ -143,7 +158,7 @@ pub(crate) fn append_audit_log(esp: &mut EspVolume, message: &str) -> Result {
     dead_code,
     reason = "will be called from error paths once error reporting is integrated"
 )]
-pub(crate) fn write_error_report(esp: &mut EspVolume, error: &str) -> Result {
+pub(crate) fn write_error_report(esp: &mut Volume, error: &str) -> Result {
     let json = format!(
         r#"{{
   "timestamp": "{}",
@@ -154,7 +169,11 @@ pub(crate) fn write_error_report(esp: &mut EspVolume, error: &str) -> Result {
         error.replace('"', "'")
     );
 
-    esp.write_file("\\EFI\\LamBoot\\reports\\error.json", json.as_bytes())?;
+    let err_path = path(ERROR_REPORT)?;
+    {
+        let mut w = writer_for(esp)?;
+        w.write(err_path.as_path(), json.as_bytes())?;
+    }
     append_audit_log(esp, &format!("[{}] ERROR: {}\n", get_timestamp(), error))?;
 
     Ok(())

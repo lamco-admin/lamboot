@@ -1,0 +1,23 @@
+[package]
+name = "lamboot-fs-tests"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Host-runnable test crate for the SPEC-FS-BACKEND-TRAIT §10.2 unit suite.
+#
+# The real Layer-2 modules (`fs_backend`, `fs`, `fs_backend_fat`, `fs_writer`)
+# live in `lamboot-core`, which is a `no_std` + `no_main` UEFI binary crate —
+# `cargo test` there is impossible. This crate re-hosts the _pure_ pieces of
+# the abstraction that have zero UEFI dependencies (Path canonicalization,
+# Uuid formatting, FsError tokens, VolumeCache LRU) plus an in-memory
+# `MockBackend` and runs §10.2 tests against them.
+#
+# The re-hosted code is byte-identical to the lamboot-core originals via
+# `#[path = "..."]` module declarations — no duplication, no drift risk.
+
+[dependencies]
+
+[dev-dependencies]

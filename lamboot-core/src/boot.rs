@@ -6,7 +6,7 @@ use uefi::{
 
 use crate::{
     discovery::{BootEntry, EntryKind},
-    fs::EspVolume,
+    fs::Volume,
     initrd::InitrdHandle,
     security_override,
     tpm::TpmContext,
@@ -17,7 +17,7 @@ use crate::{
 /// exposed by filesystem drivers (ext4, btrfs, etc.).
 pub(crate) fn boot_entry(
     current_image: Handle,
-    volumes: &mut [EspVolume],
+    volumes: &mut [Volume],
     entry: BootEntry,
     tpm: &TpmContext,
 ) -> Result<Status> {
@@ -44,9 +44,9 @@ pub(crate) fn boot_entry(
 }
 
 /// Chainload another EFI application
-fn chainload_efi(current_image: Handle, esp: &mut EspVolume, path: &str) -> Result<Status> {
+fn chainload_efi(current_image: Handle, esp: &mut Volume, path: &str) -> Result<Status> {
     log::info!("Chainloading: {path}");
-    let image_data = esp.read_to_vec(path)?;
+    let image_data = esp.read_str(path)?;
     log::info!("Read {} bytes", image_data.len());
     let image_handle = load_efi_image_from_buffer(current_image, &image_data, None)?;
 
@@ -62,7 +62,7 @@ fn chainload_efi(current_image: Handle, esp: &mut EspVolume, path: &str) -> Resu
 /// Boot a Unified Kernel Image (UKI)
 fn boot_uki(
     current_image: Handle,
-    esp: &mut EspVolume,
+    esp: &mut Volume,
     path: &str,
     options: &str,
     tpm: &TpmContext,
@@ -94,7 +94,7 @@ fn boot_uki(
 /// into a single buffer — the kernel splits them apart internally.
 fn boot_linux(
     current_image: Handle,
-    volumes: &mut [EspVolume],
+    volumes: &mut [Volume],
     kernel_path: &str,
     initrd_paths: &[String],
     options: &str,
@@ -135,7 +135,7 @@ fn boot_linux(
         let mut combined = Vec::new();
         for path in initrd_paths {
             log::info!("Loading initrd: {path}");
-            let data = vol.read_to_vec(path)?;
+            let data = vol.read_str(path)?;
             log::info!("  {} bytes", data.len());
             combined.extend_from_slice(&data);
         }
@@ -169,9 +169,9 @@ fn boot_linux(
 /// handle the None case — a misleading fallback to volume 0 hid real bugs
 /// where kernel-on-ext4 lookups silently redirected to the FAT ESP and failed
 /// later with an opaque NOT_FOUND from read_to_vec.
-fn find_volume_for_path(volumes: &mut [EspVolume], path: &str) -> Option<usize> {
+fn find_volume_for_path(volumes: &mut [Volume], path: &str) -> Option<usize> {
     for (i, vol) in volumes.iter_mut().enumerate() {
-        if vol.exists(path) {
+        if vol.exists_str(path) {
             return Some(i);
         }
     }
@@ -181,11 +181,11 @@ fn find_volume_for_path(volumes: &mut [EspVolume], path: &str) -> Option<usize> 
 /// Load an EFI image from ESP with Secure Boot verification and TPM measurement
 fn load_efi_image(
     parent_image: Handle,
-    esp: &mut EspVolume,
+    esp: &mut Volume,
     path: &str,
     tpm: &TpmContext,
 ) -> Result<Handle> {
-    let image_data = esp.read_to_vec(path)?;
+    let image_data = esp.read_str(path)?;
 
     // Measure kernel image into TPM PCR 4
     tpm.measure_kernel(&image_data);
