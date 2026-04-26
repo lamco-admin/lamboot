@@ -98,6 +98,52 @@ Path matching is case-insensitive. Wildcards match any substring when placed at 
 | `enabled` | boolean | `true` | Enable the UEFI watchdog timer. Prevents indefinite hangs during boot. |
 | `grace_seconds` | integer | `15` | Watchdog timeout in seconds. If LamBoot doesn't complete a phase within this time, the firmware resets the system. |
 
+### `[loader]` Section (SDS-3, v0.9.0+)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `native_pe` | enum string | `"auto"` | Controls whether UKIs and Linux kernels are loaded via LamBoot's native Rust PE loader or firmware's `BS->LoadImage` + `BS->StartImage`. Values: `"auto"`, `"always"`, `"never"` (case-insensitive). |
+
+#### Values
+
+| Value | Behavior |
+|-------|----------|
+| `"auto"` (default) | Native loader when `ShimLock::Verify` succeeds on the image bytes pre-load (and trivially on SB-off + directly-signed setups). Falls back to firmware load when shim is present but rejects the bytes, or when no verify path is available. |
+| `"always"` | Always use the native loader, regardless of pre-load verification. Operator asserts trust without delegating to shim. Useful during SB-off validation where every binary is self-signed by the administrator's key chain. |
+| `"never"` | Always use `BS->LoadImage`. v0.8.3 behavior. One-flag rollback if the native loader ever hits an unexpected firmware quirk. |
+
+#### Why this exists
+
+Firmware's `BS->LoadImage` invokes the Security2Arch hook for every image. Under shim 15.8, that hook depends on `ShimLock` being installed. Shim 15.8 uninstalls `ShimLock` after `LoadImage`-ing any child binary (e.g. a legacy UEFI FS driver). On stock Ubuntu/Debian/Fedora, that sequence meant LamBoot under Secure Boot could not verify kernels after having loaded an ext4 driver — the v0.8.3 VM 122 failure mode.
+
+Post-SDS-3, the native loader reads PE bytes, validates against §5.1 of `SPEC-NATIVE-PE-LOADER.md`, allocates UEFI pages, applies relocations, installs `LoadedImageProtocol`, and transfers control via a raw function-pointer cast — zero `BS->LoadImage` calls. `ShimLock::Verify` runs ONCE on the bytes before any of this, stamping the trust verdict that the `image_loaded_native` trust-log event records with the image's SHA-256.
+
+The Chainload path (Windows Boot Manager, GRUB, EFI Fallback) stays on the firmware path because those binaries may have imports that the native loader rejects by design (spec §5.2). Chainload's shim interaction is a different surface and not SDS-3's target.
+
+See `docs/specs/SPEC-NATIVE-PE-LOADER.md` for the full spec.
+
+---
+
+### `[drivers]` Section (SDS-6, v0.9.0+)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `legacy_uefi_drivers` | enum string | `"auto"` | Controls loading of `.efi` filesystem drivers from `\EFI\LamBoot\drivers\`. Values: `"auto"`, `"always"`, `"never"` (case-insensitive). |
+
+#### Values
+
+| Value | Behavior |
+|-------|----------|
+| `"auto"` (default) | Load drivers only for filesystems LamBoot does **not** natively support. Skips `ext4_*.efi`, `ext2_*.efi`, `ext3_*.efi` because SDS-2's `Ext4Backend` covers them natively. Drivers for `btrfs`, `xfs`, `ntfs`, `zfs`, `f2fs`, `iso9660` still load if their `.efi` binary is present. |
+| `"always"` | Load every driver in `\EFI\LamBoot\drivers\`, regardless of native coverage. v0.8.3 behavior. Useful for A/B debugging; preserves the shim-15.8 interaction pattern. Loading a natively-covered driver emits a `legacy_driver_redundant` trust event. |
+| `"never"` | Load no legacy drivers. Skip all, regardless of coverage. Security-conscious posture for systems whose filesystems are all natively covered — asserts LamBoot will never `LoadImage` a third-party UEFI binary at boot. If a required filesystem has no native backend, the boot enumerating that volume will fail. |
+
+#### Why this exists
+
+LamBoot v0.8.x loaded every driver in the drivers directory at every boot, via `LoadImage`+`StartImage` under `SecurityOverride`. Each such load triggers shim 15.8 to uninstall `ShimLock`, preventing LamBoot from verifying kernels afterward. With the native ext4 reader (SDS-2) in v0.9.x, the ext4 driver is no longer needed for the 95%-of-users case — Auto mode removes it from the load path entirely, closing the shim-uninstall window for ext4-on-/boot systems.
+
+See `docs/specs/SPEC-UEFI-FSDRV-DEPRECATION.md` for the full deprecation schedule.
+
 ---
 
 ## Module Manifest

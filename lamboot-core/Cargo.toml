@@ -9,6 +9,22 @@ license.workspace = true
 uefi.workspace = true
 uefi-raw.workspace = true
 log.workspace = true
+# SDS-2: native read-only ext4 backend. Exact-pinned per SDS-2 §11.1 —
+# ext4-view made Incompatible opaque in 0.9.0 and we match on it; unpinned
+# semver would risk silent behavioral drift. Upgrade procedure in §11.2.
+# `default-features` is empty upstream so `false` is belt-and-suspenders.
+ext4-view = { version = "=0.9.3", default-features = false }
+
+# SDS-3: native PE loader. Exact-pinned per spec §11 version-pinning
+# policy. `pe64` enables 64-bit PE parsing (the only format we support
+# per spec §5.1); `endian_fd` enables scroll-based endian-aware parsing.
+# Default features pull in `std` — disable.
+goblin = { version = "=0.10.5", default-features = false, features = ["pe64", "endian_fd"] }
+
+# SDS-3: SHA-256 for trust-log `image_loaded_native` events. Pure
+# software — `asm` feature requires nightly + arch-specific assembly,
+# keep off. Default features pull in `std`; disable.
+sha2 = { version = "=0.10.8", default-features = false }
 
 [lints]
 workspace = true

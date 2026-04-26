@@ -1,0 +1,5 @@
+# Fixture disk images — tracked via fixtures.sha256 and fetched by
+# download-fixtures.sh. Never commit the raw files; they're too big
+# for git and live at pve.a.lamco.io:/var/lib/lamboot-fixtures/ext4-distro/.
+*.raw.zst
+*.raw

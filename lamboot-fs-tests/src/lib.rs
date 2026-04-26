@@ -28,6 +28,50 @@ extern crate alloc;
 #[path = "../../lamboot-core/src/fs_types.rs"]
 mod fs_types;
 
+// SDS-5 PR-2: include the pure BLS parser verbatim. Lives at
+// `../../lamboot-core/src/bls_parse.rs`. Tests exercise the parser
+// here; the Volume-dependent side (`scan_volume_for_bls`,
+// `decrement_boot_count`) is covered by the QEMU harness (PR-4).
+//
+// This module is `pub` (not `pub(crate)`) because tests under
+// `tests/bls_parse.rs` are compiled as external consumers of the
+// library and need access. The parser items themselves stay
+// `pub(crate)` in the included file — they are crate-visible in
+// both lamboot-core and this test crate, which matches the design
+// intent (parser is internal; tests are part of "crate internals"
+// from a governance perspective even though cargo compiles them
+// against the published surface).
+#[path = "../../lamboot-core/src/bls_parse.rs"]
+pub mod bls_parse;
+
+// SDS-3 PR-2: same pattern as bls_parse. Pure PE-loader logic lives
+// at `../../lamboot-core/src/pe_loader_pure.rs`; tests under
+// `tests/pe_loader_pure.rs` compile against it as an external
+// consumer. The Volume-dependent side (`pe_loader.rs` — allocate,
+// install protocol, start_image) is out of scope for host tests and
+// is exercised by the QEMU harness in SDS-3 PR-4.
+#[path = "../../lamboot-core/src/pe_loader_pure.rs"]
+pub mod pe_loader_pure;
+
+// SDS-4 PR-4: same pattern. Pure trust-log logic (schema, accumulator,
+// stable vocabulary, JSON-Lines serializer) lives at
+// `../../lamboot-core/src/trust_log_pure.rs`; tests under
+// `tests/trust_log_pure.rs` exercise ordering, field-schema stability,
+// and vocabulary constants. The Volume-dependent side (the `flush()`
+// wrapper in `trust_log.rs` that writes the buffer via `EspWriter`) is
+// exercised by the QEMU harness.
+#[path = "../../lamboot-core/src/trust_log_pure.rs"]
+pub mod trust_log_pure;
+
+// Pop!_OS / systemd-boot-discoverable-EFI auto-discovery helpers. Lives
+// at `../../lamboot-core/src/discovery_pure.rs`; tests under
+// `tests/discovery_pure.rs` cover the dirname-pattern recognizer and
+// the pretty-name renderer. The Volume-dependent scanner
+// (`discover_systemd_boot_dir_style` in `discovery.rs`) is exercised
+// by the fleet QEMU validation on VM 124 (Pop!_OS).
+#[path = "../../lamboot-core/src/discovery_pure.rs"]
+pub mod discovery_pure;
+
 pub(crate) mod cache;
 pub(crate) mod mock;
 

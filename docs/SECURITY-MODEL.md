@@ -1,10 +1,36 @@
 # LamBoot Security Model
 
 **Audience:** system administrators, security engineers, auditors evaluating LamBoot's threat model.
-**Version:** 0.8.3
-**Last updated:** 2026-04-21
+**Version:** 0.9.x (native-path)
+**Last updated:** 2026-04-24
+
+> **Authoritative reference:** The formal trust-chain spec is
+> [`docs/specs/SPEC-NATIVE-TRUST-CHAIN.md`](specs/SPEC-NATIVE-TRUST-CHAIN.md)
+> (SDS-4). That document governs every security claim LamBoot makes
+> publicly. When a statement here differs from the SDS, the SDS wins.
+> Any user-facing security claim must appear in SDS-4's §8.1
+> permitted-claims appendix first, backed by a code path.
 
 This document is LamBoot's honest, plain-language statement of what its security features protect against and what they don't. We write it this way because most bootloaders don't — and we think the Linux boot security ecosystem has accumulated enough unstated gaps that users deserve a clear map.
+
+## What changed in v0.9.x (from v0.8.3)
+
+The native boot path (SDS-2 ext4 backend + SDS-3 native PE loader +
+SDS-4 trust chain) resolves the v0.8.3 shim-15.8 `ShimLock`-uninstall
+failure by structurally bypassing it: LamBoot calls `ShimLock::Verify`
+once on the kernel bytes, then loads the kernel via its own PE loader.
+`BS->LoadImage` is never invoked for the kernel. Every decision lands
+as a `verified_via`-tagged trust-log event on `\loader\boot-trust.log`.
+
+Under the default policy on Fedora ext4 `/boot` with shim in the
+chain, the `image_verified` + `image_loaded_native` event pair carries
+the same SHA-256 (SDS-4 §6.4 invariant, enforced via `assert_eq!` at
+load time). An auditor reading the trust log can confirm the kernel
+byte stream that was verified is the byte stream that ran.
+
+The §3 honest-gaps below are unchanged from v0.8.3 — the ecosystem
+limitations those describe still apply. What changed is that LamBoot's
+own contribution to the chain is now auditable end-to-end.
 
 ---
 

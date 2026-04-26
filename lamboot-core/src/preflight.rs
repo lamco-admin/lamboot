@@ -84,12 +84,15 @@ fn error(msg: &str) -> CheckResult {
 /// lookups only — no directory enumeration on large filesystems).
 pub(crate) fn run_preflight(
     kind: &EntryKind,
-    icon: Icon,
+    _icon: Icon,
     esp: &mut Volume,
     extra_volumes: &mut [Volume],
     sb_state: SecureBootState,
-    driver_count: usize,
+    _driver_count: usize,
 ) -> PreflightResult {
+    // `_icon` and `_driver_count` are retained in the signature to keep
+    // call sites unchanged but are currently unused — former consumer
+    // `check_fs_driver` was removed (see note below).
     let mut checks = Vec::new();
 
     match kind {
@@ -135,10 +138,10 @@ pub(crate) fn run_preflight(
             // root= check
             checks.push(check_root_param(options));
 
-            // Filesystem driver check
-            if icon != Icon::Tools {
-                checks.push(check_fs_driver(kernel_path, driver_count));
-            }
+            // check_fs_driver was removed in SDS-2+SDS-6 era — under native
+            // ext4-view backend the `driver_count == 0` heuristic is a
+            // false positive, and `check_file_exists_any` above already
+            // answers the reachability question definitively.
         }
     }
 
@@ -160,10 +163,12 @@ fn check_file_exists_any(
 }
 
 fn file_exists_any(esp: &mut Volume, extra_volumes: &mut [Volume], path: &str) -> bool {
-    if esp.exists_str(path) {
+    if exists_with_boot_fallback(esp, path).is_some() {
         return true;
     }
-    extra_volumes.iter_mut().any(|vol| vol.exists_str(path))
+    extra_volumes
+        .iter_mut()
+        .any(|vol| exists_with_boot_fallback(vol, path).is_some())
 }
 
 /// Find the volume that has a specific file. Returns ESP if no volume has it.
@@ -172,15 +177,54 @@ fn find_volume_with_file<'a>(
     extra_volumes: &'a mut [Volume],
     path: &str,
 ) -> &'a mut Volume {
-    if esp.exists_str(path) {
+    if exists_with_boot_fallback(esp, path).is_some() {
         return esp;
     }
     for vol in extra_volumes.iter_mut() {
-        if vol.exists_str(path) {
+        if exists_with_boot_fallback(vol, path).is_some() {
             return vol;
         }
     }
     esp // fallback to ESP
+}
+
+/// Check whether a volume has `path` either as-written OR under an implicit
+/// `\boot\` prefix. Needed because Debian's kernel-install occasionally
+/// generates BLS entries like `linux /vmlinuz-X` (no `/boot/` prefix) even
+/// when the actual kernel file is at `/boot/vmlinuz-X` on the root
+/// filesystem. The cross-distro layouts we target:
+///
+///   Debian / Ubuntu single-root:  kernel at `/boot/vmlinuz-X`
+///   Fedora separate /boot (XBOOTLDR): kernel at `/vmlinuz-X` on /boot volume
+///
+/// Trying the path as-written covers the XBOOTLDR case; the `\boot\`
+/// fallback covers the Debian-single-root misgeneration case without
+/// affecting correctly-prefixed entries. First match wins.
+pub(crate) fn exists_with_boot_fallback(
+    vol: &mut Volume,
+    path: &str,
+) -> Option<alloc::string::String> {
+    use alloc::string::ToString as _;
+    if vol.exists_str(path) {
+        return Some(path.to_string());
+    }
+    // Only try the boot-prefixed fallback if the path doesn't already
+    // have one — avoid turning `\boot\vmlinuz` into `\boot\boot\vmlinuz`.
+    let lower = path.to_lowercase();
+    if lower.starts_with("\\boot\\") || lower.starts_with("/boot/") {
+        return None;
+    }
+    // Build the \boot\-prefixed form. Path always starts with \ after
+    // bls_parse::normalize_path, but be defensive.
+    let prefixed = if path.starts_with('\\') || path.starts_with('/') {
+        format!("\\boot{path}")
+    } else {
+        format!("\\boot\\{path}")
+    };
+    if vol.exists_str(&prefixed) {
+        return Some(prefixed);
+    }
+    None
 }
 
 fn check_pe_header(esp: &mut Volume, path: &str) -> CheckResult {
@@ -226,14 +270,25 @@ fn check_pe_header(esp: &mut Volume, path: &str) -> CheckResult {
     ok()
 }
 
-fn check_secure_boot(esp: &mut Volume, path: &str, sb_state: SecureBootState) -> CheckResult {
+fn check_secure_boot(vol: &mut Volume, path: &str, sb_state: SecureBootState) -> CheckResult {
     if sb_state == SecureBootState::Disabled {
         return ok();
     }
 
-    let Ok(data) = esp.read_str(path) else {
+    let Ok(data) = vol.read_str(path) else {
         return warning("Cannot read file for Secure Boot check");
     };
+
+    // Under shim+MOK, ShimLock::Verify is the authoritative runtime check
+    // (it covers both MOK-enrolled certs AND firmware `db`). Calling only
+    // `verify_image` here — which walks firmware `db` only — false-warns
+    // on every stock distro kernel (Canonical, Red Hat, Debian signing
+    // certs are in MOK, not in `db`). Mirror the runtime trust decision
+    // so the menu matches what boot.rs will actually do.
+    if sb_state == SecureBootState::ActiveWithShim && crate::security_override::shim_validate(&data)
+    {
+        return ok();
+    }
 
     match crate::secure::verify_image(&data) {
         Ok(()) => ok(),
@@ -264,17 +319,13 @@ fn check_root_param(options: &str) -> CheckResult {
     ok()
 }
 
-fn check_fs_driver(kernel_path: &str, driver_count: usize) -> CheckResult {
-    // If kernel path suggests it's NOT on the ESP (no EFI or loader prefix,
-    // either forward- or backslash-style) and no filesystem drivers were
-    // loaded, warn.
-    let p = kernel_path.to_uppercase();
-    let on_esp = p.starts_with("\\EFI\\")
-        || p.starts_with("/EFI/")
-        || p.starts_with("\\LOADER\\")
-        || p.starts_with("/LOADER/");
-    if driver_count == 0 && !on_esp {
-        return warning("Path may require a filesystem driver (none loaded)");
-    }
-    ok()
-}
+// check_fs_driver was removed. Historical rationale: under v0.8.3 this
+// warned "you probably forgot --with-drivers" when `driver_count == 0`
+// and the kernel path wasn't on the ESP. Under v0.9.x SDS-2 compiles the
+// native ext4-view backend in unconditionally, and SDS-6 Auto mode
+// deliberately skips loading the legacy `ext4_x64.efi` driver — so
+// `driver_count == 0` is the *expected* state on any ext4-rooted distro,
+// not a problem. The reachability question is already answered correctly
+// by `check_file_exists_any` (which probes the mounted volumes,
+// including native backends). Keeping this check would have fired a
+// warning ! on every Ubuntu/Debian/Fedora BLS entry under v0.9.x.

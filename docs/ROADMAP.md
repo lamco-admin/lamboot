@@ -65,6 +65,10 @@ Added f2fs, xfs, zfs, ntfs drivers (EfiFs v1.12) for x86_64 and aarch64. Superbl
 
 ## Current — Testing & Validation
 
+> **Authoritative tracker for v0.9.0 work: see
+> [`V0.9.0-RELEASE-PLAN.md`](V0.9.0-RELEASE-PLAN.md).** The tables
+> below summarize current state; the plan owns the open punch list.
+
 ### Testing Plan Sessions
 
 | Session | Scope | Status |
@@ -73,11 +77,11 @@ Added f2fs, xfs, zfs, ntfs drivers (EfiFs v1.12) for x86_64 and aarch64. Superbl
 | 2 | Feature testing (F1/F2/F12, navigation, escape) | ✓ Done |
 | 3 | Diagnostic modules (diag-shell, pci-inventory) | ✓ Done |
 | 4 | Cross-distro (Debian on debway VM 100) | ✓ Done |
-| 5 | Install script edge cases | Not started |
-| 6 | Feature gating (policy.toml options) | Not started |
-| 7 | No-entries and recovery screen | Not started |
-| 8 | Toolkit tools (lamboot-diagnose, lamboot-esp, etc.) | Not started |
-| 9 | vmgenid snapshot detection | Not started |
+| 5 | Install script edge cases | Open — **P-SESS-5** |
+| 6 | Feature gating (policy.toml options) | Open — **P-SESS-6** |
+| 7 | No-entries and recovery screen | Open — **P-SESS-7** |
+| 8 | Toolkit tools (lamboot-diagnose, lamboot-esp, etc.) | ✓ Done (lamboot-tools v0.2.0 ship + this session's deploy/repair gap closure) |
+| 9 | vmgenid snapshot detection | Open — **P-SESS-9** |
 | 10 | Optimization verification | ✓ Done |
 
 ### VM Migration Testing
@@ -85,85 +89,76 @@ Added f2fs, xfs, zfs, ntfs drivers (EfiFs v1.12) for x86_64 and aarch64. Superbl
 | VM | OS | Status |
 |----|-----|--------|
 | 201 (fedora-lamboot) | Fedora 43 | ✓ Installed, tested, working |
-| 100 (debway) | Debian forky/sid | ✓ Installed, tested, working |
-| 120 (ubuntu-wayland-test) | Ubuntu 25.10 | Installed, **blocked on Secure Boot** (shim chain needed) |
-| 122 (fedora-sway) | Fedora | Not started |
-| 123 (endeavouros-sway) | EndeavourOS | Not started |
-| 124 (popos-cosmic) | Pop!_OS | Not started |
-| 104 (fedora-gnome) | Fedora (SeaBIOS) | Not started — requires BIOS→UEFI migration |
+| 100 (debway) | Debian forky/sid | ✓ Installed (SB-off); SB+MOK validation open — **P-TM-1** |
+| 120 (ubuntu-wayland-test) | Ubuntu 25.10 | ✓ Installed, SB+MOK + native PE loader validated 2026-04-24 |
+| 122 (fedora-sway) | Fedora 43 | ✓ Installed (SB-off, native PE) 2026-04-24; SB+MOK validation open — **P-TM-2** |
+| 123 (endeavouros-sway) | EndeavourOS | ✓ Installed + recovered + booted 2026-04-25 (lamboot OVMF VARS + canonical ESP layout) |
+| 124 (popos-cosmic) | Pop!_OS | Open — **P-TM-5** |
+| 104 (fedora-gnome) | Fedora (SeaBIOS) | Deferred — BIOS→UEFI migration test; nice-to-have |
+| openSUSE (TBD VMID) | openSUSE Tumbleweed | NEW fixture needed — **P-TM-3** (btrfs UKI test) |
+| Bare metal | (any UEFI hardware) | Open — **P-TM-4** |
 
 ### Known Blockers
 
-- **Secure Boot chain (resolved in v0.8.3)** — LamBoot now supports four deployment configurations (SB disabled / firmware db / shim + MOK / custom OVMF VARS) with signed binaries, Path F SecurityArchProtocol override for driver loading, ShimRetainProtocol for shim 15.8+, and first-class UKI discovery. See `docs/SECURITY-MODEL.md` for the honest trust model and `docs/analysis/` for the underlying architecture research.
-- **Hookscript config locking** — current hookscript calls `qm set` during pre-start which fails due to Proxmox config lock. Fix: fw_cfg file-reference pattern (documented in Proxmox Integration Roadmap).
-- **Ubuntu kernel hooks** — `/etc/kernel/postinst.d/zz-lamboot` needed for BLS entry management on Ubuntu. Not implemented.
+- **Secure Boot chain** — resolved in v0.8.3. LamBoot supports four deployment configurations (SB disabled / firmware db / shim + MOK / custom OVMF VARS). v0.9.x adds native PE loader so the shim-15.8 ShimLock-uninstall failure mode is structurally unreachable for kernel load. See `docs/SECURITY-MODEL.md`.
+- **Hookscript config locking** — resolved in v0.8.4 via fw_cfg file-reference pattern (`docs/PROXMOX-INTEGRATION-ROADMAP.md`).
+- **Ubuntu kernel hooks** — `/etc/kernel/postinst.d/zz-lamboot` still needed for BLS entry management on Ubuntu. Open — **P-INF-1**.
 
 ---
 
-## Pre-Release Requirements
+## Pre-Release Requirements (v0.9.0)
 
-### Must Have (blocks release)
+> **Authoritative list:** [`V0.9.0-RELEASE-PLAN.md §3`](V0.9.0-RELEASE-PLAN.md).
+> Summary below; plan owns the IDs and execution order.
 
-- [ ] Shim chain loading for Secure Boot systems
-- [ ] Install script `--signed` flag to deploy signed binaries through shim
-- [ ] Session 5 testing (install script edge cases: remove, update, binary validation)
-- [ ] Session 7 testing (no-entries recovery screen)
-- [ ] Release packaging (tarball with binary + drivers + modules + installer + policy)
+### Must Have (blocks tag)
 
-### Should Have (important but not blocking)
+- [ ] **P-DOC-1/2/3** Doc refresh (this file, CHANGELOG LANDING→LANDED, STATUS supersession)
+- [ ] **P-S3-1** SDS-3 §13.3 QEMU harness menu-selection injection
+- [ ] **P-TM-1** Debian 13 SB+MOK native ext4 (VM 100 flip)
+- [ ] **P-TM-2** Fedora SB+MOK native (VM 122 flip)
+- [ ] **P-TM-3** openSUSE /boot=btrfs UKI (NEW fixture)
+- [ ] **P-TM-4** Bare metal + ext4 (real hardware OR documented v0.9.1 deferral)
+- [ ] **P-REL-1** Tag, sign, package, GitHub release, ledger update
 
-- [ ] Ubuntu kernel hooks (`/etc/kernel/postinst.d/zz-lamboot`)
-- [ ] Session 6 testing (policy.toml feature gating)
-- [ ] Session 9 testing (vmgenid snapshot detection)
-- [ ] VM migrations on 122, 123, 124 (cross-distro validation)
+### Should Have (defer to v0.9.1 only with explicit rationale)
+
+- [ ] **P-INF-1** Ubuntu kernel hooks (`/etc/kernel/postinst.d/zz-lamboot`)
+- [ ] **P-SESS-5** Test session 5: install script edge cases
+- [ ] **P-SESS-6** Test session 6: policy.toml feature gating
+- [ ] **P-SESS-7** Test session 7: no-entries recovery screen
+- [ ] **P-SESS-9** Test session 9: vmgenid snapshot detection
+- [ ] **P-TM-5** VM 124 Pop!_OS migration
+
+### Optional polish
+
+- [ ] **P-S2-1** SDS-2 SHA-256 hashing in `volume_mounted` events (now unblocked by sha2 in SDS-3)
 
 ### Nice to Have (can ship without)
 
 - [ ] VM 104 BIOS→UEFI migration test
-- [ ] NVMe diagnostic module (currently stub)
-- [ ] Website content and product page
+- [ ] NVMe diagnostic module real SMART implementation
+- [ ] Website content and product page (parallel content track, not release-gating)
 
 ---
 
-## Toolkit Pivot — coordinated v0.8.4 release with lamboot-tools v0.2.0
+## Toolkit Pivot — coordinated v0.8.4 + v0.2.0 release ✅ COMPLETE 2026-04-23
 
-**Added 2026-04-22.** Per `docs/STATUS-2026-04-22-TOOLKIT-PIVOT.md` (note §9
-post-Q appendix) and the authoritative toolkit spec at
-`~/lamboot-tools-dev/docs/SPEC-LAMBOOT-TOOLKIT-V1.md`, further bootloader
-implementation work (SDS-2 through SDS-6) is paused while the `lamboot-tools`
-toolkit reaches its v0.2.0 publishable milestone.
+Both sides shipped 2026-04-23:
 
-**Toolkit-side state (2026-04-22 end-of-day):** `lamboot-tools v0.2.0` is
-feature-complete and claim-accurate. Sessions A–Q landed 11 tools, unified
-RPM spec (three subpackages from one source per Option 2), 13 man pages, 24
-website pages, 84-check `verify-claims.sh`, 28/28 release-rehearsal, 11
-Proxmox fixture images. Five founder-gated items remain on the toolkit side
-(self-hosted runner, Tier 1 baseline, this repo's v0.8.4 coordination path
-choice — **resolved: Path A**, release-runbook execution, optional public
-fixture hosting).
+- `lamboot v0.8.4` → <https://github.com/lamco-admin/lamboot/releases/tag/v0.8.4>
+- `lamboot-tools v0.2.0` → <https://github.com/lamco-admin/lamboot-tools/releases/tag/v0.2.0>
+
+All v0.8.4 must-haves + should-haves landed (hookscript rewrite to
+fw_cfg file-reference, fleet.toml schema consumption, `--toolkit-prompt`,
+README / LAMBOOT-TOOLS-OVERVIEW rewrite, three doc back-links). Proxmox
+integration test on VM 120: **PASS 8/8**
+(`docs/analysis/V0.8.4-PROXMOX-INTEGRATION-TEST-2026-04-22.md`).
+Full commit log in `docs/CROSS-REPO-STATUS.md §4.1`.
 
 **Rolling cross-repo coordination tracker:**
-[`docs/CROSS-REPO-STATUS.md`](CROSS-REPO-STATUS.md). Mirror counterpart lives
+[`docs/CROSS-REPO-STATUS.md`](CROSS-REPO-STATUS.md). Mirror counterpart
 at `~/lamboot-tools-dev/docs/CROSS-REPO-STATUS.md`; keep them in sync.
-
-### What lamboot-dev owes the toolkit's v0.2.0 release
-
-Cross-repo coordination per SPEC-LAMBOOT-TOOLKIT-V1.md §14.3. All items ship in a coordinated v0.8.4 release alongside toolkit v0.2.0:
-
-**Must have (blocks coordinated release):**
-- [ ] **Hookscript rewrite** — `tools/lamboot-hookscript.pl` must use the fw_cfg file-reference pattern per `~/lamboot-tools-dev/docs/PROXMOX-INTEGRATION-ROADMAP.md` Phase 1. Current implementation calls `qm set` mid-pre-start which config-locks. Blocks `lamboot-pve-setup` from functioning. Hookscript reads `/etc/lamboot/fleet.toml` per shared schema in `~/lamboot-tools-dev/docs/SPEC-LAMBOOT-TOOLKIT-V1.md` Appendix C.
-- [ ] **`/etc/lamboot/fleet.toml` consumption** — hookscript + `lamboot-monitor.py` read settings per the `[hookscript]` and `[monitor]` sections of the shared schema.
-- [ ] **`lamboot-install` opt-in toolkit prompt** — adds `Install lamboot-tools for diagnostic and repair utilities? [y/N]` to the interactive path, `--install-toolkit` / `--no-install-toolkit` flag forms. Prompt occurs after successful install.
-- [ ] **README / USER-GUIDE cross-reference** — adds toolkit recommendation and link. Non-functional but brand-coherent.
-
-**Should have:**
-- [ ] **`SECURE-BOOT-AND-SIGNING-STRATEGY.md` cross-reference** — `lamboot-signing-keys` tool Scope 1 mode invokes procedures documented here. Add back-link to the toolkit's tool.
-- [ ] **`KEY-GENERATION.md` cross-reference** — same; authoritative doc for the key-management procedure `lamboot-signing-keys` consumes.
-- [ ] **`OVMF-VARS-PROXMOX.md` cross-reference** — `lamboot-pve-ovmf-vars` is the mirror of `build-ovmf-vars.sh` for tooling; doc remains authoritative.
-
-**Release coordination:**
-- [ ] Combined release announcement covers lamboot v0.8.4 bootloader changes + lamboot-tools v0.2.0 + lamboot-toolkit-pve v0.2.0
-- [ ] Release notes cross-link between repos
 
 ### Files mirrored at toolkit release-build time
 
@@ -174,7 +169,10 @@ Cross-repo coordination per SPEC-LAMBOOT-TOOLKIT-V1.md §14.3. All items ship in
 - `tools/lamboot-monitor.py` → mirrored into `lamboot-toolkit-pve` as `lamboot-pve-monitor` (renamed)
 - `tools/build-ovmf-vars.sh` → mirrored into `lamboot-toolkit-pve` as `lamboot-pve-ovmf-vars` (renamed)
 
-### What's paused while the toolkit ships
+### What's next — v0.9.0 ladder unblocked
+
+The pivot's pause gate cleared with toolkit ship. SDS-2 through SDS-6
+implementation is unblocked:
 
 - SDS-2 (ext4-view integration) implementation
 - SDS-3 (native PE loader) implementation
@@ -306,6 +304,19 @@ Path F (SecurityOverride) is being implemented for v0.8.3 — see `docs/analysis
 | rhboot/shim-review | LamBoot shim submission (Path D) | Prerequisites in progress — v1.0+ |
 
 ---
+
+## Deferred work
+
+### `pe_loader::load_pe_stream` streaming variant (post-v0.9.0)
+
+SPEC-NATIVE-PE-LOADER.md v1.0 §2.2 defined a streaming `load_pe_stream(Box<dyn FsStream>, ...)` entry point alongside the full-buffer `load_pe(&[u8], ...)`. v1.1 amendment #1 deferred this: goblin's `PE::parse` takes a byte slice not a stream, implementing a from-scratch streaming PE parser is large scope, and typical kernels are 17-18 MB with the largest UKIs at ~60 MB — comfortably inside the 256 MiB full-buffer cap.
+
+**When it returns:** if binaries we need to load ever exceed 256 MiB (hypothetical: kernel + initrd combined UKI for a large server workload), SDS-3 gets an amendment restoring the streaming variant. Until then, the spec line stays in §2.2 marked "deferred — not in v0.9.0" and ROADMAP tracks it here.
+
+**What's needed if restored:**
+- Either a streaming PE parser (no goblin) or buffering strategy that reads headers, then sections on demand.
+- `FsStream::seek` guarantee (SDS-1 trait addition).
+- Test fixture for a genuinely-large PE (one that warrants streaming).
 
 ## Key Risks
 

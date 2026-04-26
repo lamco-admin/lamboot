@@ -15,6 +15,32 @@ Install, update, or remove the LamBoot UEFI bootloader on the local system.
 
 ---
 
+## SDS-6 Driver Install Policy
+
+From v0.9.0, `lamboot-install` gates legacy UEFI filesystem driver
+deployment against a new policy knob. The default (`auto`) installs
+drivers only for filesystems LamBoot does NOT natively support. For
+stock ext4 `/boot` installs, no third-party `.efi` driver is written
+to the ESP at all.
+
+| Flag | Effect |
+|------|--------|
+| `--with-drivers-legacy=auto` (default) | Install a driver only if `/boot`'s filesystem has no native LamBoot backend. ext2/3/4 skipped (native via SDS-2). btrfs/xfs/ntfs/zfs/f2fs/iso9660 installed when applicable. |
+| `--with-drivers-legacy=all` | v0.8.3 behavior — install every driver applicable to the running architecture, regardless of native coverage. Useful for debugging. |
+| `--with-drivers-legacy=none` | Install no legacy drivers. Fails gracefully at boot if `/boot` is not natively covered. Use only after confirming `/boot` is ext2/3/4 or vfat. |
+| `--with-drivers` | Alias for `--with-drivers-legacy=all`. Retained for v0.8.x script compatibility. |
+
+On `--update`, lamboot-install also **prunes** previously-installed
+`ext4_x64.efi` / `ext2_x64.efi` / `ext3_x64.efi` (and the `-signed`
+and aarch64 variants) from the ESP in Auto mode — they are no longer
+needed and their presence has security implications (each would load
+at boot under `--with-drivers-legacy=all`, triggering shim 15.8's
+ShimLock-uninstall). To keep them around for A/B testing, run
+`lamboot-install --update --with-drivers-legacy=all`.
+
+See `docs/specs/SPEC-UEFI-FSDRV-DEPRECATION.md` and
+`docs/CONFIGURATION-GUIDE.md` `[drivers]` section.
+
 ## Options
 
 | Flag | Description |
@@ -91,6 +117,52 @@ The installer runs 8 phases in sequence:
 - Includes title, version, linux path, initrd path(s), and kernel options
 - Microcode initrd auto-prepended (Intel or AMD ucode)
 
+#### Where LamBoot writes its own BLS entries (v0.9.0+)
+
+Post-SDS-5, `lamboot-install` **always** writes generated entries to
+`$ESP/loader/entries/` on the FAT ESP — regardless of whether your
+distro keeps its existing entries on the ESP (Debian, Ubuntu with
+BLS, Pop!_OS, EndeavourOS, Arch with systemd-boot) or on ext4
+`/boot/loader/entries/` (Fedora, openSUSE Tumbleweed).
+
+**Why:**
+
+- **Spec-compliant location.** ESP is always a valid BLS location
+  per the UAPI Boot Loader Specification.
+- **Writable at runtime.** LamBoot's boot-counter rename
+  (`entry+3-0.conf` → `entry+2-1.conf`) works only on FAT because
+  `ext4-view` is read-only by design. Entries we generate on the
+  ESP therefore support `systemd-bless-boot` integration; entries
+  the distro left on ext4 do not.
+- **Fast boot reads.** FAT backend is in-firmware; no native ext4
+  parser needed.
+- **Coexistence.** Runtime LamBoot scans **every** mounted volume
+  for `/loader/entries/*.conf`, so distro entries on ext4 coexist
+  with `lamboot-install`-generated entries on ESP — both appear in
+  the menu, grouped by source volume.
+
+**What `lamboot-install` does NOT do:**
+
+- Does not copy distro BLS entries from ext4 to ESP (that would
+  duplicate state and fight `kernel-install`).
+- Does not rewrite distro entries (LamBoot's read-only stance).
+- Does not install BLS entries to `/boot/loader/entries/` even if
+  `/boot` is on FAT — always at `/loader/entries/` on the ESP.
+
+**Boot-counter limitation on ext4 entries.** Systems using
+Fedora-style ext4 `/boot/loader/entries/` cannot have those
+entries participate in `systemd-bless-boot` counter decrement.
+The security gain from a read-only `/boot` mount outweighs the
+loss of counter-based automatic fallback for most users. Three
+workarounds if you need the counter:
+
+1. Keep `/boot` on FAT (effectively kernel-on-ESP flow).
+2. Use UKIs on the ESP — same effect.
+3. Migrate to `lamboot-install`'s generated ESP entries and
+   disable `kernel-install` on the distro side.
+
+See `docs/specs/SPEC-BLS-MULTI-FS.md` §6 for the full policy.
+
 ### Phase 6: UEFI Boot Entry
 
 - Creates a UEFI boot entry via `efibootmgr` (if not already present)
@@ -110,9 +182,15 @@ The installer runs 8 phases in sequence:
 ### Phase 8: Verification
 
 - Verifies the binary exists on the ESP with correct size
-- Checks filesystem drivers are present
+- Checks filesystem drivers are present (applicable when
+  `--with-drivers-legacy` retained any; see §"SDS-6 Driver Install
+  Policy" above)
 - Verifies the UEFI boot entry exists
 - Validates each BLS entry: checks kernel and initrd file existence
+  across **both** `$ESP/loader/entries/` and `/boot/loader/entries/`
+  (Fedora-layout systems keep BLS on a separate ext4 `/boot`
+  partition, so ESP-only scanning would false-warn "empty menu" even
+  when entries are present — see commit a586677)
 - Reports any issues found
 
 ---

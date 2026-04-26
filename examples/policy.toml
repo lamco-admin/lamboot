@@ -57,3 +57,48 @@ enabled = true
 
 # Watchdog grace period in seconds
 grace_seconds = 15
+
+[loader]
+# SDS-3: native PE loader policy.
+#
+# Controls whether LamBoot loads UKIs and Linux kernels via its own
+# Rust PE loader or via firmware's BS->LoadImage. The native loader
+# bypasses Security2Arch's shim-ShimLock dance — the root cause of
+# the v0.8.3 VM 122 kernel-load failure under Secure Boot.
+#
+# Values:
+#   "auto"   (default) — native loader when ShimLock::Verify succeeds
+#                         (or SB-off / directly-signed); firmware
+#                         fallback when verification unavailable.
+#   "always"          — always native, regardless of verification.
+#   "never"           — firmware path (BS->LoadImage). v0.8.3 behavior,
+#                         kept as one-flag rollback.
+#
+# Chainload targets (Windows Boot Manager, GRUB, EFI Fallback) stay
+# on the firmware path regardless of this setting, because those
+# binaries may have imports that the native loader rejects by design.
+native_pe = "auto"
+
+[drivers]
+# SDS-6: legacy UEFI filesystem driver load policy.
+#
+# LamBoot v0.9.x+ reads ext4 natively via a Rust crate (ext4-view); the
+# legacy \EFI\LamBoot\drivers\ext4_x64.efi is redundant and — because
+# LoadImage of any UEFI FS driver triggers shim 15.8 to uninstall
+# ShimLock — actively harmful under Secure Boot. This setting controls
+# whether LamBoot still loads legacy FS drivers.
+#
+# Values:
+#   "auto"    (default) — load drivers only for filesystems LamBoot does
+#                         NOT natively support. ext4/ext2 skipped;
+#                         btrfs/xfs/ntfs/zfs/f2fs/iso9660 still load if
+#                         their .efi is present.
+#   "always"            — load every driver in \EFI\LamBoot\drivers\,
+#                         regardless of native coverage. v0.8.3 behavior.
+#                         Useful for A/B debugging; leaves the shim
+#                         interaction pattern in place.
+#   "never"             — load no legacy drivers. Security-conscious
+#                         posture for systems whose filesystems are all
+#                         natively covered. Asserts LamBoot will never
+#                         LoadImage a third-party UEFI binary at boot.
+legacy_uefi_drivers = "auto"

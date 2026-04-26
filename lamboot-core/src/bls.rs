@@ -1,497 +1,220 @@
-//! Boot Loader Specification (BLS) Type 1 entry parser.
+//! Boot Loader Specification (BLS) Type 1 discovery — volume side.
 //!
-//! Parses `/loader/entries/*.conf` files per the UAPI Group specification.
-//! Supports all 14 fields, multi-value initrd/options, boot counting (+N[-M]),
-//! and UAPI.10 version comparison for sorting.
+//! The pure byte-level parser lives in `bls_parse.rs` so host tests
+//! can include it verbatim (SDS-5 §9.1). This file holds the
+//! Volume-dependent code:
+//!
+//!   * `scan_volume_for_bls` — walks a `Volume`'s `/loader/entries/`
+//!     directory via the `FsBackend` trait, parses each `.conf` via
+//!     `BlsEntry::parse`, emits per-volume trust events, returns the
+//!     sorted `Vec<BlsEntry>` (SDS-5 §4.1).
+//!   * `to_boot_entry` — converts a parsed `BlsEntry` into the
+//!     menu-system `BootEntry`, preserving `source_volume_index` and
+//!     `source_backend_tag` for downstream use.
+//!   * `decrement_boot_count` — renames the `.conf` file on FAT
+//!     (`entry+3-0.conf` → `entry+2-1.conf`) via `EspWriter`. Skips
+//!     silently on non-FAT backends; SDS-5 PR-3 wires the
+//!     `boot_counter_skipped_ro` event.
 
 use alloc::{format, string::String, vec::Vec};
-use core::cmp::Ordering;
 
+// Re-export the pure parser types so other modules in lamboot-core keep
+// `use crate::bls::{BlsEntry, version_compare};` working. `BootCountState`
+// is not currently used outside `bls_parse` itself but stays exported
+// from there for host tests.
+pub(crate) use crate::bls_parse::{version_compare, BlsEntry};
 use crate::{
+    bls_parse::{
+        bls_sort_compare, count_digits_in_filename, has_extension_ignore_case,
+        is_native_architecture,
+    },
     discovery::{BootEntry, EntryKind, Icon},
     fs::Volume,
     policy::Policy,
+    trust_log::{TrustEvent, TrustLog},
 };
 
-/// A parsed BLS Type 1 entry
-#[derive(Debug, Clone)]
-pub(crate) struct BlsEntry {
-    /// Entry ID (filename without .conf and boot count suffix)
-    pub id: String,
-    /// Full filename (used by boot counting rename)
-    pub filename: String,
-    // BLS fields
-    pub title: Option<String>,
-    pub version: Option<String>,
-    pub machine_id: Option<String>,
-    pub sort_key: Option<String>,
-    pub linux: Option<String>,
-    pub initrd: Vec<String>,
-    pub efi: Option<String>,
-    pub options: Vec<String>,
-    pub architecture: Option<String>,
-    // Boot counting
-    pub tries_left: Option<u32>,
-    pub tries_done: Option<u32>,
-}
-
-/// Boot count state derived from tries_left
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BootCountState {
-    /// No counters — entry is known good
-    Good,
-    /// tries_left > 0 — being assessed
-    Indeterminate,
-    /// tries_left == 0 — entry failed assessment
-    Bad,
-}
-
-impl BlsEntry {
-    /// Parse a BLS entry from file contents
-    pub(crate) fn parse(filename: &str, content: &str) -> Option<Self> {
-        let mut entry = BlsEntry {
-            id: String::new(),
-            filename: String::from(filename),
-            title: None,
-            version: None,
-            machine_id: None,
-            sort_key: None,
-            linux: None,
-            initrd: Vec::new(),
-            efi: None,
-            options: Vec::new(),
-            architecture: None,
-            tries_left: None,
-            tries_done: None,
-        };
-
-        // Parse boot counting suffix from filename
-        // Format: <base>+<tries_left>[-<tries_done>].conf
-        let name_without_ext = filename.trim_end_matches(".conf");
-        if let Some(plus_pos) = name_without_ext.rfind('+') {
-            entry.id = String::from(&name_without_ext[..plus_pos]);
-            let count_part = &name_without_ext[plus_pos + 1..];
-            if let Some(dash_pos) = count_part.find('-') {
-                entry.tries_left = count_part[..dash_pos].parse().ok();
-                entry.tries_done = count_part[dash_pos + 1..].parse().ok();
-            } else {
-                entry.tries_left = count_part.parse().ok();
-                entry.tries_done = Some(0);
-            }
+/// Convert a parsed `BlsEntry` into the menu's `BootEntry`. Preserves
+/// source fields so the boot layer can pick the correct volume.
+pub(crate) fn to_boot_entry(entry: &BlsEntry) -> BootEntry {
+    let name = entry.title.clone().unwrap_or_else(|| {
+        if let Some(ref ver) = entry.version {
+            format!("Linux {ver}")
         } else {
-            entry.id = String::from(name_without_ext);
+            entry.id.clone()
         }
+    });
 
-        // Parse fields
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            // Split on first whitespace
-            let (key, value) = if let Some(pos) = line.find(|c: char| c.is_ascii_whitespace()) {
-                let k = &line[..pos];
-                let v = line[pos..].trim_start();
-                (k, v)
-            } else {
-                continue;
-            };
-
-            match key {
-                "title" => entry.title = Some(String::from(value)),
-                "version" => entry.version = Some(String::from(value)),
-                "machine-id" => entry.machine_id = Some(String::from(value)),
-                "sort-key" => entry.sort_key = Some(String::from(value)),
-                "linux" => entry.linux = Some(normalize_path(value)),
-                "efi" => entry.efi = Some(normalize_path(value)),
-                "initrd" => {
-                    // initrd can have multiple space-separated values on one line
-                    for part in value.split_whitespace() {
-                        entry.initrd.push(normalize_path(part));
-                    }
-                }
-                "options" => entry.options.push(String::from(value)),
-                "architecture" => entry.architecture = Some(String::from(value)),
-                _ => {} // Unknown keys silently ignored per spec
-            }
+    let kind = if let Some(ref efi_path) = entry.efi {
+        EntryKind::Chainload {
+            path: efi_path.clone(),
         }
-
-        // Validation: at least linux or efi must be present
-        if entry.linux.is_none() && entry.efi.is_none() {
-            return None;
+    } else if let Some(ref linux_path) = entry.linux {
+        EntryKind::LinuxLegacy {
+            kernel_path: linux_path.clone(),
+            initrd_paths: entry.cleaned_initrd(),
+            options: entry.combined_options(),
         }
-
-        Some(entry)
-    }
-
-    /// Get the boot count state
-    pub(crate) fn boot_count_state(&self) -> BootCountState {
-        match self.tries_left {
-            None => BootCountState::Good,
-            Some(0) => BootCountState::Bad,
-            Some(_) => BootCountState::Indeterminate,
-        }
-    }
-
-    /// Get combined options as a single string, stripping GRUB $variable tokens
-    pub(crate) fn combined_options(&self) -> String {
-        strip_grub_variables(&self.options.join(" "))
-    }
-
-    /// Get initrd paths with GRUB $variable tokens removed
-    pub(crate) fn cleaned_initrd(&self) -> Vec<String> {
-        self.initrd
-            .iter()
-            .filter(|s| !s.starts_with('$'))
-            .cloned()
-            .collect()
-    }
-
-    /// Convert to a BootEntry for the menu system
-    pub(crate) fn to_boot_entry(&self) -> BootEntry {
-        let name = self.title.clone().unwrap_or_else(|| {
-            if let Some(ref ver) = self.version {
-                format!("Linux {ver}")
-            } else {
-                self.id.clone()
-            }
-        });
-
-        let kind = if let Some(ref efi_path) = self.efi {
-            EntryKind::Chainload {
-                path: efi_path.clone(),
-            }
-        } else if let Some(ref linux_path) = self.linux {
-            EntryKind::LinuxLegacy {
-                kernel_path: linux_path.clone(),
-                initrd_paths: self.cleaned_initrd(),
-                options: self.combined_options(),
-            }
-        } else {
-            // Should not reach here due to validation
-            return BootEntry {
-                id: self.id.clone(),
-                name,
-                kind: EntryKind::Chainload {
-                    path: String::new(),
-                },
-                icon: Icon::Linux,
-                bls_filename: None,
-                preflight: None,
-            };
-        };
-
-        BootEntry {
-            id: format!("bls-{}", self.id),
+    } else {
+        // Should not reach here due to parse-time validation.
+        return BootEntry {
+            id: entry.id.clone(),
             name,
-            kind,
+            kind: EntryKind::Chainload {
+                path: String::new(),
+            },
             icon: Icon::Linux,
-            bls_filename: Some(self.filename.clone()),
+            bls_filename: None,
             preflight: None,
-        }
+            source_volume_index: entry.source_volume_index,
+            source_backend_tag: entry.source_backend_tag,
+        };
+    };
+
+    BootEntry {
+        id: format!("bls-{}", entry.id),
+        name,
+        kind,
+        icon: Icon::Linux,
+        bls_filename: Some(entry.filename.clone()),
+        preflight: None,
+        source_volume_index: entry.source_volume_index,
+        source_backend_tag: entry.source_backend_tag,
     }
 }
 
-/// Discover BLS Type 1 entries on a volume
-pub(crate) fn discover_bls_entries(esp: &mut Volume, policy: &Policy) -> Vec<BlsEntry> {
+/// Scan a single volume for BLS Type 1 entries at `/loader/entries/`.
+///
+/// SDS-5 §4.1 per-volume scanner. Uses `Volume`'s FsBackend-uniform
+/// API — works identically on FAT (ESP / XBOOTLDR) and ext4 (Fedora
+/// /boot). Emits per-volume trust events for operator visibility:
+///
+///   * `bls_entry_read_failed` — a `.conf` file's bytes could not be read
+///   * `bls_entry_invalid` — parse failure (malformed `.conf`)
+///   * `bls_entries_found` — terminal event with count + backend tag
+///
+/// Volumes without `/loader/entries/` return an empty `Vec` silently —
+/// that's the common case (most disk volumes have nothing to offer).
+pub(crate) fn scan_volume_for_bls(
+    volume: &mut Volume,
+    volume_index: usize,
+    policy: &Policy,
+    trust_log: &mut TrustLog,
+) -> Vec<BlsEntry> {
     let entries_dir = "/loader/entries";
+    let backend_tag = volume.backend_tag();
 
-    let Ok(filenames) = esp.read_dir_str(entries_dir) else {
+    // `/loader/entries/` not present on this volume — silent: most
+    // volumes legitimately have no BLS directory. Genuine I/O errors
+    // (as opposed to NotFound) surface as Err too; distinguishing
+    // them requires an `exists()` probe first, which we skip on the
+    // common-empty path for perf (§10 budget).
+    let Ok(filenames) = volume.read_dir_str(entries_dir) else {
         return Vec::new();
     };
 
     let mut entries: Vec<BlsEntry> = Vec::new();
 
     for filename in &filenames {
-        // Must end with .conf
+        // Must end with `.conf`.
         if !has_extension_ignore_case(filename, "conf") {
             continue;
         }
-        // Reject filenames starting with . or auto-
+        // Reject hidden (`.`) + auto-generated (`auto-*`) filenames.
         if filename.starts_with('.') || filename.starts_with("auto-") {
             continue;
         }
 
         let path = format!("{entries_dir}/{filename}");
 
-        let Ok(content) = esp.read_to_string_str(&path) else {
-            continue;
+        let content = match volume.read_to_string_str(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                trust_log.record(
+                    TrustEvent::new("bls_entry_read_failed")
+                        .with_path(&path)
+                        .with_note(&format!(
+                            "volume_index={volume_index} backend={backend_tag} err={e}"
+                        )),
+                );
+                continue;
+            }
         };
 
-        if let Some(mut entry) = BlsEntry::parse(filename, &content) {
-            // Filter by architecture — accept entries matching our target
-            if let Some(ref arch) = entry.architecture {
-                if !is_native_architecture(arch) {
-                    continue;
-                }
-            }
+        match BlsEntry::parse(filename, &content) {
+            Some(mut entry) => {
+                // Tag the source so downstream (boot layer, trust log,
+                // menu UI) can pick the correct volume / group entries.
+                entry.source_volume_index = volume_index;
+                entry.source_backend_tag = backend_tag;
 
-            // Check policy allowlist/denylist
-            if let Some(ref linux_path) = entry.linux {
-                if !policy.allowed(linux_path) {
-                    continue;
-                }
-            }
-
-            // Auto-discover initrd if entry has none
-            if entry.initrd.is_empty() {
-                if let Some(ref linux_path) = entry.linux {
-                    let discovered = crate::autodiscovery::find_initrd(linux_path, esp);
-                    if !discovered.is_empty() {
-                        log::info!(
-                            "Auto-discovered {} initrd(s) for {}",
-                            discovered.len(),
-                            entry.id
-                        );
-                        entry.initrd = discovered;
+                // Filter by architecture — accept entries matching our target.
+                if let Some(ref arch) = entry.architecture {
+                    if !is_native_architecture(arch) {
+                        continue;
                     }
                 }
-            }
 
-            entries.push(entry);
+                // Check policy allowlist/denylist.
+                if let Some(ref linux_path) = entry.linux {
+                    if !policy.allowed(linux_path) {
+                        continue;
+                    }
+                }
+
+                // Auto-discover initrd if entry has none. Pre-SDS-5 this
+                // always probed the ESP; now we probe the SAME volume the
+                // entry came from (Fedora's initramfs lives next to its
+                // kernel on ext4, not on ESP).
+                if entry.initrd.is_empty() {
+                    if let Some(ref linux_path) = entry.linux {
+                        let discovered = crate::autodiscovery::find_initrd(linux_path, volume);
+                        if !discovered.is_empty() {
+                            log::info!(
+                                "Auto-discovered {} initrd(s) for {}",
+                                discovered.len(),
+                                entry.id
+                            );
+                            entry.initrd = discovered;
+                        }
+                    }
+                }
+
+                entries.push(entry);
+            }
+            None => {
+                trust_log.record(
+                    TrustEvent::new("bls_entry_invalid")
+                        .with_path(&path)
+                        .with_note(&format!(
+                            "volume_index={volume_index} backend={backend_tag} \
+                             parse=missing_linux_or_efi"
+                        )),
+                );
+            }
         }
     }
 
-    // Sort entries per BLS spec
+    // Terminal trust event: count + backend identity so an operator
+    // reading the log knows which backend produced which entries.
+    trust_log.record(TrustEvent::new("bls_entries_found").with_note(&format!(
+        "volume_index={volume_index} backend={backend_tag} count={}",
+        entries.len()
+    )));
+
+    // Sort entries per BLS spec.
     entries.sort_by(bls_sort_compare);
 
     entries
 }
 
-/// BLS sort comparison per specification:
-/// 1. Bad entries (tries_left==0) sort last
-/// 2. Entries with sort-key sort before those without
-/// 3. Compare sort-key, then machine-id, then version (descending)
-/// 4. Filename fallback (descending version order)
-fn bls_sort_compare(a: &BlsEntry, b: &BlsEntry) -> Ordering {
-    // Bad entries last
-    let a_bad = a.boot_count_state() == BootCountState::Bad;
-    let b_bad = b.boot_count_state() == BootCountState::Bad;
-    if a_bad != b_bad {
-        return if a_bad {
-            Ordering::Greater
-        } else {
-            Ordering::Less
-        };
+/// Provide the `.to_boot_entry()` method on `BlsEntry` used by the
+/// discovery pipeline. Delegates to the free function so `bls_parse`
+/// stays free of `BootEntry` / UEFI dependencies.
+impl BlsEntry {
+    pub(crate) fn to_boot_entry(&self) -> BootEntry {
+        to_boot_entry(self)
     }
-
-    // sort-key presence: entries WITH sort-key come first
-    let a_has_sk = a.sort_key.is_some();
-    let b_has_sk = b.sort_key.is_some();
-    if a_has_sk != b_has_sk {
-        return if a_has_sk {
-            Ordering::Less
-        } else {
-            Ordering::Greater
-        };
-    }
-
-    // Both have sort-key: compare sort-key → machine-id → version (desc)
-    if a_has_sk && b_has_sk {
-        let sk_cmp = cmp_opt_str(a.sort_key.as_ref(), b.sort_key.as_ref());
-        if sk_cmp != Ordering::Equal {
-            return sk_cmp;
-        }
-
-        let mid_cmp = cmp_opt_str(a.machine_id.as_ref(), b.machine_id.as_ref());
-        if mid_cmp != Ordering::Equal {
-            return mid_cmp;
-        }
-
-        // Version: descending (newer first)
-        let ver_cmp = version_compare(
-            a.version.as_deref().unwrap_or(""),
-            b.version.as_deref().unwrap_or(""),
-        );
-        if ver_cmp != Ordering::Equal {
-            return ver_cmp.reverse();
-        }
-    }
-
-    // Filename fallback.
-    // If BOTH entries have version metadata, treat the filename as a version-like
-    // identifier and sort descending (newer version-like names first).
-    // If either is missing a version, there's nothing version-y to reverse —
-    // use plain ascending alphabetical order so predictable names like
-    // "Pop_OS-current" beat "Recovery-79EB-58C6". Reversing in the no-version
-    // case produced the Pop!_OS recovery-as-default bug on v0.8.3 (task #51).
-    if a.version.is_some() && b.version.is_some() {
-        version_compare(&a.id, &b.id).reverse()
-    } else {
-        a.id.cmp(&b.id)
-    }
-}
-
-/// Compare optional strings (None sorts lower than Some)
-fn cmp_opt_str(a: Option<&String>, b: Option<&String>) -> Ordering {
-    match (a, b) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Greater, // None sorts after
-        (Some(_), None) => Ordering::Less,    // Some sorts before
-        (Some(a), Some(b)) => a.cmp(b),
-    }
-}
-
-/// UAPI.10 Version Format Comparison
-///
-/// Compares two version strings according to the UAPI Group specification.
-/// Used for BLS entry sorting and boot counting.
-pub(crate) fn version_compare(a: &str, b: &str) -> Ordering {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    let mut ai = 0;
-    let mut bi = 0;
-
-    loop {
-        // Skip non-alphanumeric, non-special characters
-        while ai < a.len() && !is_version_char(a[ai]) {
-            ai += 1;
-        }
-        while bi < b.len() && !is_version_char(b[bi]) {
-            bi += 1;
-        }
-
-        // Tilde: sorts lower than everything (pre-release)
-        let a_tilde = ai < a.len() && a[ai] == b'~';
-        let b_tilde = bi < b.len() && b[bi] == b'~';
-        if a_tilde || b_tilde {
-            if !a_tilde {
-                return Ordering::Greater;
-            }
-            if !b_tilde {
-                return Ordering::Less;
-            }
-            ai += 1;
-            bi += 1;
-            continue;
-        }
-
-        // End of string check
-        let a_end = ai >= a.len();
-        let b_end = bi >= b.len();
-        if a_end && b_end {
-            return Ordering::Equal;
-        }
-        if a_end {
-            return Ordering::Less;
-        }
-        if b_end {
-            return Ordering::Greater;
-        }
-
-        // Dash: sorts lower
-        let a_dash = a[ai] == b'-';
-        let b_dash = b[bi] == b'-';
-        if a_dash || b_dash {
-            if !a_dash {
-                return Ordering::Greater;
-            }
-            if !b_dash {
-                return Ordering::Less;
-            }
-            ai += 1;
-            bi += 1;
-            continue;
-        }
-
-        // Caret: sorts lower (post-release)
-        let a_caret = a[ai] == b'^';
-        let b_caret = b[bi] == b'^';
-        if a_caret || b_caret {
-            if !a_caret {
-                return Ordering::Greater;
-            }
-            if !b_caret {
-                return Ordering::Less;
-            }
-            ai += 1;
-            bi += 1;
-            continue;
-        }
-
-        // Dot: sorts lower
-        let a_dot = a[ai] == b'.';
-        let b_dot = b[bi] == b'.';
-        if a_dot || b_dot {
-            if !a_dot {
-                return Ordering::Greater;
-            }
-            if !b_dot {
-                return Ordering::Less;
-            }
-            ai += 1;
-            bi += 1;
-            continue;
-        }
-
-        // Numeric comparison
-        if a[ai].is_ascii_digit() || b[bi].is_ascii_digit() {
-            // Skip leading zeros
-            while ai < a.len() && a[ai] == b'0' {
-                ai += 1;
-            }
-            while bi < b.len() && b[bi] == b'0' {
-                bi += 1;
-            }
-
-            // Extract numeric spans
-            let a_start = ai;
-            let b_start = bi;
-            while ai < a.len() && a[ai].is_ascii_digit() {
-                ai += 1;
-            }
-            while bi < b.len() && b[bi].is_ascii_digit() {
-                bi += 1;
-            }
-            let a_len = ai - a_start;
-            let b_len = bi - b_start;
-
-            // Longer number is bigger
-            if a_len != b_len {
-                return a_len.cmp(&b_len);
-            }
-
-            // Same length: compare digit-by-digit
-            for i in 0..a_len {
-                let cmp = a[a_start + i].cmp(&b[b_start + i]);
-                if cmp != Ordering::Equal {
-                    return cmp;
-                }
-            }
-            continue;
-        }
-
-        // Alphabetic comparison (uppercase sorts LOWER than lowercase)
-        if a[ai].is_ascii_alphabetic() || b[bi].is_ascii_alphabetic() {
-            let a_start = ai;
-            let b_start = bi;
-            while ai < a.len() && a[ai].is_ascii_alphabetic() {
-                ai += 1;
-            }
-            while bi < b.len() && b[bi].is_ascii_alphabetic() {
-                bi += 1;
-            }
-
-            let a_span = &a[a_start..ai];
-            let b_span = &b[b_start..bi];
-
-            let cmp = a_span.cmp(b_span);
-            if cmp != Ordering::Equal {
-                return cmp;
-            }
-            continue;
-        }
-
-        // Should not reach here, but advance to prevent infinite loop
-        ai += 1;
-        bi += 1;
-    }
-}
-
-/// Check if a byte is a version-relevant character
-fn is_version_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'~' || b == b'^' || b == b'-' || b == b'.'
 }
 
 /// Decrement the boot counter for a BLS entry.
@@ -503,14 +226,14 @@ pub(crate) fn decrement_boot_count(
 ) -> Option<String> {
     let tries_left = entry.tries_left?;
     if tries_left == 0 {
-        return None; // Already bad, nothing to decrement
+        return None; // Already bad, nothing to decrement.
     }
 
     let tries_done = entry.tries_done.unwrap_or(0);
     let new_left = tries_left - 1;
     let new_done = tries_done.saturating_add(1);
 
-    // Preserve digit width for padding (e.g., +03 stays 2 digits)
+    // Preserve digit width for padding (e.g., +03 stays 2 digits).
     let left_width = count_digits_in_filename(&entry.filename, '+');
     let done_width = count_digits_in_filename(&entry.filename, '-');
 
@@ -560,60 +283,4 @@ pub(crate) fn decrement_boot_count(
             None
         }
     }
-}
-
-/// Count the number of digits after a marker character in the filename
-fn count_digits_in_filename(filename: &str, marker: char) -> usize {
-    let name = filename.trim_end_matches(".conf");
-    if let Some(pos) = name.rfind(marker) {
-        let after = &name[pos + 1..];
-        // Count digits until a non-digit (e.g., the '-' separator)
-        after.chars().take_while(char::is_ascii_digit).count()
-    } else {
-        0
-    }
-}
-
-/// Check if an architecture string matches the current build target
-fn is_native_architecture(arch: &str) -> bool {
-    let arch_lower = arch.to_lowercase();
-    #[cfg(target_arch = "x86_64")]
-    {
-        arch_lower == "x64" || arch_lower == "x86_64" || arch_lower == "x86-64"
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        arch_lower == "aa64" || arch_lower == "aarch64" || arch_lower == "arm64"
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        false
-    }
-}
-
-/// Case-insensitive file extension check for no_std environments
-fn has_extension_ignore_case(filename: &str, ext: &str) -> bool {
-    let Some(dot_pos) = filename.rfind('.') else {
-        return false;
-    };
-    filename[dot_pos + 1..].eq_ignore_ascii_case(ext)
-}
-
-/// Convert forward slashes to backslashes for EFI path compatibility
-/// Remove GRUB `$variable` tokens from a string.
-/// Fedora BLS entries contain `$tuned_initrd`, `$grub_users`, etc.
-/// that are meaningful to GRUB but not to LamBoot.
-fn strip_grub_variables(s: &str) -> String {
-    s.split_whitespace()
-        .filter(|token| !token.starts_with('$'))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn normalize_path(path: &str) -> String {
-    let mut s = path.replace('/', "\\");
-    if !s.starts_with('\\') {
-        s.insert(0, '\\');
-    }
-    s
 }

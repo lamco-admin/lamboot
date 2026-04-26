@@ -6,10 +6,12 @@ extern crate alloc;
 mod acpi;
 mod autodiscovery;
 mod bls;
+mod bls_parse;
 mod boot;
 mod bootlog;
 mod console;
 mod discovery;
+mod discovery_pure;
 mod drivers;
 mod fs;
 mod fs_backend;
@@ -24,6 +26,8 @@ mod hypervisor;
 mod initrd;
 mod input;
 mod partitions;
+mod pe_loader;
+mod pe_loader_pure;
 mod policy;
 mod preflight;
 mod report;
@@ -33,12 +37,15 @@ mod smbios;
 mod telemetry;
 mod tpm;
 mod trust_log;
+mod trust_log_pure;
 mod uki;
 
-use alloc::{format, string::String};
+use alloc::{format, string::String, vec::Vec};
 
 use log::info;
 use uefi::{prelude::*, Result};
+
+use crate::fs::Volume;
 
 const WATCHDOG_TIMEOUT_SECONDS: usize = 300; // 5 minutes
 
@@ -166,10 +173,41 @@ fn run_bootloader(image: Handle) -> Result<Status> {
 
     // Phase 4: Load policy
     info!("Loading boot policy...");
-    let policy = policy::load_policy(&mut esp).unwrap_or_else(|e| {
+    let policy_load = policy::load_policy(&mut esp);
+    // SDS-4 Step 5: emit policy_loaded OR policy_invalid trust event.
+    // The auditable record of what policy drove this boot lives here.
+    match &policy_load {
+        Ok((_, _)) => {
+            trust_log.record(
+                trust_log::TrustEvent::new("policy_loaded")
+                    .with_path("/EFI/LamBoot/policy.toml")
+                    .with_status(Status::SUCCESS),
+            );
+        }
+        Err(e) => {
+            trust_log.record(
+                trust_log::TrustEvent::new("policy_invalid")
+                    .with_path("/EFI/LamBoot/policy.toml")
+                    .with_status(e.status())
+                    .with_note("falling back to compiled-in defaults"),
+            );
+        }
+    }
+    let (policy, clamps) = policy_load.unwrap_or_else(|e| {
         log::warn!("Failed to load policy, using defaults: {e:?}");
-        policy::Policy::default()
+        (policy::Policy::default(), alloc::vec::Vec::new())
     });
+    // Surface any compiled-in floor clamps so an operator inspecting the
+    // log can see that the ESP policy.toml tried to weaken a
+    // security-critical field. `lamboot-inspect verify` picks these up.
+    for clamp in &clamps {
+        log::warn!(
+            "policy.toml {} = {} clamped to floor {}",
+            clamp.field,
+            clamp.esp_value,
+            clamp.floor_value,
+        );
+    }
 
     // Measure boot config into TPM PCR 5
     if let Ok(config_data) = esp.read_str("/EFI/LamBoot/policy.toml") {
@@ -186,7 +224,12 @@ fn run_bootloader(image: Handle) -> Result<Status> {
     security_override::request_shim_retain_protocol();
     info!("Loading filesystem drivers...");
     let t = telemetry::timestamp_ms();
-    let driver_count = drivers::load_drivers(image, &mut esp, &tpm, &mut trust_log);
+    // SDS-6: policy.drivers_legacy controls per-driver gating.
+    // Default "auto" skips drivers whose filesystem is natively covered
+    // (ext4/ext2 via SDS-2's Ext4Backend). "always" preserves v0.8.3
+    // load-everything behavior. "never" blocks all legacy FS drivers.
+    let driver_count =
+        drivers::load_drivers(image, &mut esp, &tpm, &mut trust_log, policy.drivers_legacy);
     telemetry.record("drivers", t);
     // Defer trust_log flush until the boot_attempt record is queued —
     // a single flush before handoff captures the full boot's decisions.
@@ -202,7 +245,8 @@ fn run_bootloader(image: Handle) -> Result<Status> {
     let mut extra_volumes = fs::enumerate_volumes();
     info!("Found {} additional volume(s)", extra_volumes.len());
 
-    // Phase 6.5: Scan discoverable partitions and mount XBOOTLDR
+    // Phase 6.5: Scan discoverable partitions, mount XBOOTLDR (FAT), and
+    // mount ext4 partitions via the SDS-2 native ext4 backend.
     let discovered_partitions = partitions::scan_discoverable_partitions();
     if !discovered_partitions.is_empty() {
         info!(
@@ -233,11 +277,129 @@ fn run_bootloader(image: Handle) -> Result<Status> {
         info!("XBOOTLDR partition added to volume list");
     }
 
-    // Phase 7: Discover boot entries (BLS first, then ESP fallback)
+    // SDS-2: Mount ext4 partitions natively (no UEFI FS driver, no
+    // shim-uninstall path). The canonical use case is reading /boot from
+    // a Linux root partition when the distro installs kernels on ext4
+    // rather than the ESP. Extended to all FsType::Ext4 volumes so future
+    // SDS-5 BLS-multi-FS discovery sees them without additional work.
+    for part in &discovered_partitions {
+        let Some(fs_info) = partitions::probe_superblock(part.handle) else {
+            continue;
+        };
+        if fs_info.fs_type != partitions::FsType::Ext4 {
+            continue;
+        }
+        match fs_backend_ext4::Ext4Backend::new(part.handle, fs_info) {
+            Ok(backend) => {
+                // Pull identity via the FsBackend trait before we box
+                // the backend (after boxing we'd still have access, but
+                // fetching here keeps the Volume construction call
+                // below concise).
+                use fs_backend::FsBackend as _;
+                let label = backend.label().map(alloc::string::String::from);
+                let fs_uuid = backend.uuid();
+                let identity = fs::VolumeIdentity {
+                    partition_guid: Some(part.unique_guid),
+                    fs_uuid,
+                    label,
+                    index: (extra_volumes.len() as u32) + 1,
+                    backend_tag: fs_backend_ext4::EXT4_BACKEND_TAG,
+                };
+                let volume = fs::Volume::from_backend(identity, alloc::boxed::Box::new(backend));
+                info!(
+                    "Mounted native ext4 volume: {}",
+                    volume.identity().describe()
+                );
+                // SDS-4 §6.1 Step 6: volume_mounted trust event with
+                // backend tag + fs_uuid so audit consumers can trace
+                // which volume sourced which kernel bytes later.
+                trust_log.record(
+                    trust_log::TrustEvent::new("volume_mounted").with_note(&format!(
+                        "backend={} fs_uuid={} partition_guid={} index={}",
+                        volume.identity().backend_tag,
+                        volume
+                            .identity()
+                            .fs_uuid
+                            .as_ref()
+                            .map_or("none".into(), |u| format!("{u}")),
+                        volume
+                            .identity()
+                            .partition_guid
+                            .map_or("none".into(), |g| format!("{g}")),
+                        volume.identity().index,
+                    )),
+                );
+                extra_volumes.push(volume);
+            }
+            Err(e) => {
+                log::warn!(
+                    "Skipping ext4 partition {:?}: {} ({})",
+                    part.partition_type,
+                    e,
+                    e.as_log_token(),
+                );
+            }
+        }
+    }
+
+    // Phase 7: Discover boot entries (BLS across all volumes per SDS-5,
+    // then ESP-only fallback for Windows/UKI/other-loaders/tools).
     bootlog.info(Some(&mut esp), "Discovering boot entries...");
     info!("Discovering boot entries...");
     let t = telemetry::timestamp_ms();
-    let mut entries = discovery::discover_all_entries(&mut esp, &mut extra_volumes, &policy);
+
+    // Compute SHA-256 of the running LamBoot image so the discovery
+    // layer can recognize and skip the synthetic "EFI Fallback" entry
+    // when `\EFI\BOOT\BOOTX64.EFI` is itself a copy of LamBoot (the
+    // toolkit's belt-and-suspenders pattern installs LamBoot there for
+    // firmware-fallback boot). Without this guard, that path produces
+    // a chainload self-loop. See discovery.rs::discover_other_loaders.
+    let self_image_sha256: Option<[u8; 32]> = {
+        match uefi::boot::open_protocol_exclusive::<uefi::proto::loaded_image::LoadedImage>(image) {
+            Ok(li) => {
+                let info = li.info();
+                let base = info.0.cast::<u8>();
+                let size = info.1 as usize;
+                if base.is_null() || size == 0 {
+                    None
+                } else {
+                    // SAFETY: LoadedImageProtocol guarantees image_base()
+                    // points to a valid mapped image of length image_size().
+                    let bytes = unsafe { core::slice::from_raw_parts(base, size) };
+                    Some(pe_loader_pure::sha256_of(bytes))
+                }
+            }
+            Err(_) => None,
+        }
+    };
+
+    // SDS-5 signature takes a unified &mut [Volume]; merge esp + extras,
+    // call, then split back. `volumes[0]` is always ESP by construction;
+    // this invariant is relied on by the Phase-2 ESP-only scanners.
+    let mut entries = {
+        let mut all_volumes: Vec<Volume> = alloc::vec![esp];
+        all_volumes.append(&mut extra_volumes);
+        let result = discovery::discover_all_entries(
+            &mut all_volumes,
+            &policy,
+            &mut trust_log,
+            self_image_sha256,
+        );
+        // Split back (preserve order: esp stays index 0, extras 1..n)
+        esp = all_volumes.remove(0);
+        extra_volumes = all_volumes;
+        result
+    };
+    // SDS-4 §6.1 Step 7: entries_discovered summary event. Audit
+    // consumers use this as the pivot between discovery phase and
+    // user-selection phase.
+    trust_log.record(
+        trust_log::TrustEvent::new("entries_discovered").with_note(&format!(
+            "total={} extra_volumes={}",
+            entries.len(),
+            extra_volumes.len()
+        )),
+    );
     telemetry.record("discovery", t);
 
     let bootable_count = entries
@@ -278,15 +440,38 @@ fn run_bootloader(image: Handle) -> Result<Status> {
     // Checks file existence across ALL volumes (targeted lookups, not dir scans)
     let sb_state = secure::detect_secure_boot();
     for entry in &mut entries {
-        entry.preflight = Some(preflight::run_preflight(
+        let pf = preflight::run_preflight(
             &entry.kind,
             entry.icon,
             &mut esp,
             &mut extra_volumes,
             sb_state,
             driver_count,
-        ));
+        );
+        // Temporary instrumentation: emit a trust-log event for every
+        // non-Ok preflight result so the status-bar `!` / `X` markers
+        // are explainable from the on-disk log alone. Matches the
+        // diagnostic pattern used to isolate the Opaque-partition
+        // hang on VM 120. Remove once preflight false-positives on
+        // Fedora-layout distros are fully resolved.
+        for check in &pf.checks {
+            if check.severity != preflight::Severity::Ok {
+                let sev = match check.severity {
+                    preflight::Severity::Warning => "warning",
+                    preflight::Severity::Error => "error",
+                    preflight::Severity::Ok => "ok", // unreachable
+                };
+                trust_log.record(trust_log::TrustEvent::new("preflight_issue").with_note(
+                    &format!(
+                        "entry_id={} severity={} msg={}",
+                        entry.id, sev, check.message,
+                    ),
+                ));
+            }
+        }
+        entry.preflight = Some(pf);
     }
+    trust_log.flush(&mut esp);
 
     // Phase 8: Crash loop check
     let mut in_crash_loop = health::is_crash_loop(policy.crash_threshold);
@@ -372,11 +557,56 @@ fn run_bootloader(image: Handle) -> Result<Status> {
 
         if let Some(ref bls_file) = selection.bls_filename {
             let entries_dir = "/loader/entries";
-            if let Ok(content) = esp.read_to_string_str(&format!("{entries_dir}/{bls_file}")) {
+            // SDS-5 PR-3: route to the SOURCE volume, not always ESP.
+            // BLS entries on ext4 /boot have bls_filename too, but the
+            // .conf file lives on ext4 — reading from ESP would silently
+            // fail (NotFound), losing the measurement + rename opportunity.
+            let vol_idx = selection.source_volume_index;
+            let source_volume: &mut fs::Volume = if vol_idx == 0 {
+                &mut esp
+            } else if vol_idx - 1 < extra_volumes.len() {
+                &mut extra_volumes[vol_idx - 1]
+            } else {
+                // Stale index — shouldn't happen given the split back
+                // in phase 7 preserves order. Fall back to ESP so the
+                // measurement path still fires.
+                log::warn!(
+                    "bls source_volume_index {vol_idx} out of range (extra_volumes.len()={}) — measuring from ESP",
+                    extra_volumes.len()
+                );
+                &mut esp
+            };
+            let source_backend = source_volume.backend_tag();
+            if let Ok(content) =
+                source_volume.read_to_string_str(&format!("{entries_dir}/{bls_file}"))
+            {
                 tpm.measure_bls_entry(content.as_bytes(), &selection.id);
                 if let Some(bls_entry) = bls::BlsEntry::parse(bls_file, &content) {
                     if bls_entry.tries_left.is_some() {
-                        bls::decrement_boot_count(&mut esp, &bls_entry);
+                        // SDS-5 PR-3: counter rename requires FAT. On RO
+                        // ext4, emit boot_counter_skipped_ro instead of
+                        // attempting (which would fail cryptically inside
+                        // EspWriter::new). Operator sees the skip + can
+                        // migrate to UKI or ESP-BLS if they want counters.
+                        if source_backend == fs_backend_fat::FatBackend::TAG {
+                            bls::decrement_boot_count(source_volume, &bls_entry);
+                        } else {
+                            trust_log.record(
+                                trust_log::TrustEvent::new("boot_counter_skipped_ro")
+                                    .with_path(bls_file)
+                                    .with_note(&format!(
+                                        "volume_index={vol_idx} backend={source_backend} \
+                                         tries_left={}",
+                                        bls_entry.tries_left.unwrap_or(0)
+                                    )),
+                            );
+                            log::warn!(
+                                "Boot counter for {bls_file} not decremented — source \
+                                 volume is read-only ({source_backend}). \
+                                 systemd-bless-boot will not work for this entry. \
+                                 See SPEC-BLS-MULTI-FS §6.2 for workarounds."
+                            );
+                        }
                     }
                 }
             }
@@ -391,6 +621,13 @@ fn run_bootloader(image: Handle) -> Result<Status> {
         info!("Booting: {}", selection.name);
         let selection_name = selection.name.clone();
         let selection_id = selection.id.clone();
+        // SDS-4 §6.1 Step 8: entry_selected (audit of the final choice
+        // regardless of whether user picked or menu timed out).
+        trust_log.record(
+            trust_log::TrustEvent::new("entry_selected")
+                .with_path(&selection_name)
+                .with_note(&format!("id={selection_id}")),
+        );
         trust_log.record(
             trust_log::TrustEvent::new("boot_attempt")
                 .with_path(&selection_name)
@@ -401,7 +638,14 @@ fn run_bootloader(image: Handle) -> Result<Status> {
         // Flush before handoff so the log reflects everything up to this point
         // even if the child image never returns.
         trust_log.flush(&mut all_volumes[0]);
-        let result = boot::boot_entry(image, &mut all_volumes, selection, &tpm);
+        let result = boot::boot_entry(
+            image,
+            &mut all_volumes,
+            selection,
+            &tpm,
+            &policy,
+            &mut trust_log,
+        );
 
         // If boot_entry returned an Err (kernel load rejected, missing file,
         // etc.) capture it to the trust log so the next boot's diagnostics

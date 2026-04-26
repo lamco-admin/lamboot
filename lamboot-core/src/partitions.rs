@@ -32,6 +32,15 @@ const ROOT_PARTITION_TYPE: Guid = guid!("b921b045-1df0-41c3-af44-4c6f280d3fae");
 
 const XBOOTLDR_PARTITION_TYPE: Guid = guid!("bc13c2ff-59e6-4262-a352-b275fd6f7172");
 
+/// EFI System Partition type GUID (UEFI spec). Excluded from the Opaque
+/// return set because the ESP is already mounted via `mount_esp(image)`
+/// elsewhere, and re-opening its BlockIO handle during superblock probing
+/// conflicts with the live mount — observed on VM 120 OVMF to hang
+/// LamBoot in `open_protocol_exclusive::<BlockIO>` without surfacing an
+/// error. The ESP is never an ext4-backend candidate, so skipping it is
+/// safe and eliminates the hang.
+const ESP_PARTITION_TYPE: Guid = guid!("c12a7328-f81f-11d2-ba4b-00a0c93ec93b");
+
 /// Information about a discovered partition
 #[derive(Debug)]
 pub(crate) struct DiscoveredPartition {
@@ -42,8 +51,28 @@ pub(crate) struct DiscoveredPartition {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PartType {
+    /// UAPI.2 Discoverable Partition for the architecture's Linux root.
+    /// Consumed by [`auto_append_root`] to synthesize `root=PARTUUID=`.
     Root,
+    /// UAPI.2 XBOOTLDR (Boot Loader Specification extended boot partition).
+    /// Consumed by [`mount_xbootldr`].
     Xbootldr,
+    /// A GPT partition present on the disk but carrying a partition-type
+    /// GUID that isn't one of the DPS ones we recognize above. We still
+    /// return it so callers that want to try mounting by filesystem probe
+    /// (main.rs phase 6 — SDS-2 native ext4 mount) can iterate every
+    /// partition the firmware knows about, not just DPS-tagged ones.
+    ///
+    /// Rationale: most Linux distros (Ubuntu, Debian, Fedora when not using
+    /// `systemd-repart`) create their root partition with the generic
+    /// "Linux filesystem" type GUID `0fc63daf-8483-4772-8e79-3d69d8477de4`
+    /// rather than the DPS root GUID. Under v0.8.3 those partitions were
+    /// reachable through the UEFI `ext4_x64.efi` filesystem driver, which
+    /// registered `SimpleFileSystem` for any ext4 blockdev. Under v0.9.x
+    /// SDS-6 Auto-mode correctly skips the legacy driver; without this
+    /// `Opaque` path, the native ext4 backend would never get a chance
+    /// to mount real-world distro roots, silently regressing Config 4.
+    Opaque,
 }
 
 /// Scan all partitions for discoverable types (root, XBOOTLDR).
@@ -75,15 +104,36 @@ pub(crate) fn scan_discoverable_partitions() -> Vec<DiscoveredPartition> {
         let type_guid: Guid = { gpt_entry.partition_type_guid }.0;
         let unique_guid: Guid = { gpt_entry.unique_partition_guid };
 
+        // ESP: skip entirely. Probing its handle while mount_esp already
+        // holds it hangs LamBoot on OVMF (see ESP_PARTITION_TYPE doc).
+        if type_guid == ESP_PARTITION_TYPE {
+            continue;
+        }
+
         let part_type = if type_guid == ROOT_PARTITION_TYPE {
             PartType::Root
         } else if type_guid == XBOOTLDR_PARTITION_TYPE {
             PartType::Xbootldr
         } else {
-            continue;
+            PartType::Opaque
         };
 
-        log::info!("Discoverable partition: {part_type:?} PARTUUID={unique_guid}");
+        // Log at INFO so boot.log captures scanner results and real-hardware
+        // debugging stays tractable. For DPS-tagged partitions we name the
+        // semantic role; for Opaque (generic Linux filesystem GUID, EFI
+        // System, BIOS boot, Windows Recovery, etc.) we just record the
+        // type GUID so the trace reader can correlate with a GUID table.
+        match part_type {
+            PartType::Root | PartType::Xbootldr => {
+                log::info!("Discoverable partition: {part_type:?} PARTUUID={unique_guid}");
+            }
+            PartType::Opaque => {
+                log::info!(
+                    "GPT partition (opaque type={type_guid}) PARTUUID={unique_guid} — \
+                     retained for superblock probing"
+                );
+            }
+        }
 
         results.push(DiscoveredPartition {
             partition_type: part_type,
@@ -215,23 +265,17 @@ pub(crate) fn probe_superblock(handle: uefi::Handle) -> Option<FsInfo> {
         .read_blocks(media_id, ext4_lba, &mut ext4_buf)
         .is_ok()
     {
-        // ext4 magic at offset 0x38 from superblock start (which is at 1024 from disk start)
-        // Since we read from LBA containing offset 1024, the superblock starts at
-        // offset (1024 % block_size) within our buffer
+        // Superblock starts at byte offset 1024 of the partition; we read
+        // from the LBA containing that offset, so it lives at
+        // (1024 % block_size) within our buffer.
         let sb_offset = 1024 % block_size;
-        if sb_offset + 0x80 <= ext4_buf.len() {
-            let magic =
-                u16::from_le_bytes([ext4_buf[sb_offset + 0x38], ext4_buf[sb_offset + 0x39]]);
-            if magic == 0xEF53 {
-                // Extract UUID at offset 0x68 (16 bytes)
-                let uuid_bytes = &ext4_buf[sb_offset + 0x68..sb_offset + 0x78];
-                let uuid = format_fs_uuid(uuid_bytes);
-
-                log::info!("Probed ext4: UUID={uuid}");
-                return Some(FsInfo {
-                    fs_type: FsType::Ext4,
-                    uuid: Some(uuid),
-                });
+        if let Some(sb) = ext4_buf.get(sb_offset..) {
+            if let Some(info) = parse_ext4_superblock(sb) {
+                log::info!(
+                    "Probed ext4: UUID={}",
+                    info.uuid.as_deref().unwrap_or("unknown")
+                );
+                return Some(info);
             }
         }
     }
@@ -321,6 +365,29 @@ pub(crate) fn probe_superblock(handle: uefi::Handle) -> Option<FsInfo> {
     }
 
     None
+}
+
+/// Parse an ext4 superblock from a byte slice starting at the superblock
+/// offset (byte 1024 of the partition). Returns `None` if the magic is
+/// absent or the slice is too short to hold the UUID field. Pure — no
+/// UEFI dependencies — so it can be exercised under host tests and
+/// `cargo-fuzz` (see `fuzz/fuzz_targets/probe_ext4.rs`).
+pub(crate) fn parse_ext4_superblock(sb: &[u8]) -> Option<FsInfo> {
+    // Need bytes up through UUID tail: offset 0x78.
+    if sb.len() < 0x78 {
+        return None;
+    }
+    // Magic 0xEF53 at offset 0x38, little-endian.
+    let magic = u16::from_le_bytes([sb[0x38], sb[0x39]]);
+    if magic != 0xEF53 {
+        return None;
+    }
+    // UUID at offset 0x68, 16 bytes.
+    let uuid = format_fs_uuid(&sb[0x68..0x78]);
+    Some(FsInfo {
+        fs_type: FsType::Ext4,
+        uuid: Some(uuid),
+    })
 }
 
 /// Format a filesystem UUID (standard byte order, not GPT mixed-endian)

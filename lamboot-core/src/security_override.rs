@@ -1,10 +1,33 @@
-//! SecurityArchProtocol override for shim+MOK driver/kernel loading.
+//! SecurityArchProtocol override for shim+MOK *driver* loads.
+//!
+//! # Scope as of v0.9.x (SDS-4 native trust chain)
+//!
+//! This module's override is now scoped to **legacy UEFI filesystem-driver
+//! `LoadImage` calls only**. The kernel-load path no longer routes through
+//! here:
+//!
+//! - Kernels are verified via [`ShimLock::Verify`] directly on the in-memory
+//!   bytes in [`crate::boot::verify_kernel_bytes`], then handed to
+//!   [`crate::pe_loader`] for a native-PE load. `BS->LoadImage` is not
+//!   invoked on kernels under the native path, so no firmware `db` check
+//!   runs and no `SecurityArch` delegation is needed.
+//! - Drivers (legacy UEFI FS drivers wired via
+//!   [`crate::drivers::load_drivers`]) still go through `BS->LoadImage`.
+//!   Those *do* hit the firmware security hooks and therefore still
+//!   require this override when signed with MOK-only certs.
+//!
+//! The long-term intent per SDS-6 is to retire the legacy UEFI FS driver
+//! path entirely (ext4 is already natively read by `ext4-view`). Once the
+//! last driver under `\EFI\LamBoot\drivers\` is removed, this module
+//! becomes dead code; until then, keep it correct and minimal.
+//!
+//! # Background (why the override exists at all)
 //!
 //! Under shim < v16 (Ubuntu 25.10 ships 15.8, Debian 13, Fedora current as of
 //! 2026-04), shim does NOT hook `BS->LoadImage`. When LamBoot calls LoadImage
-//! on a MOK-signed driver or kernel, firmware's native Secure Boot check runs,
-//! sees a signature issued by a cert that isn't in firmware `db` (our cert is
-//! only in shim's MOK list), and returns `EFI_ACCESS_DENIED`. This is exactly
+//! on a MOK-signed driver, firmware's native Secure Boot check runs, sees a
+//! signature issued by a cert that isn't in firmware `db` (our cert is only
+//! in shim's MOK list), and returns `EFI_ACCESS_DENIED`. This is exactly
 //! [systemd/systemd#38624](https://github.com/systemd/systemd/issues/38624).
 //!
 //! The canonical fix, implemented by systemd-boot in
@@ -17,7 +40,9 @@
 //! This is labeled a "hack" in sd-boot's own source comments but is the
 //! industry-standard pattern for this exact problem. Target lifetime of the
 //! override is a single `LoadImage` call; install just before, uninstall just
-//! after. Long-term, Path G (own PE loader) will eliminate the need entirely.
+//! after. For kernel loads this mechanism is obsolete under SDS-4 — the
+//! native path verifies once on bytes and loads via `pe_loader`, never
+//! touching `BS->LoadImage`.
 //!
 //! **Critical invariant:** only one override may be active at a time. Nested
 //! installs are rejected. Callers MUST uninstall before installing again.
@@ -181,7 +206,11 @@ unsafe extern "efiapi" fn hook_security2(
 }
 
 /// Call ShimLock::Verify on a buffer. Returns true iff shim trusts the image.
-fn shim_validate(buffer: &[u8]) -> bool {
+/// Exposed crate-visible so preflight can mirror the runtime trust decision
+/// without re-implementing the ShimLock dance (otherwise preflight would
+/// false-warn "Not signed for Secure Boot" on MOK-chained distro kernels
+/// whose certs live in MOK rather than firmware `db`).
+pub(crate) fn shim_validate(buffer: &[u8]) -> bool {
     let Ok(handle) = uefi::boot::get_handle_for_protocol::<ShimLock>() else {
         SHIMLOCK_NOT_FOUND.fetch_add(1, Ordering::Relaxed);
         return false;
