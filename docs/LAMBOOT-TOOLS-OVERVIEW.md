@@ -1,9 +1,7 @@
 # LamBoot Tools — Companion Toolkit
 
-**Toolkit version:** 0.2.0 (release candidate; see
-`~/lamboot-tools-dev/docs/STATUS-2026-04-22-SESSION-HANDOVER.md` for state)
-**LamBoot version this doc tracks:** 0.8.3 (shipped) → 0.8.4 (coordinated
-release pending; see `docs/CROSS-REPO-STATUS.md`)
+**Toolkit version:** 0.2.0
+**LamBoot version this doc tracks:** 0.8.3 (shipped) → 0.8.4 (coordinated release)
 **Updated:** 2026-04-22
 
 ---
@@ -12,10 +10,10 @@ release pending; see `docs/CROSS-REPO-STATUS.md`)
 
 LamBoot Tools is a companion toolkit for diagnosing, repairing, backing up,
 and migrating Linux UEFI boot configurations. It ships from the
-[`lamboot-tools-dev`](https://github.com/lamco-admin/lamboot-tools-dev) source
-repo (development) as **three RPM subpackages** built from one unified spec,
-plus a standalone `lamboot-migrate` dual-publication for operators who only
-need the BIOS→UEFI migrator.
+[`lamboot-tools`](https://github.com/lamco-admin/lamboot-tools) repository
+as **three RPM subpackages** built from one unified spec, plus a standalone
+`lamboot-migrate` dual-publication for operators who only need the BIOS→UEFI
+migrator.
 
 The toolkit is **CLI-only, permanent** — no GUI is planned at any version.
 Audience is intentionally broader than LamBoot users: a Linux admin with a
@@ -24,7 +22,7 @@ tool" should all land here productively. The toolkit is LamBoot's gift to
 the broader UEFI boot ecosystem, with LamBoot-specific subcommands where
 useful.
 
-Authoritative product spec: `~/lamboot-tools-dev/docs/SPEC-LAMBOOT-TOOLKIT-V1.md`.
+Authoritative product spec ships with the [`lamboot-tools`](https://github.com/lamco-admin/lamboot-tools) repository.
 
 ---
 
@@ -186,9 +184,8 @@ backup dir.
 Three Proxmox methods (auto-selected): (A) pre-convert via live media,
 (B) post-convert live chroot, (C) add second disk as ESP. See spec §4.
 
-SDS-7 gap-close status: **done** (see
-`~/lamboot-tools-dev/docs/SDS-7-GAP-ANALYSIS.md` and `SPEC-LAMBOOT-MIGRATE.md`
-§14 reconciliation table).
+SDS-7 gap-close status: **done** (see `SPEC-LAMBOOT-MIGRATE.md` §14
+reconciliation table).
 
 ---
 
@@ -257,8 +254,7 @@ refuses to run against pre-0.8.4 hookscripts with remediation text pointing
 at this repo's release.
 
 **`lamboot-pve-fleet`** (experimental) — fleet-wide orchestration over
-`lamboot-pve-setup`. Reads `/etc/lamboot/fleet.toml` (schema v1, authoritative
-at `~/lamboot-tools-dev/docs/SPEC-LAMBOOT-TOOLKIT-V1.md` §16 Appendix C) and
+`lamboot-pve-setup`. Reads `/etc/lamboot/fleet.toml` (schema v1) and
 applies to the matching VMs.
 
 **`lamboot-pve-monitor`** (stable, mirrored) — boot-health read via OVMF
@@ -274,15 +270,9 @@ repo.
 ## Cross-repo coordination
 
 Because the toolkit depends on this repo's `lamboot-hookscript.pl` to
-function on Proxmox hosts, releases are coordinated. See
-[`docs/CROSS-REPO-STATUS.md`](CROSS-REPO-STATUS.md) for the current state of
-the four coordination items and the toolkit spec's §14.3 for the full table.
-
-Brief: toolkit v0.2.0 depends on this repo v0.8.4 for the fw_cfg
-file-reference hookscript rewrite. Path A (full coordinated release) is the
-chosen approach. This repo owes: hookscript rewrite, `fleet.toml`
-consumption in `lamboot-monitor.py`, `lamboot-install --toolkit-prompt`,
-README cross-reference, three should-have doc back-links.
+function on Proxmox hosts, releases are coordinated. Toolkit v0.2.0
+depends on this repo v0.8.4 for the fw_cfg file-reference hookscript
+rewrite.
 
 ---
 
@@ -303,14 +293,6 @@ cd lamboot-tools-0.2.0
 sudo make install PREFIX=/usr/local
 ```
 
-Until v0.2.0 ships, source install from the private dev repo:
-
-```bash
-git clone git@github.com:lamco-admin/lamboot-tools-dev.git
-cd lamboot-tools-dev
-sudo make install PREFIX=/usr/local
-```
-
 ### Opt-in via lamboot-install
 
 In v0.8.4, `lamboot-install` will prompt after successful install:
@@ -325,10 +307,9 @@ Non-interactive override: `--install-toolkit` / `--no-install-toolkit`.
 
 ## See Also
 
-- [Cross-Repo Coordination Status](CROSS-REPO-STATUS.md) — current v0.8.4 + v0.2.0 release alignment
+- [`lamboot-tools` repository](https://github.com/lamco-admin/lamboot-tools) — toolkit source, releases, and tool-level documentation
 - [User Guide](USER-GUIDE.md) — LamBoot bootloader usage
 - [Troubleshooting Guide](TROUBLESHOOTING-GUIDE.md) — when to reach for which tool
 - [Install Reference](INSTALL-REFERENCE.md) — `lamboot-install` documentation
 - [Proxmox Guide](PROXMOX-GUIDE.md) — offline repair + fleet integration
-- [`SPEC-LAMBOOT-TOOLKIT-V1.md`](https://github.com/lamco-admin/lamboot-tools-dev/blob/main/docs/SPEC-LAMBOOT-TOOLKIT-V1.md) — authoritative product spec (toolkit repo)
 - [`SPEC-LAMBOOT-MIGRATE.md`](specs/SPEC-LAMBOOT-MIGRATE.md) — SDS-7, the tool-level spec for `lamboot-migrate`

@@ -248,4 +248,4 @@ The tool is one safe execution path; hand-run `sbsign` + `objcopy` remains
 equally valid. Canonical key-handling procedure lives in
 [`KEY-GENERATION.md`](KEY-GENERATION.md).
 
-Tool-level spec: [`~/lamboot-tools-dev/docs/SPEC-LAMBOOT-SIGNING-KEYS.md`](https://github.com/lamco-admin/lamboot-tools-dev/blob/main/docs/SPEC-LAMBOOT-SIGNING-KEYS.md).
+Tool-level documentation lives with the [`lamboot-tools`](https://github.com/lamco-admin/lamboot-tools) repository.

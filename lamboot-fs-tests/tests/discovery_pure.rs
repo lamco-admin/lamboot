@@ -1,10 +1,7 @@
 //! Host-side unit tests for the pure helpers in
 //! `lamboot-core/src/discovery_pure.rs`. The Volume-dependent scanner
 //! (`discover_systemd_boot_dir_style`) is exercised by the QEMU /
-//! fleet harness on VM 124 (Pop!_OS) — see
-//! `docs/POPOS-AUTO-DISCOVERY-FINDINGS-2026-04-25.md` for the original
-//! VM 124 finding and `docs/analysis/POPOS-UPSTREAM-DEEP-DIVE-2026-04-25.md`
-//! for the strategic context.
+//! fleet harness on VM 124 (Pop!_OS).
 //!
 //! The pure helpers cover the *recognizer* and *renderer* layers:
 //!   * `looks_like_distro_uuid_dir` — true/false on directory-name shapes

@@ -33,7 +33,7 @@ LamBoot is a UEFI bootloader for Linux targeting hypervisor-managed VM environme
 **Honest posture for v0.8.3:**
 - **Ships now:** the signing pipeline, SecurityOverride (Path F), trust-evidence log, install-script hardening, Proxmox integration, BLS+UKI handling. Full feature set under Secure Boot off.
 - **Works under Secure Boot today** with UKI on the ESP, or with a firmware-DB-signed kernel (self-signed UKI / custom build shop).
-- **Known limitation:** stock `/boot` on ext4 under Secure Boot fails on shim 15.8 (shim uninstalls `ShimLock` after our UEFI ext4 driver loads, leaving the kernel unverifiable). Rooted cause in [`docs/analysis/CONFIG-4-TRUST-CHAIN-GAP-2026-04-21-AMENDED.md`](docs/analysis/CONFIG-4-TRUST-CHAIN-GAP-2026-04-21-AMENDED.md). **Resolved structurally in v1.0** via a native Rust ext4 reader (`ext4-view`) plus a native PE loader — see [`docs/analysis/NATIVE-FS-AND-PE-LOADER-STRATEGY-2026-04-21.md`](docs/analysis/NATIVE-FS-AND-PE-LOADER-STRATEGY-2026-04-21.md).
+- **Known limitation:** stock `/boot` on ext4 under Secure Boot fails on shim 15.8 (shim uninstalls `ShimLock` after our UEFI ext4 driver loads, leaving the kernel unverifiable). **Resolved structurally in v1.0** via a native Rust ext4 reader (`ext4-view`) plus a native PE loader, eliminating the UEFI FS driver load and firmware `LoadImage` re-check from the kernel-load path.
 - Not shim-review approved yet (v1.0+ target, parallel track).
 - Not a GRUB drop-in — no legacy BIOS, no rescue shell, no GRUB config language.
 - Standard ecosystem gaps inherited (initrd integrity, kernel cmdline post-verification). See [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md).
@@ -57,7 +57,6 @@ LamBoot is a UEFI bootloader for Linux targeting hypervisor-managed VM environme
 ### Architecture
 - [**docs/ARCHITECTURE.md**](docs/ARCHITECTURE.md) — 10-phase boot flow, subsystem map
 - [**docs/DEVELOPER-GUIDE.md**](docs/DEVELOPER-GUIDE.md) — project layout, coding standards, adding a subsystem
-- [**docs/analysis/UEFI-SECURITY-ECOSYSTEM-DEEP-DIVE-2026-04-21.md**](docs/analysis/UEFI-SECURITY-ECOSYSTEM-DEEP-DIVE-2026-04-21.md) — ecosystem bypass catalog and Path G design
 
 ### Integration
 - [**docs/PROXMOX-GUIDE.md**](docs/PROXMOX-GUIDE.md) — VM fleet operation
@@ -69,9 +68,6 @@ LamBoot is a UEFI bootloader for Linux targeting hypervisor-managed VM environme
 - [**CHANGELOG.md**](CHANGELOG.md) — release notes
 - [**SECURITY.md**](SECURITY.md) — disclosure policy
 - [**docs/ROADMAP.md**](docs/ROADMAP.md)
-
-### Website content brief
-- [**docs/WEBSITE-CONTENT.md**](docs/WEBSITE-CONTENT.md) — canonical product content for LAMCO-website
 
 ---
 
@@ -118,11 +114,7 @@ Ships as three RPM subpackages from one source tree:
 - `lamboot-migrate` — standalone RPM for operators who want only the BIOS→UEFI migrator.
 - `lamboot-toolkit-pve` — Proxmox host add-on (`lamboot-pve-setup`, `lamboot-pve-fleet`, plus mirrors of `lamboot-monitor.py` and `build-ovmf-vars.sh` from this repo).
 
-See [`docs/LAMBOOT-TOOLS-OVERVIEW.md`](docs/LAMBOOT-TOOLS-OVERVIEW.md) for
-tool-by-tool guidance, [`docs/CROSS-REPO-STATUS.md`](docs/CROSS-REPO-STATUS.md)
-for current v0.8.4 + v0.2.0 coordination state, and the authoritative
-[`SPEC-LAMBOOT-TOOLKIT-V1.md`](https://github.com/lamco-admin/lamboot-tools-dev/blob/main/docs/SPEC-LAMBOOT-TOOLKIT-V1.md)
-for product design.
+See the companion repository [github.com/lamco-admin/lamboot-tools](https://github.com/lamco-admin/lamboot-tools) for the toolkit source, releases, and tool-by-tool documentation.
 
 ---
 
@@ -378,8 +370,6 @@ After loading, LamBoot reconnects all controllers, making new SimpleFileSystem h
 | x86_64 + aarch64 | **Both** | Both | Both | x86_64 | Both |
 | License | MIT OR Apache-2.0 | GPLv3 | LGPL-2.1+ | GPLv3 | MIT |
 
-Full comparison in [`docs/WEBSITE-CONTENT.md`](docs/WEBSITE-CONTENT.md) §5.
-
 ---
 
 ## Development
@@ -399,9 +389,6 @@ cargo clippy
 
 # QEMU smoke test
 ./run-qemu.sh
-
-# Secure Boot test (requires signed binary + enrolled keys)
-./run-qemu-secureboot.sh
 ```
 
 See [`docs/DEVELOPER-GUIDE.md`](docs/DEVELOPER-GUIDE.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md).
@@ -413,7 +400,7 @@ See [`docs/DEVELOPER-GUIDE.md`](docs/DEVELOPER-GUIDE.md) and [`CONTRIBUTING.md`]
 **LamBoot:** MIT OR Apache-2.0 (dual-licensed).
 See [`LICENSE`](LICENSE), [`LICENSE-MIT`](LICENSE-MIT), [`LICENSE-APACHE`](LICENSE-APACHE).
 
-**Bundled filesystem drivers:** GPL-2.0 from the rEFInd project, distributed as separate binaries. See [`docs/LICENSE-THIRDPARTY.md`](docs/LICENSE-THIRDPARTY.md) if present, otherwise [`LICENSE`](LICENSE) §"Third-party binary notice".
+**Bundled filesystem drivers:** GPL-2.0 from the rEFInd project, distributed as separate binaries. See [`LICENSE`](LICENSE) §"Third-party binary notice".
 
 ---
 
@@ -423,4 +410,4 @@ See [`LICENSE`](LICENSE), [`LICENSE-MIT`](LICENSE-MIT), [`LICENSE-APACHE`](LICEN
 - **Security disclosure:** `security@lamco.io` — see [`SECURITY.md`](SECURITY.md) for GPG key
 - **Issues / discussion:** [github.com/lamco-admin/lamboot](https://github.com/lamco-admin/lamboot) (public repo)
 
-**Development happens in a private repo.** The public repo mirrors each release via [`export-to-public.sh`](export-to-public.sh). Pull requests and issues on the public repo are welcome.
+**Development happens in a private repo.** The public repo mirrors each release. Pull requests and issues on the public repo are welcome.

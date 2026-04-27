@@ -14,8 +14,7 @@ lamboot-dev/
 ├── .cargo/config.toml             Default target = x86_64-unknown-uefi, build-std flags
 ├── build.sh                       Build both targets + modules, prepare dist/
 ├── package-release.sh             Build + sign + produce release tarball
-├── export-to-public.sh            Gated export from lamboot-dev to public lamboot repo
-├── run-qemu*.sh                   QEMU test harnesses (SB, non-SB, signed, diagnostics)
+├── run-qemu.sh                    QEMU test harness
 ├── lamboot-core/                  The bootloader
 │   ├── Cargo.toml
 │   └── src/
@@ -48,8 +47,7 @@ lamboot-dev/
 │   ├── sign-unlock / sign-lock    Session-cached signing-key unlock
 │   ├── lamboot-monitor.py         Proxmox host-side VM boot health monitor
 │   └── build-ovmf-vars.sh         Build pre-enrolled OVMF_VARS
-├── docs/                          User-facing + strategy documentation
-│   └── analysis/                  Internal deep-dives (do not publish)
+├── docs/                          User-facing documentation
 ├── examples/                      Sample policy.toml, BLS entries
 ├── dist/                          Build output (gitignored)
 ├── keys/                          Signing keys (gitignored)
@@ -90,9 +88,6 @@ cargo clippy
 
 # QEMU smoke test (Secure Boot off)
 ./run-qemu.sh
-
-# QEMU Secure Boot test (requires signed binary + enrolled keys)
-./run-qemu-secureboot.sh
 ```
 
 **No `cargo test` for UEFI targets** — UEFI binaries cannot run on the host. Tests that must run cross-compiled live inside in-tree runtime check modules; QEMU is the integration-test vehicle.
@@ -235,10 +230,6 @@ Enabled via `git config core.hooksPath .githooks` (already set in this repo). To
 4. Build + sign: `./build.sh && ./tools/sign-lamboot.sh`.
 5. Package: `./package-release.sh`.
 6. Tag: `git tag -a vX.Y.Z -m '...'` and push.
-7. Dry-run export: `./export-to-public.sh --dry-run X.Y.Z`.
-8. Real export after review: `./export-to-public.sh X.Y.Z`.
-
-**Never push to the public repo directly. Always via `export-to-public.sh`.**
 
 ---
 
@@ -281,4 +272,4 @@ See `CONTRIBUTING.md` for:
 
 ---
 
-**For full architecture, see `docs/ARCHITECTURE.md` and `docs/analysis/UEFI-SECURITY-ECOSYSTEM-DEEP-DIVE-2026-04-21.md`.**
+**For full architecture, see `docs/ARCHITECTURE.md`.**

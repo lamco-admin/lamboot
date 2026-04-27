@@ -123,7 +123,7 @@ Should show our cert subject. If absent, repeat step 3 — sometimes the reboot 
 
 **Trust path:** LamBoot's cert is enrolled directly into the firmware's `db`. Firmware validates LamBoot; shim **is still deployed in the chain** and remains in memory to provide the `ShimLock` protocol that LamBoot uses to verify MOK-signed Linux kernels.
 
-**Critical note (v0.8.3):** even in Config 2, do **not** pass `--no-shim` if your kernel is a stock distro kernel (Ubuntu, Debian, Fedora, …) — those are signed against MOK, not firmware DB. Without shim in the chain, LamBoot cannot verify them and the kernel will fail to boot. See `docs/analysis/CONFIG-4-TRUST-CHAIN-GAP-2026-04-21.md` for the root-cause write-up.
+**Critical note (v0.8.3):** even in Config 2, do **not** pass `--no-shim` if your kernel is a stock distro kernel (Ubuntu, Debian, Fedora, …) — those are signed against MOK, not firmware DB. Without shim in the chain, LamBoot cannot verify them and the kernel will fail to boot.
 
 `--no-shim` is appropriate **only** when the kernel you want to boot is signed by a cert that is itself in firmware DB — typically a self-signed UKI or a kernel from a custom build shop. If that's your scenario, pair `--no-shim` with `--kernel-firmware-db-signed` to acknowledge the constraint.
 
@@ -326,6 +326,5 @@ Before v0.8.3 ships, each row must pass end-to-end on a fresh VM:
 - `docs/SECURE-BOOT-AND-SIGNING-STRATEGY.md` — architectural rationale
 - `docs/MOK-ENROLLMENT-GUIDE.md` — step-by-step MOK walkthrough with screenshots (TBD)
 - `docs/OVMF-VARS-PROXMOX.md` — Proxmox-specific Config 4 procedures (TBD)
-- `docs/SB-RECOVERY.md` — expanded recovery scenarios (TBD)
 - `docs/SECURITY-GUIDE.md` — full LamBoot security model
 - `docs/KEY-GENERATION.md` — production key-hierarchy generation (TBD)

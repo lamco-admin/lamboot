@@ -37,7 +37,7 @@ Only the latest released LamBoot version receives security updates. We aim for a
 
 ## Signing keys
 
-See [`docs/KEY-GENERATION.md`](docs/KEY-GENERATION.md) for production key hierarchy (PK/KEK RSA 4096, db RSA 2048 per [RSA-4096 compatibility analysis](docs/analysis/RSA-4096-COMPATIBILITY-ANALYSIS-2026-04-20.md)).
+See [`docs/KEY-GENERATION.md`](docs/KEY-GENERATION.md) for the production key hierarchy (PK/KEK RSA 4096, db RSA 2048 per shim-MOK compatibility constraints).
 
 Public certificates are distributed in release tarballs as `keys/db.der` for MOK enrollment.
 

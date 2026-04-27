@@ -59,6 +59,41 @@ readonly FALLBACK_NAME_AA64="BOOTAA64.EFI"
 readonly MANIFEST_FILE=".install-manifest"
 readonly MANIFEST_PATH="EFI/LamBoot/${MANIFEST_FILE}"
 
+# --- Shared ESP file-layout library ---
+#
+# Encodes the canonical "what files where on the ESP, with the
+# -signed.efi → bare rename rule" knowledge. Sourced by both this tool
+# (online install) and lamboot-tools' offline deploy (via the mirrored
+# copy). See lib/esp-deploy.sh + docs/specs/SPEC-LAMBOOT-TOOLKIT-V1.md
+# §14.2 canonical-source-map.
+_lamboot_install_script_dir() {
+    local s="$0"
+    if command -v readlink >/dev/null 2>&1; then
+        s=$(readlink -f "$0" 2>/dev/null) || s="$0"
+    fi
+    cd "$(dirname "$s")" && pwd
+}
+_lamboot_install_self_dir=$(_lamboot_install_script_dir)
+# Search order: same-tree (dev), system install path (/usr/lib/lamboot/),
+# repo root (../lib/).
+for _esp_lib_candidate in \
+    "${_lamboot_install_self_dir}/../lib/esp-deploy.sh" \
+    "/usr/lib/lamboot/esp-deploy.sh" \
+    "${_lamboot_install_self_dir}/lib/esp-deploy.sh" \
+; do
+    if [[ -f "$_esp_lib_candidate" ]]; then
+        # shellcheck source=../lib/esp-deploy.sh
+        source "$_esp_lib_candidate"
+        break
+    fi
+done
+unset _esp_lib_candidate _lamboot_install_self_dir
+if [[ -z "${_LAMBOOT_ESP_DEPLOY_SOURCED:-}" ]]; then
+    echo "ERROR: lamboot-install could not source esp-deploy.sh library." >&2
+    echo "  Expected at: <script-dir>/../lib/esp-deploy.sh or /usr/lib/lamboot/esp-deploy.sh" >&2
+    exit 1
+fi
+
 readonly ESP_PARTTYPE_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
 readonly MIN_ESP_SPACE_KIB=2048
 
@@ -78,7 +113,13 @@ OPT_ESP=""
 OPT_NO_EFI_ENTRY=0
 OPT_SET_DEFAULT=1   # Install makes LamBoot the default boot entry; override with --no-make-default
 OPT_FALLBACK=0
-OPT_WITH_DRIVERS=-1  # -1=auto, 0=no, 1=yes
+OPT_WITH_DRIVERS=-1  # -1=auto, 0=no, 1=yes (pre-SDS-6 legacy knob; still honored)
+# SDS-6: legacy UEFI FS driver installation policy.
+# Values: "auto" (default; install only for non-natively-covered FSs),
+#         "all"  (install every driver we ship; matches v0.8.3 behavior),
+#         "none" (install no drivers; security-conscious posture).
+# --with-drivers continues to work as an alias for --with-drivers-legacy=all.
+OPT_WITH_DRIVERS_LEGACY="auto"
 OPT_WITH_MODULES=0
 OPT_REMOVE=0
 OPT_UPDATE=0
@@ -86,6 +127,7 @@ OPT_DRY_RUN=0
 OPT_FORCE=0
 OPT_NO_BLS=0
 OPT_KEEP_ENTRIES=0
+OPT_KEEP_LOGS=0
 OPT_QUIET=0
 OPT_VERBOSE=0
 OPT_REPLACE=0
@@ -105,6 +147,7 @@ DISTRO_VERSION=""
 HAS_EXISTING=0
 SECURE_BOOT=0
 IS_CHROOT=0
+FIRMWARE_MODE=""
 
 ESP_DISK=""
 ESP_PARTNUM=""
@@ -248,24 +291,13 @@ detect_arch() {
     esac
 }
 
-efi_binary() {
-    case "$ARCH" in
-        x86_64)  echo "lambootx64.efi" ;;
-        aarch64) echo "lambootaa64.efi" ;;
-    esac
-}
-
-# Source binary filename in the dist/ tree — may be the signed variant
-efi_source_binary() {
-    if (( OPT_SIGNED )); then
-        case "$ARCH" in
-            x86_64)  echo "lambootx64-signed.efi" ;;
-            aarch64) echo "lambootaa64-signed.efi" ;;
-        esac
-    else
-        efi_binary
-    fi
-}
+# Architecture-specific naming — delegates to lib/esp-deploy.sh so the
+# rename rule lives in exactly one place (the lib). Both this tool and
+# lamboot-tools' offline deploy must produce identical paths and
+# filenames or the firmware Boot#### entry won't resolve at boot — the
+# bug that broke VM 123 (signed.efi on disk vs lambootx64.efi in NVRAM).
+efi_binary()        { esp_efi_binary_name "$ARCH"; }
+efi_source_binary() { esp_efi_source_filename "$ARCH" "$OPT_SIGNED"; }
 
 efi_loader_path() {
     if (( SECURE_BOOT )) && [ -n "$SHIM_SOURCE" ] && ! (( OPT_NO_SHIM )); then
@@ -374,6 +406,84 @@ detect_chroot() {
             IS_CHROOT=1
         fi
     fi
+}
+
+# Refuse to install on BIOS/legacy-booted systems. The kernel only
+# creates /sys/firmware/efi when it was itself booted via UEFI; if it
+# isn't there we're running under a BIOS loader and LamBoot (UEFI-only)
+# cannot take over this host. Detection is deliberately strict:
+#  - /sys/firmware/efi present → UEFI (normal path)
+#  - absent AND we're in a chroot → skip; the chroot host might be UEFI
+#  - absent AND --force → let the operator override at their own risk
+#  - absent otherwise → refuse with remediation guidance
+#
+# This fires before any destructive action (file copies, efibootmgr
+# writes) so a BIOS-booted operator discovers the mismatch immediately,
+# not two phases in.
+detect_firmware_mode() {
+    if [ -d /sys/firmware/efi ]; then
+        FIRMWARE_MODE="uefi"
+        return 0
+    fi
+
+    if (( IS_CHROOT )); then
+        FIRMWARE_MODE="unknown-chroot"
+        warn "Cannot detect firmware mode from inside chroot (/sys/firmware/efi missing)."
+        warn "Proceeding; the outer host must be UEFI for the installed LamBoot to boot."
+        return 0
+    fi
+
+    FIRMWARE_MODE="bios"
+
+    if (( OPT_FORCE )); then
+        warn "This system is BIOS/legacy-booted (/sys/firmware/efi missing)."
+        warn "--force set; continuing. LamBoot will not boot on this host until"
+        warn "firmware is switched to UEFI."
+        return 0
+    fi
+
+    local remediation=""
+    # Distro-aware remediation hint. detect_distro must have set DISTRO_ID.
+    case "${DISTRO_ID:-}" in
+        ubuntu|debian|pop|linuxmint)
+            remediation="
+  Ubuntu/Debian family: converting a running system requires repartitioning
+  to GPT + creating an ESP + rerunning grub-install --target=x86_64-efi.
+  See https://help.ubuntu.com/community/UEFI and the companion toolkit:
+  sudo lamboot-migrate to-uefi --disk /dev/sdX"
+            ;;
+        fedora|rhel|centos|rocky|almalinux)
+            remediation="
+  Fedora/RHEL family: similar flow — sgdisk to convert partition table,
+  format ESP, grub2-install --target=x86_64-efi. Automated helper:
+  sudo lamboot-migrate to-uefi --disk /dev/sdX"
+            ;;
+        arch|endeavouros|manjaro)
+            remediation="
+  Arch family: create an ESP, mount at /boot/efi, reinstall bootloader
+  via bootctl install or grub-install --target=x86_64-efi. Automated:
+  sudo lamboot-migrate to-uefi --disk /dev/sdX"
+            ;;
+        *)
+            remediation="
+  Convert the system to UEFI first, then re-run lamboot-install.
+  See lamboot-tools' lamboot-migrate tool for automated conversion:
+  sudo lamboot-migrate to-uefi --disk /dev/sdX"
+            ;;
+    esac
+
+    die "This system is BIOS/legacy-booted; LamBoot is a UEFI-only bootloader.
+
+  Signal: /sys/firmware/efi does not exist. The kernel only creates that
+  directory when it was booted through UEFI firmware. This host booted
+  through legacy BIOS (CSM / SeaBIOS / equivalent).
+
+  Installing LamBoot here would leave your system unbootable: the UEFI
+  binary we would copy to the ESP cannot be loaded by a BIOS firmware.
+${remediation}
+
+  To override anyway (advanced — e.g. preparing a disk that will boot
+  on a different host), re-run with --force."
 }
 
 detect_secure_boot() {
@@ -549,6 +659,11 @@ phase1_detect_environment() {
     detect_distro
     detail "Distro: ${DISTRO_NAME} (${DISTRO_ID})"
 
+    # Firmware mode check MUST run before find_esp / any file writes.
+    # Detects BIOS-booted hosts and refuses early with actionable guidance.
+    detect_firmware_mode
+    [ "${FIRMWARE_MODE:-}" = "uefi" ] && detail "Firmware: UEFI" || true
+
     find_esp
     ok "ESP: ${ESP} ($(df -h --output=avail "${ESP}" 2>/dev/null | tail -1 | tr -d ' ') free)"
 
@@ -564,6 +679,21 @@ phase1_detect_environment() {
 # ============================================================================
 # Phase 2: Filesystem Driver Assessment
 # ============================================================================
+
+# SDS-6: is a filesystem natively covered by a LamBoot backend compiled
+# into the bootloader binary (i.e. do we NOT need a legacy UEFI FS
+# driver for it)? Mirrors lamboot-core/src/drivers.rs::filesystem_natively_covered.
+#
+# Kept in sync by convention — if you add a native backend in lamboot-core,
+# extend this list too. Both sides cover ext2/ext3/ext4 via ext4-view (SDS-2)
+# and FAT is always UEFI-native.
+is_filesystem_natively_covered() {
+    case "$1" in
+        ext2|ext3|ext4|vfat|fat|fat32) return 0 ;;
+        # Future v1.1+: btrfs, xfs if native backends land in lamboot-core.
+        *) return 1 ;;
+    esac
+}
 
 driver_files_for_arch() {
     case "$ARCH" in
@@ -615,7 +745,41 @@ phase2_assess_drivers() {
         fi
     fi
 
-    if (( OPT_WITH_DRIVERS == 1 )); then
+    # SDS-6 gating — apply the legacy-drivers policy on top of the
+    # fstype-driven detection above.
+    case "$OPT_WITH_DRIVERS_LEGACY" in
+        none)
+            # Operator has asserted "no UEFI FS drivers, ever". If the
+            # filesystem is natively covered, we're fine. Otherwise warn
+            # loudly — LamBoot will not be able to read /boot.
+            if (( NEED_FS_DRIVER )) && ! is_filesystem_natively_covered "$BOOT_FSTYPE"; then
+                warn "--with-drivers-legacy=none set but /boot filesystem ${BOOT_FSTYPE} is NOT natively covered."
+                warn "LamBoot will not be able to read kernels on /boot. Boot will fail."
+                warn "Either switch /boot to a natively-covered filesystem (ext2/3/4, vfat) or allow drivers."
+            fi
+            NEED_FS_DRIVER=0
+            ;;
+        all)
+            # v0.8.3 behavior — force driver install regardless of native coverage.
+            # --with-drivers (legacy flag) rewrites to this.
+            if [ -n "${BOOT_FSTYPE:-}" ] && [ "$BOOT_FSTYPE" != "vfat" ]; then
+                NEED_FS_DRIVER=1
+            fi
+            ;;
+        auto)
+            # SDS-6 default. If the filesystem is natively covered AND the
+            # legacy flag didn't force-on, skip the driver install.
+            if is_filesystem_natively_covered "$BOOT_FSTYPE"; then
+                if (( OPT_WITH_DRIVERS != 1 )); then
+                    detail "${BOOT_FSTYPE} is natively covered by LamBoot (SDS-2); skipping driver install"
+                    NEED_FS_DRIVER=0
+                fi
+            fi
+            ;;
+    esac
+
+    # Legacy --with-drivers=1 (force) still wins unless policy is "none".
+    if (( OPT_WITH_DRIVERS == 1 )) && [ "$OPT_WITH_DRIVERS_LEGACY" != "none" ]; then
         NEED_FS_DRIVER=1
     fi
 
@@ -631,6 +795,54 @@ phase2_assess_drivers() {
         fi
     else
         detail "/boot filesystem: ${BOOT_FSTYPE:-vfat} (no driver needed)"
+    fi
+}
+
+# SDS-6: prune now-unneeded legacy drivers from an existing install.
+# Called during --update when a previous v0.8.x install deployed
+# ext4_x64.efi / ext2_x64.efi to the ESP. Those are now natively
+# covered by ext4-view (SDS-2); leaving them on the ESP doesn't hurt
+# (lamboot-core's Auto mode skips them at boot) but it wastes ESP
+# space and confuses audit reads. Remove them.
+#
+# Runs only in "auto" mode + during --update (not --remove, which
+# cleans everything manifest-listed anyway). Never touches drivers
+# whose FS is NOT natively covered.
+prune_natively_covered_drivers() {
+    (( OPT_UPDATE )) || return 0
+    [ "$OPT_WITH_DRIVERS_LEGACY" = "auto" ] || return 0
+
+    local drivers_dir="${ESP}/${EFI_DIR}/drivers"
+    [ -d "$drivers_dir" ] || return 0
+
+    local removed=0
+    local pruned
+    for pruned in ext4_x64.efi ext2_x64.efi ext3_x64.efi \
+                  ext4_x64-signed.efi ext2_x64-signed.efi ext3_x64-signed.efi \
+                  aarch64/ext4_aa64.efi aarch64/ext2_aa64.efi aarch64/ext3_aa64.efi; do
+        local f="${drivers_dir}/${pruned}"
+        if [ -f "$f" ]; then
+            # The `run` wrapper takes a description first, then the
+            # command — matching every other call site in this file
+            # (see lines 186, 189, 930, etc.). Pre-fix the call was
+            # `run rm -f "$f"`, which took "rm" as the description and
+            # tried to invoke `-f` as the command, failing silently
+            # with `line 178: -f: command not found` while still
+            # printing the "Pruned ${pruned}" success line — so the
+            # driver stayed on the ESP even though the installer
+            # claimed to have removed it.
+            run "rm ${f}" rm -f "$f" || {
+                fail "Failed to remove ${pruned} (continuing)"
+                continue
+            }
+            ok "Pruned ${pruned} (natively covered by LamBoot SDS-2)"
+            removed=$((removed + 1))
+        fi
+    done
+
+    if (( removed > 0 )); then
+        msg "Pruned ${removed} legacy filesystem driver(s); native backend supersedes them."
+        msg "If you need them back, run: lamboot-install --update --with-drivers-legacy=all"
     fi
 }
 
@@ -963,6 +1175,43 @@ validate_efi_binary() {
     detail "Binary validated: ${size} bytes, PE header OK"
 }
 
+# Identify the bootloader kind of an existing ESP binary at path $1.
+# Echoes one of: "lamboot", "shim", "grub", "systemd-boot", "refind",
+# "windows", "unknown". Uses interior strings — PE binaries embed their
+# names/paths in plain text, so grep against magic markers is reliable
+# across distros and versions.
+identify_bootloader() {
+    local path="$1"
+    [ -f "$path" ] || { echo "none"; return; }
+
+    # shim has a very distinctive "MokManager" string + UEFI Shim
+    if grep -aqE "MokManager|shim_lock|UEFI[_ ]Shim" "$path" 2>/dev/null; then
+        echo "shim"; return
+    fi
+    # systemd-boot self-identifies in its PE section strings
+    if grep -aqE "systemd-boot|systemd-stub" "$path" 2>/dev/null; then
+        echo "systemd-boot"; return
+    fi
+    # GRUB embeds "GRUB" + "grub_" symbol names
+    if grep -aqE "GRUB version|grub_main|grub_efi" "$path" 2>/dev/null; then
+        echo "grub"; return
+    fi
+    # rEFInd embeds "rEFInd"
+    if grep -aq "rEFInd" "$path" 2>/dev/null; then
+        echo "refind"; return
+    fi
+    # Windows bootmgfw.efi / bootmgr.efi — distinctive copyright + path strings
+    if grep -aqE "Windows Boot Manager|bootmgfw|bootmgr\\.efi" "$path" 2>/dev/null; then
+        echo "windows"; return
+    fi
+    # LamBoot itself — if this is already our binary (hash match is a
+    # stronger test but we're pre-hash here; a string check is adequate)
+    if grep -aqE "LamBoot|lamboot" "$path" 2>/dev/null; then
+        echo "lamboot"; return
+    fi
+    echo "unknown"
+}
+
 install_fallback() {
     (( OPT_FALLBACK )) || return 0
 
@@ -971,6 +1220,55 @@ install_fallback() {
     local backup="${dst}.lamboot-backup"
 
     run "mkdir -p ${ESP}/${FALLBACK_DIR}" mkdir -p "${ESP}/${FALLBACK_DIR}"
+
+    # Self-loop guard. UEFI firmware uses \EFI\BOOT\BOOTX64.EFI as the
+    # removable-media fallback: if every Boot#### entry in BootOrder
+    # fails, firmware invokes this path. If we overwrite it with our own
+    # LamBoot binary and then our primary Boot#### entry fails, the
+    # firmware fallback re-invokes the same LamBoot binary → self-loop.
+    # Worse: the distro's shim or GRUB that was previously the fallback
+    # is now buried under our backup suffix, so recovery requires manual
+    # ESP editing.
+    #
+    # Refuse --fallback when an existing non-LamBoot distro bootloader
+    # is present. --force overrides for advanced operators preparing a
+    # removable-media disk.
+    if [ -f "$dst" ]; then
+        local existing_kind
+        existing_kind=$(identify_bootloader "$dst")
+        case "$existing_kind" in
+            shim|grub|systemd-boot|refind|windows)
+                if ! (( OPT_FORCE )); then
+                    die "--fallback would overwrite an existing ${existing_kind} at
+  ${dst}
+
+  This is a UEFI firmware fallback path. If a future LamBoot update or
+  misconfiguration causes the primary Boot#### entry to fail, the
+  firmware fallback would re-invoke LamBoot and produce an un-bootable
+  loop — the ${existing_kind} that previously caught this case would be
+  hidden under ${backup}.
+
+  Options:
+    1. Install without --fallback (recommended). LamBoot will register a
+       Boot#### entry via efibootmgr; your existing ${existing_kind}
+       stays as the firmware fallback, catching any LamBoot failure.
+    2. Re-run with --force if you explicitly want LamBoot to take over
+       the fallback path (e.g. a removable disk with no other OS). A
+       restore marker is written so 'lamboot-install --remove' can
+       recover the ${existing_kind}."
+                fi
+                warn "--force set; replacing existing ${existing_kind} at fallback path"
+                warn "On future LamBoot failure, firmware will re-invoke LamBoot via fallback"
+                warn "Original ${existing_kind} will be preserved at ${backup}"
+                ;;
+            lamboot)
+                # Already ours; backup would be stale; just overwrite in place.
+                ;;
+            none|unknown)
+                # No existing or unrecognized — safe to install.
+                ;;
+        esac
+    fi
 
     # Backup existing fallback if not ours
     if [ -f "$dst" ] && [ ! -f "$backup" ]; then
@@ -998,24 +1296,15 @@ install_drivers() {
 
     local drv
     while IFS= read -r drv; do
-        # Under Secure Boot (--signed), prefer the signed variant of the driver
-        # so firmware accepts it. Destination filename is always the unsigned
-        # name so LamBoot's driver-load code can find it.
-        local src_name="${drv}"
-        if (( OPT_SIGNED )); then
-            local signed_name="${drv%.efi}-signed.efi"
-            if [ -f "${SRC_DIR}/EFI/LamBoot/drivers/${signed_name}" ]; then
-                src_name="$signed_name"
-            else
-                warn "Signed driver not found, falling back to unsigned: ${drv}"
-            fi
-        fi
-        local src="${SRC_DIR}/EFI/LamBoot/drivers/${src_name}"
-        local dst="${ESP}/${EFI_DIR}/drivers/${drv}"
-        if [ ! -f "$src" ]; then
-            warn "Driver not found: ${src}"
+        # esp_driver_source_for encodes the -signed.efi → canonical rename
+        # rule in the shared lib. Destination filename is always the
+        # canonical (unsigned) name so LamBoot's driver-load code finds it.
+        local src
+        if ! src=$(esp_driver_source_for "$SRC_DIR" "$drv" "$OPT_SIGNED"); then
+            warn "Driver not found: $drv (canonical or signed)"
             continue
         fi
+        local dst="${ESP}/${EFI_DIR}/drivers/${drv}"
         if needs_update "$src" "$dst"; then
             atomic_copy "$src" "$dst" || { warn "Failed to install driver ${drv}"; continue; }
             ok "Installed driver: ${drv}"
@@ -1029,11 +1318,30 @@ install_drivers() {
     local lic_dst="${ESP}/${EFI_DIR}/drivers/LICENSE-GPL-2.0.txt"
     if [ -f "$lic_src" ]; then
         atomic_copy "$lic_src" "$lic_dst" 2>/dev/null || true
+        # Manifest-track so --remove cleans it up. Without this, the file
+        # was orphaned: do_remove() did rm-by-manifest and then rmdir on
+        # drivers/, which silently no-op'd against the non-empty dir.
+        manifest_add "${EFI_DIR}/drivers/LICENSE-GPL-2.0.txt"
     fi
 }
 
 install_modules() {
-    (( OPT_WITH_MODULES )) || return 0
+    # Opt-in on fresh install (--with-modules), but on --update we MUST
+    # update existing modules — otherwise they go stale forever and
+    # drift from the signed variants shipped in new tarballs. Prior
+    # observed failure mode: VM 100 had 4 unsigned modules from April
+    # 5 on its ESP across every v0.9.x install cycle, which then
+    # surfaced as "Not signed for Secure Boot" preflight warnings on
+    # every tool entry under shim+MOK. Installer was silently skipping
+    # them because OPT_WITH_MODULES defaults to 0.
+    if ! (( OPT_WITH_MODULES )); then
+        if (( OPT_UPDATE )) && [ -d "${ESP}/${EFI_DIR}/modules" ] \
+           && compgen -G "${ESP}/${EFI_DIR}/modules/*.efi" >/dev/null; then
+            detail "--update with existing modules dir: refreshing modules"
+        else
+            return 0
+        fi
+    fi
 
     local manifest_src="${SRC_DIR}/EFI/LamBoot/modules/manifest.toml"
     if [ -f "$manifest_src" ]; then
@@ -1042,24 +1350,22 @@ install_modules() {
         manifest_add "${EFI_DIR}/modules/manifest.toml"
     fi
 
-    # Iterate modules by UNSIGNED names — for each, pick signed variant when
-    # --signed is set so firmware accepts the binary under Secure Boot.
+    # Iterate modules by canonical (unsigned) names — the case filter is
+    # critical: it skips -signed.efi files because esp_module_source_for
+    # picks the signed variant on our behalf via the rename rule. This
+    # matches the iteration done in esp_deploy_modules() in the shared
+    # lib so behavior stays identical between online and offline deploy.
     local mod
     for mod in "${SRC_DIR}"/EFI/LamBoot/modules/*.efi; do
         [ -f "$mod" ] || continue
         local name
         name=$(basename "$mod")
-        # Skip -signed.efi files in iteration — they're handled via the unsigned name
-        case "$name" in *-signed.efi) continue;; esac
+        case "$name" in *-signed.efi) continue ;; esac
 
-        local src="$mod"
-        if (( OPT_SIGNED )); then
-            local signed_src="${SRC_DIR}/EFI/LamBoot/modules/${name%.efi}-signed.efi"
-            if [ -f "$signed_src" ]; then
-                src="$signed_src"
-            else
-                warn "Signed module not found, falling back to unsigned: ${name}"
-            fi
+        local src
+        if ! src=$(esp_module_source_for "$SRC_DIR" "$name" "$OPT_SIGNED"); then
+            warn "Module source not found: $name (canonical or signed)"
+            continue
         fi
         local dst="${ESP}/${EFI_DIR}/modules/${name}"
         if needs_update "$src" "$dst"; then
@@ -1156,6 +1462,12 @@ phase4_install_files() {
     install_secure_boot_chain
     install_mok_enrollment
     install_fallback
+    # SDS-6: prune legacy drivers that SDS-2's native backend now covers
+    # BEFORE installing (so re-install of a natively-covered driver on
+    # update doesn't happen — install_drivers already honors NEED_FS_DRIVER
+    # which phase2 set, but old ESP residue from v0.8.x needs explicit
+    # cleanup).
+    prune_natively_covered_drivers
     install_drivers
     install_modules
     install_policy
@@ -1207,7 +1519,7 @@ install_secure_boot_chain() {
 # Pre-populate ShimRetainProtocol NVRAM variable so shim 15.8+ retains its
 # ShimLock protocol across child StartImage calls (ext4 driver load, etc.)
 # rather than uninstalling it — which would leave the kernel unverifiable.
-# See rhboot/shim#444 and docs/analysis/CONFIG-4-TRUST-CHAIN-GAP-2026-04-21.md.
+# See rhboot/shim#444 for upstream context.
 #
 # The LamBoot runtime also calls runtime::set_variable for this, but shim
 # reads the variable at shim-init time (before LamBoot runs), so a runtime
@@ -1739,12 +2051,21 @@ phase8_verify() {
         fi
     fi
 
+    # BLS entries may live on the ESP (systemd-boot convention, Ubuntu),
+    # or on a separate /boot partition (Fedora, Debian with --boot-part).
+    # Check both — the runtime scanner (SDS-5 discover_all_entries) walks
+    # every mounted volume, and phase 8 must match that contract or it
+    # will false-warn "empty menu" on Fedora-layout hosts where the
+    # entries are present but off-ESP.
     local bls_count=0 bls_problems=0
-    local conf
-    for conf in "${ESP}/${BLS_DIR}"/*.conf; do
-        [ -f "$conf" ] || continue
-        bls_count=$((bls_count+1))
-        verify_bls_entry "$conf" || bls_problems=$((bls_problems+1))
+    local conf bls_search_dir
+    for bls_search_dir in "${ESP}/${BLS_DIR}" "/boot/loader/entries"; do
+        [ -d "$bls_search_dir" ] || continue
+        for conf in "$bls_search_dir"/*.conf; do
+            [ -f "$conf" ] || continue
+            bls_count=$((bls_count+1))
+            verify_bls_entry "$conf" || bls_problems=$((bls_problems+1))
+        done
     done
     if (( bls_count > 0 )); then
         ok "${bls_count} BLS entries (${bls_problems} with problems)"
@@ -1992,6 +2313,33 @@ do_remove() {
     run "remove kernel-install plugin" \
         rm -f "${KERNEL_INSTALL_DIR}/90-lamboot.install" 2>/dev/null || true
 
+    # Remove runtime-generated forensic logs from reports/. These files are
+    # written by LamBoot at boot time (see lamboot-core/src/{bootlog,report}.rs),
+    # not by the installer, so the manifest doesn't track them. Without explicit
+    # cleanup, the rmdir loop below silently no-op'd against the non-empty dir
+    # and left a partial-uninstall trail (boot.log + boot.json + audit.log
+    # remained). --keep-logs preserves them for forensic value.
+    local reports_dir="${ESP}/${EFI_DIR}/reports"
+    if [ -d "$reports_dir" ] && ! (( OPT_KEEP_LOGS )); then
+        local rpt
+        for rpt in boot.log boot.json audit.log error.json; do
+            [ -f "${reports_dir}/${rpt}" ] || continue
+            run "remove runtime log ${EFI_DIR}/reports/${rpt}" \
+                rm -f "${reports_dir}/${rpt}" || warn "Failed to remove ${rpt}"
+        done
+    elif (( OPT_KEEP_LOGS )); then
+        detail "Keeping forensic logs under ${reports_dir}/ (--keep-logs)"
+    fi
+
+    # Legacy cleanup: pre-fix manifests didn't track drivers/LICENSE-GPL-2.0.txt
+    # (the file was copied at install time but never manifest_add'd). Remove it
+    # unconditionally so old installations also clean up cleanly.
+    local legacy_lic="${ESP}/${EFI_DIR}/drivers/LICENSE-GPL-2.0.txt"
+    if [ -f "$legacy_lic" ]; then
+        run "remove legacy ${EFI_DIR}/drivers/LICENSE-GPL-2.0.txt" \
+            rm -f "$legacy_lic" || warn "Failed to remove legacy license file"
+    fi
+
     # Remove empty directories
     local dir
     for dir in reports modules drivers ""; do
@@ -2042,8 +2390,7 @@ Options:
                     MOK-chained) this will lead to kernel-load failure inside
                     LamBoot. If you genuinely have a firmware-DB-signed kernel
                     (self-signed UKI / custom shop), pair with
-                    --kernel-firmware-db-signed. See
-                    docs/analysis/CONFIG-4-TRUST-CHAIN-GAP-2026-04-21.md.
+                    --kernel-firmware-db-signed.
   --no-mok          Skip MOK enrollment prompt (advanced; implies manual
                     enrollment by the operator). Shim is STILL deployed in the
                     boot chain; pre-enrolled MokList from the guest OS install
@@ -2053,7 +2400,21 @@ Options:
                     Unblocks --no-shim under Secure Boot. Rare — only use if
                     you know your kernel signature chain terminates in
                     firmware DB, not MOK.
-  --with-drivers    Install filesystem drivers (auto-detected by default)
+  --with-drivers-legacy=MODE
+                    SDS-6: legacy UEFI filesystem driver install policy.
+                    Default: auto. Values:
+                      auto  — install drivers only for filesystems NOT
+                              natively covered by LamBoot. ext2/3/4
+                              skipped (covered by ext4-view since v0.9.0);
+                              btrfs/xfs/ntfs/zfs/f2fs/iso9660 installed
+                              when /boot is one of those.
+                      all   — install every driver applicable to the
+                              running arch, regardless of coverage.
+                              Equivalent to the v0.8.3 --with-drivers.
+                      none  — install no drivers. Fails gracefully at
+                              boot if /boot is non-native; use only when
+                              you've confirmed /boot is natively covered.
+  --with-drivers    Alias for --with-drivers-legacy=all (v0.8.3 name).
   --with-modules    Install diagnostic modules
   --install-toolkit Print lamboot-tools install guidance at end of successful
                     install (non-interactive; suitable for scripts).
@@ -2066,6 +2427,8 @@ Options:
   --force           Skip safety checks
   --no-bls          Don't generate BLS entries
   --keep-entries    With --remove: keep generated BLS entries
+  --keep-logs       With --remove: keep boot.log/boot.json/audit.log/
+                    error.json forensic data under reports/
   --quiet           Minimal output
   --verbose         Detailed output
   --version         Print version and exit
@@ -2088,7 +2451,31 @@ parse_options() {
             --no-make-default) OPT_SET_DEFAULT=0 ;;
             --make-default)   OPT_SET_DEFAULT=1 ;;
             --fallback)     OPT_FALLBACK=1 ;;
-            --with-drivers) OPT_WITH_DRIVERS=1 ;;
+            --with-drivers) OPT_WITH_DRIVERS=1; OPT_WITH_DRIVERS_LEGACY="all" ;;
+            --with-drivers-legacy=*)
+                OPT_WITH_DRIVERS_LEGACY="${1#--with-drivers-legacy=}"
+                case "$OPT_WITH_DRIVERS_LEGACY" in
+                    auto) OPT_WITH_DRIVERS=-1 ;;
+                    all)  OPT_WITH_DRIVERS=1 ;;
+                    none) OPT_WITH_DRIVERS=0 ;;
+                    *)
+                        die "--with-drivers-legacy=${OPT_WITH_DRIVERS_LEGACY}: valid values are auto, all, none"
+                        ;;
+                esac
+                ;;
+            --with-drivers-legacy)
+                [ -n "${2:-}" ] || die "--with-drivers-legacy requires an argument (auto|all|none)"
+                OPT_WITH_DRIVERS_LEGACY="$2"
+                case "$OPT_WITH_DRIVERS_LEGACY" in
+                    auto) OPT_WITH_DRIVERS=-1 ;;
+                    all)  OPT_WITH_DRIVERS=1 ;;
+                    none) OPT_WITH_DRIVERS=0 ;;
+                    *)
+                        die "--with-drivers-legacy ${OPT_WITH_DRIVERS_LEGACY}: valid values are auto, all, none"
+                        ;;
+                esac
+                shift
+                ;;
             --with-modules) OPT_WITH_MODULES=1 ;;
             --remove)       OPT_REMOVE=1 ;;
             --update)       OPT_UPDATE=1 ;;
@@ -2096,6 +2483,7 @@ parse_options() {
             --force)        OPT_FORCE=1 ;;
             --no-bls)       OPT_NO_BLS=1 ;;
             --keep-entries) OPT_KEEP_ENTRIES=1 ;;
+            --keep-logs)    OPT_KEEP_LOGS=1 ;;
             --quiet)        OPT_QUIET=1 ;;
             --verbose)      OPT_VERBOSE=1 ;;
             --replace)      OPT_REPLACE=1; OPT_SET_DEFAULT=1 ;;
@@ -2128,8 +2516,6 @@ parse_options() {
     # kernel because MOK-chained kernels can't be verified without shim's
     # ShimLock protocol). Stock Ubuntu/Debian/Fedora kernels are MOK-chained,
     # not firmware-DB-signed.
-    # See docs/analysis/CONFIG-4-TRUST-CHAIN-GAP-2026-04-21.md for the
-    # full root-cause narrative.
     if (( OPT_NO_SHIM )) && (( SECURE_BOOT )) && ! (( OPT_KERNEL_DB_SIGNED )); then
         die "--no-shim under Secure Boot requires a firmware-DB-signed kernel.
 Stock Linux distro kernels (Ubuntu, Debian, Fedora, openSUSE, Arch) are NOT
@@ -2144,8 +2530,7 @@ For stock distro installs on SB-enabled systems, the correct flow is:
     lamboot-install --signed              # deploys shim + LamBoot + optional MOK prompt
     lamboot-install --signed --no-mok     # deploys shim but skips interactive mokutil
 
-See docs/SECURE-BOOT-DEPLOYMENT.md and
-docs/analysis/CONFIG-4-TRUST-CHAIN-GAP-2026-04-21.md."
+See docs/SECURE-BOOT-DEPLOYMENT.md."
     fi
 }
 

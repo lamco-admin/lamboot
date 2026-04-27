@@ -16,7 +16,7 @@ LamBoot's Secure Boot signing uses a three-tier key hierarchy following UEFI con
 | **KEK** — Key Exchange Key | Signs `db` updates | RSA 4096 / SHA-256 | 10 years | Only during `db` rotation | Offline encrypted |
 | **db** — Signature DB | Signs every LamBoot release binary | **RSA 2048** / SHA-256 | 3 years (rotatable) | Every build | Encrypted at rest on signing host |
 
-The algorithm split is deliberate. See [`docs/analysis/RSA-4096-COMPATIBILITY-ANALYSIS-2026-04-20.md`](analysis/RSA-4096-COMPATIBILITY-ANALYSIS-2026-04-20.md) for the full rationale. In short: **the `db` key must be RSA 2048** because shim has an unfixed bug ([Debian #1013320](https://groups.google.com/g/linux.debian.bugs.dist/c/VYecNquj5mk)) that freezes when verifying binaries via an RSA 4096 MOK-enrolled key, and Config 3 (shim + MOK) is LamBoot's default distro-user path. **PK and KEK use RSA 4096** because they operate entirely in firmware variable space and never pass through shim — firmware-level 4096 is universally supported ([Microsoft's UEFI CA 2023](https://support.microsoft.com/en-us/topic/kb5036210-deploying-windows-uefi-ca-2023-certificate-to-secure-boot-allowed-signature-database-db-a68a3eae-292b-4224-9490-299e303b450b) is itself RSA 4096). All keys use SHA-256 for universal spec-mandatory support.
+The algorithm split is deliberate. **The `db` key must be RSA 2048** because shim has an unfixed bug ([Debian #1013320](https://groups.google.com/g/linux.debian.bugs.dist/c/VYecNquj5mk)) that freezes when verifying binaries via an RSA 4096 MOK-enrolled key, and Config 3 (shim + MOK) is LamBoot's default distro-user path. **PK and KEK use RSA 4096** because they operate entirely in firmware variable space and never pass through shim — firmware-level 4096 is universally supported ([Microsoft's UEFI CA 2023](https://support.microsoft.com/en-us/topic/kb5036210-deploying-windows-uefi-ca-2023-certificate-to-secure-boot-allowed-signature-database-db-a68a3eae-292b-4224-9490-299e303b450b) is itself RSA 4096). All keys use SHA-256 for universal spec-mandatory support.
 
 **Never use RSA 4096 for any LamBoot cert that might end up in a MOKList.** That includes the `db` signing key and any intermediate keys derived from it.
 
@@ -333,7 +333,6 @@ rm -rf keys-gen   # db.key has already been moved to signing host location
 - [UEFI Specification 2.11 §32 — Secure Boot and Driver Signing](https://uefi.org/specs/UEFI/2.11/32_Secure_Boot_and_Driver_Signing.html)
 - [Microsoft — Windows Secure Boot Key Creation and Management Guidance](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/windows-secure-boot-key-creation-and-management-guidance)
 - [Debian Bug #1013320 — the RSA 4096 MOK constraint](https://groups.google.com/g/linux.debian.bugs.dist/c/VYecNquj5mk)
-- [`docs/analysis/RSA-4096-COMPATIBILITY-ANALYSIS-2026-04-20.md`](analysis/RSA-4096-COMPATIBILITY-ANALYSIS-2026-04-20.md) — the research behind the algorithm split
 - [`docs/SECURE-BOOT-DEPLOYMENT.md`](SECURE-BOOT-DEPLOYMENT.md) — deployment guide consuming these keys
 
 ---
@@ -362,5 +361,5 @@ safe way to execute **how**. Other execution paths (hand-run OpenSSL,
 existing `tools/sign-lamboot.sh` + `tools/sign-lock` / `sign-unlock` in
 this repo, vendor automation) remain valid.
 
-See [`~/lamboot-tools-dev/docs/SPEC-LAMBOOT-SIGNING-KEYS.md`](https://github.com/lamco-admin/lamboot-tools-dev/blob/main/docs/SPEC-LAMBOOT-SIGNING-KEYS.md)
-for the tool-level spec.
+See the [`lamboot-tools`](https://github.com/lamco-admin/lamboot-tools)
+repository for the tool's source and documentation.

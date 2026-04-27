@@ -156,5 +156,4 @@ echo
 echo "Next steps:"
 echo "  1. Tag: git tag -a v${VERSION} -m 'LamBoot v${VERSION}'"
 echo "  2. Push tag: git push origin v${VERSION}"
-echo "  3. Export: ./export-to-public.sh --dry-run ${VERSION}"
-echo "  4. Review, then: ./export-to-public.sh ${VERSION}"
+echo "  3. Run the project's publish workflow to stage and ship the release."

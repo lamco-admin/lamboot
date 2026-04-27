@@ -6,8 +6,7 @@
 //! property of the type system — you cannot hold an `EspWriter` whose
 //! underlying volume is ext4.
 //!
-//! Rationale (see `docs/analysis/NATIVE-FS-AND-PE-LOADER-STRATEGY-2026-04-21.md`
-//! §5.7): on-disk writes to ext4 at boot time introduce journal-replay
+//! Rationale: on-disk writes to ext4 at boot time introduce journal-replay
 //! hazards that trade away the security posture we gain from never-mounting
 //! ext4 read-write in UEFI. The FAT ESP, in contrast, is a small,
 //! append-only-in-practice workspace for trust logs, boot reports, and

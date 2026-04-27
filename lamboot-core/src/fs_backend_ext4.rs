@@ -8,12 +8,11 @@
 //! # Why this exists
 //!
 //! Loading a UEFI filesystem driver through `BS->LoadImage` +
-//! `StartImage` triggers shim 15.8's `ShimLock` uninstall (see
-//! `docs/analysis/CONFIG-4-TRUST-CHAIN-GAP-2026-04-21-AMENDED.md`),
-//! which breaks later kernel verification. A native Rust reader
-//! embedded in the LamBoot binary sidesteps that path entirely. Same
-//! security property plus a stronger claim than any FS-driver loader:
-//! a read-only crate cannot modify `/boot` by construction.
+//! `StartImage` triggers shim 15.8's `ShimLock` uninstall, which breaks
+//! later kernel verification. A native Rust reader embedded in the
+//! LamBoot binary sidesteps that path entirely. Same security property
+//! plus a stronger claim than any FS-driver loader: a read-only crate
+//! cannot modify `/boot` by construction.
 //!
 //! # Architectural position
 //!

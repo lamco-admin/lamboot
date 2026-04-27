@@ -8,7 +8,6 @@
 > - [`SECURE-BOOT-DEPLOYMENT.md`](SECURE-BOOT-DEPLOYMENT.md) — four Secure Boot deployment configurations
 > - [`KEY-GENERATION.md`](KEY-GENERATION.md) — production PK/KEK/db key hierarchy
 > - [`MOK-ENROLLMENT-GUIDE.md`](MOK-ENROLLMENT-GUIDE.md) — MokManager walkthrough
-> - [`analysis/UEFI-SECURITY-ECOSYSTEM-DEEP-DIVE-2026-04-21.md`](analysis/UEFI-SECURITY-ECOSYSTEM-DEEP-DIVE-2026-04-21.md) — ecosystem bypass catalog
 >
 > The content below is still accurate but less complete than the v0.8.3 model doc.
 

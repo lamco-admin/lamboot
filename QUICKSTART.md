@@ -50,12 +50,6 @@ sudo dnf install qemu-system-x86 edk2-ovmf
 
 You should see the graphical boot menu with a mouse cursor.
 
-For Secure Boot tests with a signed binary and enrolled keys:
-
-```bash
-./run-qemu-secureboot.sh
-```
-
 ## Manual install on a real system
 
 ```bash

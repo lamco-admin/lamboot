@@ -46,7 +46,7 @@ Added f2fs, xfs, zfs, ntfs drivers (EfiFs v1.12) for x86_64 and aarch64. Superbl
 - Filesystem Driver Analysis (bcachefs, ReFS, Windows trajectory)
 - F2FS Boot Ecosystem Analysis (GRUB breakage, CachyOS, bootloader matrix)
 
-**lamboot-tools-dev (2 docs):**
+**lamboot-tools (companion repo):**
 - README with full CLI reference + Makefile
 - Proxmox Integration Roadmap (5 phases)
 
@@ -101,7 +101,7 @@ Added f2fs, xfs, zfs, ntfs drivers (EfiFs v1.12) for x86_64 and aarch64. Superbl
 ### Known Blockers
 
 - **Secure Boot chain** — resolved in v0.8.3. LamBoot supports four deployment configurations (SB disabled / firmware db / shim + MOK / custom OVMF VARS). v0.9.x adds native PE loader so the shim-15.8 ShimLock-uninstall failure mode is structurally unreachable for kernel load. See `docs/SECURITY-MODEL.md`.
-- **Hookscript config locking** — resolved in v0.8.4 via fw_cfg file-reference pattern (`docs/PROXMOX-INTEGRATION-ROADMAP.md`).
+- **Hookscript config locking** — resolved in v0.8.4 via fw_cfg file-reference pattern.
 - **Ubuntu kernel hooks** — `/etc/kernel/postinst.d/zz-lamboot` still needed for BLS entry management on Ubuntu. Open — **P-INF-1**.
 
 ---
@@ -152,13 +152,7 @@ Both sides shipped 2026-04-23:
 All v0.8.4 must-haves + should-haves landed (hookscript rewrite to
 fw_cfg file-reference, fleet.toml schema consumption, `--toolkit-prompt`,
 README / LAMBOOT-TOOLS-OVERVIEW rewrite, three doc back-links). Proxmox
-integration test on VM 120: **PASS 8/8**
-(`docs/analysis/V0.8.4-PROXMOX-INTEGRATION-TEST-2026-04-22.md`).
-Full commit log in `docs/CROSS-REPO-STATUS.md §4.1`.
-
-**Rolling cross-repo coordination tracker:**
-[`docs/CROSS-REPO-STATUS.md`](CROSS-REPO-STATUS.md). Mirror counterpart
-at `~/lamboot-tools-dev/docs/CROSS-REPO-STATUS.md`; keep them in sync.
+integration test on VM 120: **PASS 8/8**.
 
 ### Files mirrored at toolkit release-build time
 
@@ -229,7 +223,7 @@ How Linux distribution installers handle bootloader selection and installation. 
 
 ## Future — Proxmox Integration
 
-See [Proxmox Integration Roadmap](https://github.com/lamco-admin/lamboot-tools-dev/blob/main/docs/PROXMOX-INTEGRATION-ROADMAP.md) for 5-phase plan:
+See the [`lamboot-tools`](https://github.com/lamco-admin/lamboot-tools) repository for the 5-phase Proxmox integration plan:
 
 1. Basic fix (lamboot-setup, hookscript fw_cfg rewrite)
 2. Fleet management tooling
@@ -255,7 +249,7 @@ See [Proxmox Integration Roadmap](https://github.com/lamco-admin/lamboot-tools-d
 
 ## Secure Boot Architecture — Long-Term Paths
 
-Path F (SecurityOverride) is being implemented for v0.8.3 — see `docs/analysis/SECURE-BOOT-ECOSYSTEM-AND-REAL-FIX-2026-04-21.md`. Two further paths sit beyond that release:
+Path F (SecurityOverride) is being implemented for v0.8.3. Two further paths sit beyond that release:
 
 ### Path G — Custom PE Loader (v0.9.x target)
 

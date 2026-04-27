@@ -141,8 +141,7 @@ fn run_bootloader(image: Handle) -> Result<Status> {
     })?;
 
     // Trust-evidence log (v0.8.3 initial version) — records every trust
-    // decision to \loader\boot-trust.log for host-side audit. See
-    // docs/analysis/UEFI-SECURITY-ECOSYSTEM-DEEP-DIVE-2026-04-21.md §9.
+    // decision to \loader\boot-trust.log for host-side audit.
     // Path G (v0.9.x) extends with crypto-signed entries and richer context.
     let mut trust_log = trust_log::TrustLog::new();
     trust_log.record(trust_log::TrustEvent::new("boot_start").with_note(&format!(
@@ -661,8 +660,7 @@ fn run_bootloader(image: Handle) -> Result<Status> {
             let note = format!(
                 "status hint: ACCESS_DENIED/SECURITY_VIOLATION typically means kernel rejected by firmware DB after shim_validate returned false; \
                  hook_security2 invocations={hook2_calls}, shim_validate calls={shim_calls} (true={shim_true}), \
-                 delegations to original={delegate_calls}, ShimLock handle not found={shimlock_not_found}; \
-                 see docs/analysis/CONFIG-4-TRUST-CHAIN-GAP-2026-04-21.md"
+                 delegations to original={delegate_calls}, ShimLock handle not found={shimlock_not_found}"
             );
             trust_log.record(
                 trust_log::TrustEvent::new("kernel_load_failed")

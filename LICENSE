@@ -31,5 +31,5 @@ Trademark notice
 
 "LamBoot" and the LamBoot logo are claimed marks of Lamco Development.
 Source-code forks are welcome under the MIT/Apache-2.0 license. Redistribution
-using the "LamBoot" name or logo for packaged binaries requires notice; see
-docs/WEBSITE-CONTENT.md §18 for details.
+of packaged binaries using the "LamBoot" name or logo requires written notice
+to Lamco Development. Forks distributed under a different name need no notice.

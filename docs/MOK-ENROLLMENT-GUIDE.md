@@ -185,7 +185,7 @@ sudo reboot
 - blue shim splash, then black screen forever
 - "Failed to open MokManager" briefly then hang
 
-**Likely cause (specific to this release):** shim has a known hang when verifying binaries via RSA 4096 MOK keys (see `docs/analysis/RSA-4096-COMPATIBILITY-ANALYSIS-2026-04-20.md`). LamBoot's `db` key is RSA 2048 precisely to avoid this, but if you see the hang, confirm:
+**Likely cause (specific to this release):** shim has a known hang when verifying binaries via RSA 4096 MOK keys. LamBoot's `db` key is RSA 2048 precisely to avoid this, but if you see the hang, confirm:
 
 ```
 openssl x509 -in /boot/efi/EFI/LamBoot/db.der -inform DER -noout -text \
@@ -254,6 +254,4 @@ You only go through it once per key, per machine. Future LamBoot updates signed 
 ## 8. Related documentation
 
 - `docs/SECURE-BOOT-DEPLOYMENT.md` — the master deployment guide and decision tree
-- `docs/SB-RECOVERY.md` — expanded recovery procedures (TBD)
-- `docs/analysis/RSA-4096-COMPATIBILITY-ANALYSIS-2026-04-20.md` — why our `db` cert is RSA 2048
 - `docs/KEY-GENERATION.md` — how LamBoot's signing keys were generated
