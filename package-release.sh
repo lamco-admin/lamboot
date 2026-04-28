@@ -1,5 +1,5 @@
 #!/bin/bash
-# Package LamBoot release tarball per docs/IMPLEMENTATION-PLAN.md §7.
+# Package LamBoot release tarball.
 #
 # Outputs:
 #   dist/lamboot-<VERSION>-<ARCH>.tar.gz
@@ -128,6 +128,61 @@ for d in \
         cp "/home/greg/lamboot-dev/docs/$d" "docs/$d"
     fi
 done
+
+# ── Cross-reference scan ───────────────────────────────────────────────
+# Catches references in the staged tarball tree to docs that the tarball
+# does NOT include — links that would dead-end for a user who extracted
+# the tarball, or worse, advertise the existence of internal documents.
+# Mirrors the scan in lamco-admin/pipelines/lamboot/publish/sync-to-public.sh;
+# the two must allow-list the same set of doc names.
+echo
+echo "══ Cross-reference scan ══"
+TARBALL_DOCS=(
+    SECURE-BOOT-DEPLOYMENT.md
+    SECURITY-MODEL.md
+    MOK-ENROLLMENT-GUIDE.md
+    OVMF-VARS-PROXMOX.md
+    PROXMOX-GUIDE.md
+    KEY-GENERATION.md
+    INSTALL-REFERENCE.md
+    CONFIGURATION-GUIDE.md
+    TROUBLESHOOTING-GUIDE.md
+    USER-GUIDE.md
+    SECURITY-GUIDE.md
+    DIAGNOSTIC-MODULES.md
+    ARCHITECTURE.md
+    LAMBOOT-TOOLS-OVERVIEW.md
+    LAMBOOT-INSPECT.md
+    ROADMAP.md
+)
+declare -A _ALLOWED_DOC=()
+for _d in "${TARBALL_DOCS[@]}"; do _ALLOWED_DOC["$_d"]=1; done
+
+_LEAK_REPORT=""
+while IFS= read -r -d '' _f; do
+    while IFS=: read -r _line _ref; do
+        _name="${_ref#docs/}"
+        if [[ -z "${_ALLOWED_DOC[$_name]:-}" ]]; then
+            _rel="${_f#$STAGING/}"
+            _LEAK_REPORT+="  ${_rel}:${_line}: refers to docs/${_name} (NOT in tarball)"$'\n'
+        fi
+    done < <(grep -niEo '\bdocs/[A-Z][A-Z0-9_.-]*\.md\b' "$_f" 2>/dev/null | head -100)
+done < <(find "$STAGING" -type f \
+            \( -name '*.md' -o -name 'LICENSE' -o -name 'LICENSE-*' \
+               -o -name 'CONTRIBUTING' -o -name 'README' -o -name 'NOTICE' \
+               -o -name '*.sh' -o -name '*.py' -o -name '*.pl' \
+               -o -name '*.toml' -o -name '*.rs' \) \
+            -print0)
+
+if [[ -n "$_LEAK_REPORT" ]]; then
+    echo "ABORT: tarball staging tree references docs not bundled in the tarball."
+    echo "$_LEAK_REPORT" | sort -u
+    echo
+    echo "Fix the offending files in dev source, then re-run package-release.sh."
+    rm -rf "$STAGING"
+    exit 1
+fi
+echo "✓ no cross-reference leaks in tarball tree"
 
 # Checksum manifest for reproducibility
 echo "══ Writing manifest ══"

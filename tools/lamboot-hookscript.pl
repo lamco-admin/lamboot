@@ -3,11 +3,10 @@
 # version: 0.8.4
 #
 # Refreshes the per-VM configuration JSON at pre-start and captures boot
-# health at post-stop. Reads /etc/lamboot/fleet.toml (schema v1, authored
-# in ~/lamboot-tools-dev/docs/SPEC-LAMBOOT-TOOLKIT-V1.md §16 Appendix C)
-# to determine fleet ID and per-VM role, and emits the shared per-VM
-# JSON schema v1 (matching what lamboot-pve-setup writes at setup time)
-# to /var/lib/lamboot/<VMID>.json.
+# health at post-stop. Reads /etc/lamboot/fleet.toml (schema v1) to
+# determine fleet ID and per-VM role, and emits the shared per-VM JSON
+# schema v1 (matching what lamboot-pve-setup writes at setup time) to
+# /var/lib/lamboot/<VMID>.json.
 #
 # This file is configured permanently on each VM by lamboot-pve-setup via
 # a single `args:` line containing
@@ -20,9 +19,7 @@
 #
 # Prior behavior (pre-0.8.4) mutated VM config via `qm set --args` during
 # pre-start, which silently failed because Proxmox config-locks the VM
-# configuration during that lifecycle phase. See
-# ~/lamboot-tools-dev/docs/PROXMOX-INTEGRATION-ROADMAP.md Phase 1 for
-# the background.
+# configuration during that lifecycle phase.
 #
 # Install:
 #   cp lamboot-hookscript.pl /var/lib/vz/snippets/

@@ -8,9 +8,9 @@
 
 LamBoot is a UEFI bootloader for Linux targeting hypervisor-managed VM environments (Proxmox in particular) and homelab / desktop systems. Eight clean architectural layers, ~8,300 lines of Rust. Graphical menu with mouse. BLS + UKI + `kernel-install` done right. Host-side fleet monitoring without an in-guest agent. An honest Secure Boot posture with a JSON trust-evidence log written to the ESP on every boot.
 
-**v0.8.4 ships the signing + audit layer + coordinated Proxmox-toolkit integration.** v0.8.3 landed the signing pipeline; v0.8.4 adds the fw_cfg file-reference hookscript rewrite, shared `/etc/lamboot/fleet.toml` schema, and `lamboot-install --toolkit-prompt` opt-in for the `lamboot-tools` v0.2.0 companion toolkit. Native read-only ext4 and a native PE loader land in v0.9.x → v1.0 so Secure Boot on stock Ubuntu/Debian/Fedora `/boot` just works. See the [roadmap](docs/ROADMAP.md) and the [integrated plan](docs/INTEGRATED-PLAN-V0.8.3-TO-V1.0.md).
+**v0.9.0 lands the native trust chain.** Native read-only ext4 reader, native PE loader, BLS multi-filesystem discovery, and legacy UEFI FS driver deprecation — the kernel-load path no longer touches `BS->LoadImage` or external filesystem drivers, so the shim 15.8 `ShimLock`-uninstall failure mode that blocked stock `/boot` on ext4 under Secure Boot is structurally unreachable. Pop!_OS / systemd-boot-discoverable-EFI auto-discovery is first-class. v0.8.4 (April 2026) shipped the coordinated Proxmox-toolkit integration this builds on. See the [roadmap](docs/ROADMAP.md).
 
-- **Current version:** 0.8.4 (April 2026)
+- **Current version:** 0.9.0 (April 2026)
 - **Binary size:** 215 KB (x86_64 unsigned), 217 KB (signed)
 - **Platforms:** x86_64 UEFI, aarch64 UEFI
 - **License:** MIT OR Apache-2.0
@@ -30,11 +30,10 @@ LamBoot is a UEFI bootloader for Linux targeting hypervisor-managed VM environme
 | 📝 **Honest Secure Boot** | JSON trust-evidence log on `\loader\boot-trust.log` — every image-authentication decision recorded. Threat model documents what LamBoot can and cannot verify. |
 | 🧪 **Crash-loop recovery** | NVRAM state machine with automatic fallback entry selection, systemd-bless-boot compatible. |
 
-**Honest posture for v0.8.3:**
-- **Ships now:** the signing pipeline, SecurityOverride (Path F), trust-evidence log, install-script hardening, Proxmox integration, BLS+UKI handling. Full feature set under Secure Boot off.
-- **Works under Secure Boot today** with UKI on the ESP, or with a firmware-DB-signed kernel (self-signed UKI / custom build shop).
-- **Known limitation:** stock `/boot` on ext4 under Secure Boot fails on shim 15.8 (shim uninstalls `ShimLock` after our UEFI ext4 driver loads, leaving the kernel unverifiable). **Resolved structurally in v1.0** via a native Rust ext4 reader (`ext4-view`) plus a native PE loader, eliminating the UEFI FS driver load and firmware `LoadImage` re-check from the kernel-load path.
-- Not shim-review approved yet (v1.0+ target, parallel track).
+**Honest posture for v0.9.0:**
+- **Ships now:** native ext4 read backend, native PE loader, native trust chain, BLS multi-FS discovery, signing pipeline, SecurityOverride (Path F), trust-evidence log, install-script hardening, Proxmox integration, BLS+UKI handling. The previous shim 15.8 `ShimLock`-uninstall failure on stock `/boot` ext4 under Secure Boot is structurally unreachable on the kernel-load path.
+- **Pop!_OS / systemd-boot-discoverable-EFI** kernels and recovery entries are auto-discovered.
+- Not shim-review approved yet (parallel track).
 - Not a GRUB drop-in — no legacy BIOS, no rescue shell, no GRUB config language.
 - Standard ecosystem gaps inherited (initrd integrity, kernel cmdline post-verification). See [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md).
 
@@ -76,7 +75,7 @@ LamBoot is a UEFI bootloader for Linux targeting hypervisor-managed VM environme
 ### Homelab (Secure Boot off)
 
 ```bash
-tar xzf lamboot-0.8.4-x86_64.tar.gz && cd lamboot-0.8.4
+tar xzf lamboot-0.9.0-x86_64.tar.gz && cd lamboot-0.9.0
 sudo ./lamboot-install
 # Reboot → pick "LamBoot" from firmware boot menu
 ```
@@ -92,7 +91,7 @@ sudo ./lamboot-install --signed
 
 ```bash
 # On host
-cp lamboot-0.8.4/OVMF_VARS_lamboot.fd /var/lib/vz/images/100/OVMF_VARS_100.fd
+cp lamboot-0.9.0/OVMF_VARS_lamboot.fd /var/lib/vz/images/100/OVMF_VARS_100.fd
 # In VM
 sudo ./lamboot-install --signed --no-mok
 ```

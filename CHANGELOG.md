@@ -4,7 +4,7 @@ All notable changes to LamBoot are documented here. Format inspired by Keep a Ch
 
 ## [Unreleased]
 
-(Forward work after v0.9.0 — see `docs/ROADMAP-V1.0-AND-BEYOND.md`.)
+(Forward work after v0.9.0.)
 
 ## [0.9.0]
 

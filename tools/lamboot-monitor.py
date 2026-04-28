@@ -24,8 +24,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
 
-# Shared fleet configuration, authoritative schema documented in
-# ~/lamboot-tools-dev/docs/SPEC-LAMBOOT-TOOLKIT-V1.md §16 Appendix C.
+# Shared fleet configuration (schema v1).
 FLEET_TOML_PATH = "/etc/lamboot/fleet.toml"
 
 # LamBoot vendor GUID: 4C414D42-4F4F-5400-0000-000000000001
@@ -306,10 +305,9 @@ def send_webhook(url: str, payload: dict):
 def load_fleet_config(path: str = FLEET_TOML_PATH) -> dict:
     """Return the [monitor] section of /etc/lamboot/fleet.toml, or {} if absent.
 
-    Schema v1 is defined in ~/lamboot-tools-dev/docs/SPEC-LAMBOOT-TOOLKIT-V1.md
-    §16 Appendix C. This function is tolerant: missing file, missing TOML
-    parser, missing section, or wrong schema version all return {} so the
-    caller can fall back to hardcoded defaults.
+    This function is tolerant: missing file, missing TOML parser, missing
+    section, or wrong schema version all return {} so the caller can fall
+    back to hardcoded defaults.
     """
     if not os.path.exists(path):
         return {}
