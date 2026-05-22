@@ -1,0 +1,66 @@
+name: Filesystem support request
+description: Request native LamBoot support for a filesystem currently unsupported
+labels: ["type:enhancement", "area:filesystem"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        LamBoot reads `/boot` natively via filesystem backends that implement
+        the `FsBackend` trait. When a backend is unavailable for the filesystem
+        on `/boot`, LamBoot falls back to firmware `LoadImage`, which works
+        but yields less trust evidence. This template is for requesting native
+        support for an additional filesystem.
+
+  - type: input
+    id: fs_name
+    attributes:
+      label: Filesystem name
+      placeholder: "e.g. xfs, btrfs, f2fs, zfs, bcachefs"
+    validations:
+      required: true
+
+  - type: input
+    id: fs_version
+    attributes:
+      label: Filesystem on-disk format version
+      description: If applicable. Some filesystems have stable format versions worth specifying.
+      placeholder: "e.g. btrfs v1, xfs v5"
+
+  - type: textarea
+    id: distros
+    attributes:
+      label: Distributions that use this filesystem for /boot
+      description: Which distros default to this filesystem (or commonly use it) for `/boot`?
+      placeholder: |
+        - openSUSE Tumbleweed (btrfs `@/boot/` directory inside root subvol)
+        - Fedora Server (xfs)
+    validations:
+      required: true
+
+  - type: textarea
+    id: rust_crates
+    attributes:
+      label: Existing Rust crate ecosystem
+      description: Are there mature no_std Rust crates that could be used or adapted? Read-only support is sufficient for boot.
+      placeholder: |
+        - `xfs2` (read-only, no_std-compatible)
+        - ...
+
+  - type: dropdown
+    id: rw
+    attributes:
+      label: Read or read-write
+      description: LamBoot only reads `/boot`. Read-only support is fine.
+      options:
+        - "Read-only (sufficient)"
+        - "Read-write (out of scope; document why if you think otherwise)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: Why is native support needed rather than relying on firmware LoadImage? What use case is currently broken or limited?
+    validations:
+      required: true

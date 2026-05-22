@@ -1,0 +1,38 @@
+name: Feature request
+description: Suggest a new feature or enhancement for LamBoot
+labels: ["type:enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for thinking about how to improve LamBoot. For filesystem
+        backend or distribution packaging requests, please use the dedicated
+        templates instead.
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: What problem does this feature solve? Who would benefit, and in what scenario?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should LamBoot do? Be as concrete as you can about the user-visible behavior and any policy or configuration knobs.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What other approaches did you think about? Why was the proposal preferred?
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Related projects, prior art, links to discussions or specs.

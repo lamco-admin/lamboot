@@ -34,6 +34,7 @@ REQUIRED=(
     dist/kernel-hooks/zz-lamboot-postinst
     dist/kernel-hooks/zz-lamboot-postrm
     tools/lamboot-install
+    lib/esp-deploy.sh
     CHANGELOG.md
     SECURITY.md
     LICENSE-MIT
@@ -79,6 +80,13 @@ cp -a /home/greg/lamboot-dev/tools/lamboot-inspect.1 ./man/man1/lamboot-inspect.
 cp -a /home/greg/lamboot-dev/tools/completions/lamboot-inspect.bash ./completions/lamboot-inspect.bash
 cp -a /home/greg/lamboot-dev/tools/completions/_lamboot-inspect ./completions/_lamboot-inspect
 
+# Shell library — canonical ESP file-layout primitives.
+# lamboot-install sources this from <self-dir>/lib/esp-deploy.sh
+# (third candidate in its lib search order); shipping it here is what
+# makes the tarball self-contained for fresh extracts.
+mkdir -p lib
+cp -a /home/greg/lamboot-dev/lib/esp-deploy.sh ./lib/esp-deploy.sh
+
 # EFI artifacts
 mkdir -p EFI/LamBoot
 cp -a /home/greg/lamboot-dev/dist/EFI/LamBoot/* EFI/LamBoot/
@@ -106,10 +114,15 @@ cp /home/greg/lamboot-dev/README.md ./README.md
 cp /home/greg/lamboot-dev/LICENSE-MIT ./LICENSE-MIT
 cp /home/greg/lamboot-dev/LICENSE-APACHE ./LICENSE-APACHE
 
-# User-facing documentation (NOT internal analysis)
+# User-facing documentation (NOT internal analysis).
+# This list must stay in sync with PUBLIC_DOCS in
+# ~/lamco-admin/pipelines/lamboot/publish/sync-to-public.sh so the tarball
+# and the public clone ship the same set of docs.
 for d in \
     SECURE-BOOT-DEPLOYMENT.md \
+    SECURE-BOOT-AND-SIGNING-STRATEGY.md \
     SECURITY-MODEL.md \
+    SECURITY-GUIDE.md \
     MOK-ENROLLMENT-GUIDE.md \
     OVMF-VARS-PROXMOX.md \
     PROXMOX-GUIDE.md \
@@ -118,9 +131,10 @@ for d in \
     CONFIGURATION-GUIDE.md \
     TROUBLESHOOTING-GUIDE.md \
     USER-GUIDE.md \
-    SECURITY-GUIDE.md \
+    DEVELOPER-GUIDE.md \
     DIAGNOSTIC-MODULES.md \
     ARCHITECTURE.md \
+    ARCHITECTURE-LAYERS.md \
     LAMBOOT-TOOLS-OVERVIEW.md \
     LAMBOOT-INSPECT.md \
     ROADMAP.md; do
@@ -139,7 +153,9 @@ echo
 echo "══ Cross-reference scan ══"
 TARBALL_DOCS=(
     SECURE-BOOT-DEPLOYMENT.md
+    SECURE-BOOT-AND-SIGNING-STRATEGY.md
     SECURITY-MODEL.md
+    SECURITY-GUIDE.md
     MOK-ENROLLMENT-GUIDE.md
     OVMF-VARS-PROXMOX.md
     PROXMOX-GUIDE.md
@@ -148,9 +164,10 @@ TARBALL_DOCS=(
     CONFIGURATION-GUIDE.md
     TROUBLESHOOTING-GUIDE.md
     USER-GUIDE.md
-    SECURITY-GUIDE.md
+    DEVELOPER-GUIDE.md
     DIAGNOSTIC-MODULES.md
     ARCHITECTURE.md
+    ARCHITECTURE-LAYERS.md
     LAMBOOT-TOOLS-OVERVIEW.md
     LAMBOOT-INSPECT.md
     ROADMAP.md

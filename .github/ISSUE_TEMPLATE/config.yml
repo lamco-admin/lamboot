@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or design discussion
+    url: https://github.com/lamco-admin/lamboot/discussions
+    about: For open-ended questions, design discussions, or "how does X work?" topics, please use GitHub Discussions rather than filing an issue.
+  - name: Security report
+    url: https://github.com/lamco-admin/lamboot/security/policy
+    about: For security-sensitive reports, please follow the responsible-disclosure path in SECURITY.md rather than filing a public issue.

@@ -18,6 +18,24 @@ Because LamBoot's cert is in `db`, the firmware validates LamBoot binaries direc
 
 Everything Windows/shim needs to boot is untouched. The only behavioural change from stock OVMF VARS is that LamBoot now boots.
 
+### 1.1 Common pitfall: `--add-mok` alone is not enough
+
+Operators rolling their own VARS file with `virt-fw-vars` (instead of using the pre-built `OVMF_VARS_lamboot.fd`) sometimes enroll LamBoot's cert into the **MOK list** with `--add-mok`, expecting that to be sufficient. It is not, for direct boot:
+
+- **MOK** (Machine Owner Key) is consulted by `shim`, not by the firmware. If LamBoot is launched directly (no shim in the chain), the firmware sees no `db` entry that signs LamBoot, rejects the binary, and falls back to whatever other Boot#### entries exist (typically the distro's shim).
+- **db** is consulted by the firmware itself. A cert in `db` makes LamBoot directly bootable under SB with no shim wrapper.
+
+The two paths that work under SB:
+
+| Path | Cert location | Tool flag |
+|---|---|---|
+| **Config 3** — chained behind shim | MOK | `virt-fw-vars --add-mok` (or `mokutil --import` from inside the guest) |
+| **Config 4** — direct, no shim | firmware `db` | `virt-fw-vars --add-db` (this document; `OVMF_VARS_lamboot.fd` does this for you) |
+
+Mixing the two — e.g. enrolling to MOK only and expecting LamBoot to boot directly — silently fails by falling back to a different Boot#### entry. Diagnose with `efibootmgr` post-boot: `BootCurrent` will not match LamBoot's Boot####.
+
+This pitfall was observed during v0.9.1 sprint testing on a Fedora workstation: `virt-fw-vars --add-mok` alone left LamBoot un-bootable directly under SB; adding `--add-db` for the same cert fixed it.
+
 ---
 
 ## 2. When to use this
@@ -173,6 +191,194 @@ The Proxmox wiki's [Storage: Raw Files](https://pve.proxmox.com/wiki/Storage) pa
 
 ---
 
+## 5a. Alternative: in-place modification (preserve existing VARS state)
+
+§5 replaces the entire `efidisk0` with the pre-built `OVMF_VARS_lamboot.fd` template. That is the right approach for **fleet deployment** where every VM should have identical canonical VARS.
+
+For an **already-running individual VM** where you want to keep its existing UEFI state — `BootOrder`, existing `Boot####` entries (Debian's `\EFI\debian\shimx64.efi`, etc.), enrolled MOK entries (DKMS module signing keys, NVIDIA Module Signing), customized PK/KEK — use **in-place modification** instead: read the existing VARS off the efidisk, append LamBoot's cert to `db` with `virt-fw-vars --inplace --add-db`, write it back.
+
+### 5a.1 When to use this path vs §5
+
+| | §5 (template replace) | §5a (in-place modify) |
+|---|---|---|
+| Fleet deployment from scratch | ✓ | |
+| Preserves per-VM `BootOrder`, `Boot####` entries | | ✓ |
+| Preserves enrolled MOK (DKMS, NVIDIA module signing, …) | | ✓ |
+| Preserves customized PK/KEK (e.g., Debian's PK/KEK) | | ✓ |
+| Requires `virt-firmware` on Proxmox host | (only if generating template) | ✓ (always) |
+| Snapshot/rollback safety | tied to template integrity | per-modification ZFS snapshot |
+| Idempotent (re-running is a no-op if cert already in db) | byte-identical writes | yes, with verification helper |
+
+Rule of thumb: §5 if you have a fleet template you trust; §5a if the VM has been running for a while and accumulated state worth keeping.
+
+### 5a.2 The procedure (ZFS-backed example)
+
+```bash
+VMID=108
+ZFS_DS="MonsterStore/vm-${VMID}-disk-1"          # adjust to your pool/disk
+ZVOL="/dev/zvol/${ZFS_DS}"
+CERT="/path/to/keys/db.der"                       # LamBoot signing cert
+GUID="4c414d42-4f4f-5400-0000-000000000001"       # LamBoot vendor GUID
+
+qm shutdown "$VMID"
+
+# 1. ZFS snapshot for rollback safety (instant on ZFS)
+zfs snapshot "${ZFS_DS}@pre-lamboot-inject-$(date +%Y%m%d-%H%M%S)"
+
+# 2. Read existing VARS off the zvol
+SIZE=$(blockdev --getsize64 "$ZVOL")              # 4194304 for 4M efidisk
+COUNT_MB=$(( SIZE / 1048576 ))
+dd if="$ZVOL" of=/tmp/vars.bak bs=1M count="$COUNT_MB" status=none
+cp /tmp/vars.bak /tmp/vars.new
+
+# 3. Append LamBoot cert to db (preserves all existing variables)
+virt-fw-vars --inplace /tmp/vars.new --add-db "$GUID" "$CERT"
+
+# 4. VERIFY before writing back (see §5a.3)
+# ...
+
+# 5. Write modified VARS back to the zvol
+dd if=/tmp/vars.new of="$ZVOL" bs=1M count="$COUNT_MB" conv=notrunc status=none
+sync
+
+qm start "$VMID"
+```
+
+Rollback: `zfs rollback ${ZFS_DS}@pre-lamboot-inject-<timestamp>` while VM is shut down.
+
+For non-ZFS storage backends, replace step 1's `zfs snapshot` with the equivalent (LVM snapshot, `cp` for directory storage, RBD snapshot, etc.) and steps 2/5's dd with the appropriate read/write mechanism for that backend.
+
+### 5a.3 Verification — `virt-fw-vars --print` does NOT show cert subjects
+
+A common verification mistake: piping `virt-fw-vars --print` through `grep "LamBoot Release Signing Key"` after `--add-db`. **This will fail** even when the cert is correctly added, because `--print` outputs structural information (variable names, blob sizes) but never decodes X.509 cert subjects:
+
+```
+db                  : blob: 4225 bytes      # ← size only, no subject string
+```
+
+The right verification is `--extract-certs` followed by `openssl x509`:
+
+```bash
+verify_lamboot_cert_in_db() {
+    local vars_file="$1"
+    local expected_sha256="$2"     # e.g. "513a22b6f16a5a13aeebb8da1bfb3e96..."
+    local guid="$3"                # e.g. "4c414d42-4f4f-5400-0000-000000000001"
+
+    local tmpdir
+    tmpdir=$(mktemp -d /tmp/lamboot-verify-XXXXXX)
+
+    ( cd "$tmpdir" && virt-fw-vars --input "$vars_file" --extract-certs >/dev/null 2>&1 ) \
+        || { rm -rf "$tmpdir"; return 1; }
+
+    local cert_file
+    cert_file=$(find "$tmpdir" -maxdepth 1 -name "db-${guid}-*.pem" -print -quit)
+    [[ -f "$cert_file" ]] || { rm -rf "$tmpdir"; return 1; }
+
+    local fp
+    fp=$(openssl x509 -in "$cert_file" -noout -fingerprint -sha256 \
+         | sed 's/^.*Fingerprint=//' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+
+    rm -rf "$tmpdir"
+    [[ "$fp" == "$expected_sha256" ]]
+}
+```
+
+This asserts on bytes, not human-readable substrings — robust against virt-fw-vars output format changes and against subject-string typos.
+
+**A secondary sanity check** is to verify the `db` blob grew by the expected amount:
+
+```bash
+virt-fw-vars --input /tmp/vars.bak --print | grep '^db '
+# db                  : blob: 3143 bytes
+virt-fw-vars --input /tmp/vars.new --print | grep '^db '
+# db                  : blob: 4225 bytes
+```
+
+Delta = 1082 bytes for a typical 1KB DER cert plus the 44-byte EFI_SIGNATURE_LIST + owner GUID overhead. A delta of zero means `--add-db` silently no-op'd; a non-1KB delta means something other than a cert went in.
+
+### 5a.4 1MB efidisk anomaly on older Proxmox VMs
+
+Some VMs created on older Proxmox versions, or restored from older backups, have `efitype=4m` in their config but a **1MB-allocated** efidisk on disk:
+
+```
+efidisk0: <storage>:vm-N-disk-X,efitype=4m,pre-enrolled-keys=1,size=1M
+```
+
+The OVMF VARS structure (~540KB) fits in 1MB, so the VM still boots fine — but there's almost no slack for additional variable storage. Adding LamBoot's cert (≈1KB) is comfortable, but adding several certs, or larger BootOrder/MOK growth, can run out of space.
+
+Best practice: expand to 4MB before §5a injection.
+
+```bash
+# ZFS-backed example:
+qm shutdown "$VMID"
+zfs snapshot "${ZFS_DS}@pre-lamboot-expand-$(date +%Y%m%d-%H%M%S)"
+zfs set volsize=4M "$ZFS_DS"
+udevadm settle
+qm set "$VMID" --efidisk0 "<storage>:vm-${VMID}-disk-1,efitype=4m,pre-enrolled-keys=1,size=4M"
+# Then proceed with §5a.2.
+```
+
+The existing ~540KB of OVMF VARS content stays at the start of the now-4MB zvol; the new 3.5MB is zero-padded. Pre-enrolled keys, `BootOrder`, and existing `Boot####` entries are all preserved.
+
+**Do not use `--fresh-template`-style replacement on a VM you want to preserve.** Replacing the efidisk with a fresh `OVMF_VARS_4M.ms.fd` wipes `BootOrder` and all `Boot####` entries; the VM may no longer boot until you recreate the distro boot entry via `grub-install` from a rescue environment.
+
+### 5a.5 Live data: aibox (Debian 13, ZFS, ext2 /boot) — 2026-05-21
+
+First end-to-end exercise of §5a + Config 3 with `db` pre-enrolled (per `SECURE-BOOT-DEPLOYMENT.md §4.1`). VM 108 on a Proxmox host, ZFS-backed efidisk, Debian 13 trixie guest with `/boot=ext2`.
+
+**Pre-install state:**
+- `efidisk0: AB:vm-108-disk-1,efitype=4m,pre-enrolled-keys=1,size=1M` (1MB allocated — §5a.4 anomaly)
+- ZFS zvol `MonsterStore/vm-108-disk-1`, blockdev size 1048576
+- Existing UEFI state non-trivial: Debian PK (not Microsoft's), MS UEFI CA + MS PCA + Debian's KEK in `db`, MokList already enrolled with `DKMS module signing key` + `NVIDIA Module Signing` (per `--extract-certs` on a backup of the pre-modification VARS)
+
+**Expand step (§5a.4):**
+- `zfs set volsize=4M MonsterStore/vm-108-disk-1` → new size 4194304
+- `qm set 108 --efidisk0 AB:vm-108-disk-1,efitype=4m,pre-enrolled-keys=1,size=4M`
+- All existing variables, BootOrder, and MokList preserved (verified by `--extract-certs` before/after)
+
+**Inject step (§5a.2):**
+- `dd` zvol → `vars.bak` (4194304 bytes)
+- `virt-fw-vars --inplace vars.new --add-db 4c414d42-4f4f-5400-0000-000000000001 db.der`
+- `db` blob grew 3143 → 4225 bytes (delta 1082 = expected for 1038-byte DER cert + EFI_SIGNATURE_LIST overhead)
+- Verification by `--extract-certs` produced `db-4c414d42-4f4f-5400-0000-000000000001-LamBootReleaseSigningKey2026.pem` with sha256 fingerprint matching expected `51:3A:22:B6:F1:6A:5A:13:…:14:2`
+- `dd` vars.new → zvol; round-trip re-read confirms cert on disk
+
+**Install step (`lamboot-install --signed`, in-guest):**
+- Auto-detected shim at `/boot/efi/EFI/debian/shimx64.efi`; deployed Config 3 layout (`SECURE-BOOT-DEPLOYMENT.md §4`)
+- `/boot/efi/EFI/LamBoot/` contains: `shimx64.efi` (957KB Debian shim), `grubx64.efi` (484KB LamBoot signed binary), `lambootx64.efi` (also LamBoot signed; same sha256), `policy.toml`, `db.der`, `drivers/`, `modules/`, `reports/`
+- 5 BLS entries generated for kernels 6.12.{69,73,74+1,85,88}+deb13-amd64
+- `efibootmgr --create` made `Boot0001* LamBoot → \EFI\LamBoot\shimx64.efi`; **inserted at head of BootOrder** by default
+
+**Observed first boot:**
+- `BootCurrent: 0001` — firmware loaded LamBoot's shim, not Debian's shim
+- LamBoot 0.9.0 ran, discovered 5 entries in 1000 ms, selected `bls-debian-6.12.88`
+- Kernel `6.12.88+deb13-amd64` booted normally; Debian came up clean
+- `boot.json` reports `entry_type: linux_legacy` — kernel loaded via firmware LoadImage, **not** SDS-3 native PE loader
+
+**Open issues surfaced:**
+
+1. **`entry_type: linux_legacy` on Debian 13 / ext2 — expected or regression?**
+   The Fedora 122 cross-distro reference (CROSS-DISTRO-TEST-RESULTS-2026-04-25 §1) produced `loader=native_pe_loader backend=ext4-view@0.9.3`. aibox produced `linux_legacy` with no native loader event. Two non-exclusive hypotheses:
+   - ext4-view's ext2 support: does ext4-view enumerate ext2 superblocks? If it does, SDS-3 should have engaged. If it doesn't, this is the first ext2-`/boot` data point that should be filed as a v0.9.x test row.
+   - Debian shim-protocol interaction: Debian's shim may register a different `SecurityArchProtocol` or `ShimLock` shape than Fedora's, causing LamBoot to prefer the legacy path.
+   Reproducer: any Debian guest with ext2 `/boot` under SB+shim, install LamBoot, examine `boot.json`. If `linux_legacy` is consistent, the right fix is to extend ext4-view ext2 coverage or extend SDS-3's filesystem matcher.
+
+2. **v0.9.0 summary `boot.json` cannot prove `verified_via=shim_db`.**
+   The trust-log richness the cross-distro test results doc shows (per-event `verified_via`, `image_loaded_native`, PCR measurements) is only emitted on the `native_pe` path. On `linux_legacy`, `boot.json` records timing and entry selection but no per-event verification trace. For evidence of the firmware-db trust path on this run, see §`SECURE-BOOT-DEPLOYMENT.md §4.1` "On evidence" — boot success itself is the proof under this binary version.
+
+3. **Both `grubx64.efi` and `lambootx64.efi` are the signed binary.**
+   sha256 `2f14750c…` matches `dist/EFI/LamBoot/lambootx64-signed.efi`. The unsigned `dist/EFI/LamBoot/lambootx64.efi` (sha256 `523f1249…`) was NOT deployed. Worth confirming this is the intended install-script behavior; if so, the spec wording for the unsigned-binary slot (`SPEC-LAMBOOT-INSTALL.md §1.2`) may be stale.
+
+4. **`lamboot_version=0.9.0` in `boot.json` while dev tree `Cargo.toml` is `0.9.1`.**
+   The installed binary is from a v0.9.0 build of LamBoot, not freshly rebuilt against v0.9.1 source. This is expected when using `dist/` artifacts, but worth flagging — anyone running this procedure to validate v0.9.1 behavior needs to rebuild `dist/` first (`./build.sh`).
+
+5. **Debian PK observed in pre-existing VARS.**
+   Stock Proxmox `pre-enrolled-keys=1` is documented to enroll Microsoft's PK. aibox had Debian's PK already, suggesting prior `mokutil`/`update-secureboot-policy` activity in this guest. Not a v0.9.x concern but worth noting in §5a.1's "preserve per-VM state" rationale.
+
+**Confirmed working: §5a + §4.1 hybrid path on Debian 13 + SB + ZFS efidisk + ext2 /boot.** Doesn't fill `P-TM-1` (which wants `verified_via=shim_mok`, a different code path), but populates a previously-blank cell in the test matrix.
+
+---
+
 ## 6. After swapping VARS
 
 Boot the VM. From the guest:
@@ -211,6 +417,8 @@ cd ~/lamboot-dev
 ```
 
 The script takes the stock Microsoft-enrolled Debian OVMF VARS template and appends LamBoot's cert to the `db` variable. Microsoft keys are preserved.
+
+If you are scripting around `virt-fw-vars` directly instead of using `build-ovmf-vars.sh`, use `--add-db` for direct LamBoot boot under SB. `--add-mok` alone is not sufficient for direct boot; see §1.1 for why.
 
 **Note on key rotation:** when the LamBoot `db` key rotates (planned 2029), `OVMF_VARS_lamboot.fd` must be regenerated and re-deployed to every Config 4 VM. Plan for a maintenance window or roll out alongside existing update workflows.
 

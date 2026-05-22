@@ -139,6 +139,17 @@ impl LoaderNativePeMode {
             }
         }
     }
+
+    /// Stable string token for trust-log `note` fields. Matches the
+    /// policy.toml literal so audit consumers can grep for the exact
+    /// operator-set value.
+    pub(crate) fn as_log_token(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
 }
 
 impl Default for Policy {

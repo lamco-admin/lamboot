@@ -1,0 +1,61 @@
+name: Distribution packaging request
+description: Request native LamBoot packaging for a distribution channel
+labels: ["type:packaging"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        LamBoot currently ships as a release tarball plus a `lamboot-install`
+        script. Native distribution packages (`.deb`, `.rpm`, AUR, etc.) lower
+        install friction but require ongoing maintenance. Filing a request
+        helps us track demand and find co-maintainers.
+
+  - type: dropdown
+    id: distro
+    attributes:
+      label: Distribution channel
+      options:
+        - "Debian (apt / Debian Salsa)"
+        - "Ubuntu (PPA)"
+        - "Fedora (RPM Fusion / Copr)"
+        - "RHEL / CentOS / Alma / Rocky"
+        - "openSUSE (OBS)"
+        - "Arch (AUR)"
+        - "NixOS (Nixpkgs / flake)"
+        - "Alpine (apkbuild)"
+        - "Gentoo (ebuild)"
+        - Other (please specify in additional)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: maintainer
+    attributes:
+      label: Maintenance commitment
+      description: Distribution packaging needs ongoing care. What's your interest?
+      options:
+        - "I would like to maintain the package (provide GitHub handle in additional)"
+        - "I can co-maintain alongside an upstream maintainer"
+        - "I'm asking for visibility on demand, no maintenance commitment"
+    validations:
+      required: true
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Why now
+      description: What use case or rollout would benefit from this package? Are there blockers that the tarball install path can't address?
+    validations:
+      required: true
+
+  - type: textarea
+    id: signing
+    attributes:
+      label: Signing / Secure Boot considerations
+      description: How does the channel's package signing interact with LamBoot's binary signing? Any policy concerns?
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Existing packaging attempts, related PRs, contact info if you want to co-maintain.

@@ -4,7 +4,89 @@ All notable changes to LamBoot are documented here. Format inspired by Keep a Ch
 
 ## [Unreleased]
 
-(Forward work after v0.9.0.)
+(Forward work after v0.9.1.)
+
+## [0.9.1]
+
+Bugfix-cadence release. Closes the v0.9.1 sprint punch list: a
+packaging regression in v0.9.0, a documentation gap that bit fleet
+operators rolling their own `OVMF_VARS`, a silent-trust-log
+correctness bug on the firmware-LoadImage path, and a Pop!_OS
+autodiscovery audit that closed with "no gap."
+
+### Fixed — packaging: tarball now ships `lib/esp-deploy.sh`
+
+The v0.9.0 release tarball was missing `lib/esp-deploy.sh` —
+`lamboot-install` sources this canonical ESP-layout library at one
+of three paths (`<self-dir>/../lib/esp-deploy.sh`,
+`/usr/lib/lamboot/esp-deploy.sh`, `<self-dir>/lib/esp-deploy.sh`).
+The third path is the tarball case; the file was simply never
+copied into the staging tree, so a fresh extract failed with
+`ERROR: lamboot-install could not source esp-deploy.sh library.`
+and required a manual workaround.
+
+- `package-release.sh` now copies `lib/esp-deploy.sh` into
+  `lamboot-<VERSION>/lib/esp-deploy.sh` in the staging tree, where
+  `lamboot-install`'s third lib-search candidate finds it.
+- `lib/esp-deploy.sh` is now in the `REQUIRED[]` sanity-check
+  array, so a future regression of the same shape (file missing
+  from `lib/`) will fail the package step before producing a
+  tarball.
+
+### Fixed — silent trust log on `[loader].native_pe = "never"`
+
+Operators who set `[loader].native_pe = "never"` — a documented
+v0.8.3-rollback knob — got a trust log that went silent after
+`boot_attempt`, with no record of the firmware-LoadImage path
+being taken. Two issues compounded:
+
+1. The `image_loaded_firmware` event was emitted but **never
+   flushed** to `\loader\boot-trust.log` before transferring
+   control. The kernel ExitBootServices reclaimed the in-memory
+   log, so audit consumers saw nothing.
+2. There was no event marking the *routing decision* — only the
+   post-load success.
+
+`firmware_load_and_start` now:
+- Records a new `legacy_loadimage_used` event before the
+  LoadImage call, with `note=size=<N> policy=<auto|always|never>`
+  capturing why the firmware path was taken.
+- Calls `trust_log.flush(esp)` before `start_image`, mirroring the
+  native path's existing flush at boot.rs ~617. Events on this path
+  now persist to disk.
+
+The new event uses `verified_via=firmware_loadimage` (existing
+stable token); adding the `legacy_loadimage_used` event name is
+semver-additive per the trust-log schema vocabulary in
+`SECURITY-MODEL.md`.
+
+### Documented — `--add-mok` vs `--add-db` distinction in `OVMF-VARS-PROXMOX.md`
+
+Operators rolling their own `OVMF_VARS` with `virt-fw-vars` (rather
+than the pre-built `OVMF_VARS_lamboot.fd`) sometimes used
+`--add-mok` alone, expecting that to make LamBoot directly
+bootable under SB. It does not — MOK is consulted by shim, not by
+firmware. With the cert in MOK only, firmware rejects LamBoot's
+binary and falls back to whatever other Boot#### entry exists
+(typically the distro's shim), with `BootCurrent` no longer
+matching LamBoot. Direct boot under SB requires the cert in
+firmware `db` (`virt-fw-vars --add-db`).
+
+`docs/OVMF-VARS-PROXMOX.md` now has a §1.1 "Common pitfall" callout
+making the distinction explicit, plus a back-reference from §7
+where `virt-fw-vars` is actually used.
+
+### Audit — Pop!_OS auto-discovery: no gap in `autodiscovery.rs`
+
+`POPOS-AUTO-DISCOVERY-FINDINGS-2026-04-25` §1 flagged
+`autodiscovery.rs` as a separate audit target alongside the new
+`discover_systemd_boot_dir_style` scanner shipped in v0.9.0.
+End-to-end audit closed with no code change: `find_initrd()` is
+called only from `bls.rs:171` (BLS Type 1 entries). The
+`<distro>-<root-uuid>/vmlinuz.efi` layout that Pop!_OS uses is
+handled entirely by `discover_systemd_boot_dir_style` in
+`discovery.rs`, which constructs `initrd_paths` from the sibling
+`initrd.img` file directly and never traverses `autodiscovery.rs`.
 
 ## [0.9.0]
 

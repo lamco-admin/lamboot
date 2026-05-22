@@ -149,9 +149,15 @@ fn boot_uki(
             trust_log,
             esp,
         ),
-        LoadPath::Firmware => {
-            firmware_load_and_start(current_image, &image_data, options, trust_log, path)
-        }
+        LoadPath::Firmware => firmware_load_and_start(
+            current_image,
+            &image_data,
+            options,
+            policy.loader_native_pe,
+            trust_log,
+            path,
+            esp,
+        ),
     }
 }
 
@@ -318,8 +324,10 @@ fn boot_linux(
             current_image,
             &kernel_bytes,
             options,
+            policy.loader_native_pe,
             trust_log,
             kernel_path,
+            esp,
         ),
     }
     // _initrd_handle drops here if we got back (normally we don't —
@@ -630,17 +638,42 @@ fn native_load_and_start(
 
 /// Firmware load path: the v0.8.3 load_image + start_image sequence,
 /// preserved verbatim so operators have a one-flag rollback path.
-/// Emits image_loaded_firmware trust event.
+///
+/// Emits two trust events:
+/// - `legacy_loadimage_used` before the LoadImage call — records that the
+///   firmware path was taken (and why), so an operator running with
+///   `[loader].native_pe = "never"` still sees an audit entry instead of
+///   silence. Without this, the trust log went dead after `boot_attempt`
+///   on the Never path because the verify/load events live only on the
+///   native path. (v0.9.1 sprint finding §7.P3.)
+/// - `image_loaded_firmware` after a successful load — same as before.
+///
+/// The trust log is flushed BEFORE `start_image` so events persist when
+/// the kernel ExitBootServices-es. Without this flush, the events above
+/// were lost in memory and never reached `\loader\boot-trust.log`.
 fn firmware_load_and_start(
     current_image: Handle,
     bytes: &[u8],
     options: &str,
+    mode: LoaderNativePeMode,
     trust_log: &mut TrustLog,
     path_for_log: &str,
+    esp_for_flush: &mut Volume,
 ) -> Result<Status> {
     log::info!(
         "Firmware image load: {path_for_log} ({} bytes via BS->LoadImage)",
         bytes.len()
+    );
+
+    trust_log.record(
+        TrustEvent::new("legacy_loadimage_used")
+            .with_path(path_for_log)
+            .with_verified_via(V_FIRMWARE_LOADIMAGE)
+            .with_note(&alloc::format!(
+                "size={} policy={}",
+                bytes.len(),
+                mode.as_log_token(),
+            )),
     );
 
     let image_handle = load_efi_image_from_buffer(current_image, bytes, Some(path_for_log))?;
@@ -655,6 +688,10 @@ fn firmware_load_and_start(
             .with_verified_via(V_FIRMWARE_LOADIMAGE)
             .with_status(Status::SUCCESS),
     );
+
+    // Mirror the native path's flush (line ~617). Trust events emitted
+    // here would otherwise vanish when the kernel ExitBootServices-es.
+    trust_log.flush(esp_for_flush);
 
     reconnect_console_drivers();
     uefi::boot::start_image(image_handle)?;

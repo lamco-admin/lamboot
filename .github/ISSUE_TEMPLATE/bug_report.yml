@@ -1,0 +1,121 @@
+name: Bug report
+description: Report a bug or unexpected behavior in LamBoot
+labels: ["type:bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. The fields below are designed
+        to capture the data that bootloader bugs almost always need: which
+        version, which distro, which filesystem, which Secure Boot state. Trust
+        log excerpts and reproducer steps are especially helpful.
+
+        For security-sensitive issues, please use the path in SECURITY.md
+        instead of filing a public issue.
+
+  - type: input
+    id: lamboot_version
+    attributes:
+      label: LamBoot version
+      description: From `lamboot_version` field in `/boot/efi/EFI/LamBoot/reports/boot.json`, or the release tarball you installed (e.g. `lamboot-0.9.0-x86_64.tar.gz`).
+      placeholder: "e.g. 0.9.0"
+    validations:
+      required: true
+
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution and version
+      placeholder: "e.g. Debian 13 (trixie), Fedora 43, Arch rolling"
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel version
+      placeholder: "e.g. 6.12.88+deb13-amd64"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: boot_fs
+    attributes:
+      label: /boot filesystem
+      options:
+        - ext4
+        - ext3
+        - ext2
+        - btrfs
+        - xfs
+        - f2fs
+        - "fat (ESP)"
+        - other (please describe in repro)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: sb_state
+    attributes:
+      label: Secure Boot state
+      options:
+        - Disabled
+        - "Enabled, pre-enrolled MS keys, shim chain"
+        - "Enabled, MOK-enrolled LamBoot cert"
+        - "Enabled, LamBoot cert in firmware db"
+        - Other (please describe in repro)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: hardware
+    attributes:
+      label: Hardware type
+      options:
+        - "VM (QEMU/KVM)"
+        - "VM (VMware)"
+        - "VM (VirtualBox)"
+        - "VM (Hyper-V)"
+        - "Bare metal"
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Reproduction steps
+      description: Step-by-step instructions to reproduce the bug.
+      placeholder: |
+        1. Install LamBoot v0.9.0 via `lamboot-install --signed`
+        2. Reboot, select LamBoot from UEFI boot menu
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: trust_log
+    attributes:
+      label: Trust log excerpt
+      description: Contents of `/boot/efi/EFI/LamBoot/reports/boot.json` and any relevant `boot.log` or `audit.log` entries.
+      render: json
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Anything else that might be relevant — efibootmgr output, dmesg, system journal, etc.

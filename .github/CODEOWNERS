@@ -1,0 +1,25 @@
+# CODEOWNERS — review routing for the lamboot repository.
+# See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# Lines later in this file take precedence over earlier ones.
+# When a PR is opened, GitHub requests review from the owners of any
+# touched files.
+
+# Default — anything not matched below.
+*                       @glamberson
+
+# Trust log, secure-boot, signing — primary owner reviews all of these.
+/lamboot-core/src/secure.rs      @glamberson
+/lamboot-core/src/policy.rs      @glamberson
+/lamboot-core/src/trust_log*.rs  @glamberson
+/lamboot-core/src/pe_loader*.rs  @glamberson
+/keys/                           @glamberson
+
+# Install script and ESP deployment.
+/tools/lamboot-install           @glamberson
+/lib/esp-deploy.sh               @glamberson
+
+# Documentation and contributor experience.
+/CONTRIBUTING.md                 @glamberson
+/SECURITY.md                     @glamberson
+/.github/                        @glamberson

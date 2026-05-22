@@ -10,10 +10,16 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.9.0"
-authors = ["LamBoot Contributors"]
+version = "0.9.1"
+authors = ["Greg Lamberson <greg@lamco.io>", "Lamco Development <office@lamco.io>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
+description = "Memory-safe UEFI bootloader for Linux, written in Rust. Native PE loader, native ext4 read backend, BLS multi-FS discovery, structured trust-evidence log."
+repository = "https://github.com/lamco-admin/lamboot"
+homepage = "https://lamco.ai/products/lamboot/"
+readme = "README.md"
+keywords = ["uefi", "bootloader", "secure-boot", "linux", "rust"]
+categories = ["embedded", "no-std", "os::linux-apis"]
 
 [workspace.dependencies]
 uefi = { version = "0.37", features = ["alloc", "global_allocator", "logger", "panic_handler"] }

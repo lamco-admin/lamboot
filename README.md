@@ -10,7 +10,7 @@ LamBoot is a UEFI bootloader for Linux targeting hypervisor-managed VM environme
 
 **v0.9.0 lands the native trust chain.** Native read-only ext4 reader, native PE loader, BLS multi-filesystem discovery, and legacy UEFI FS driver deprecation — the kernel-load path no longer touches `BS->LoadImage` or external filesystem drivers, so the shim 15.8 `ShimLock`-uninstall failure mode that blocked stock `/boot` on ext4 under Secure Boot is structurally unreachable. Pop!_OS / systemd-boot-discoverable-EFI auto-discovery is first-class. v0.8.4 (April 2026) shipped the coordinated Proxmox-toolkit integration this builds on. See the [roadmap](docs/ROADMAP.md).
 
-- **Current version:** 0.9.0 (April 2026)
+- **Current version:** 0.9.1 (April 2026)
 - **Binary size:** 215 KB (x86_64 unsigned), 217 KB (signed)
 - **Platforms:** x86_64 UEFI, aarch64 UEFI
 - **License:** MIT OR Apache-2.0
@@ -75,7 +75,7 @@ LamBoot is a UEFI bootloader for Linux targeting hypervisor-managed VM environme
 ### Homelab (Secure Boot off)
 
 ```bash
-tar xzf lamboot-0.9.0-x86_64.tar.gz && cd lamboot-0.9.0
+tar xzf lamboot-0.9.1-x86_64.tar.gz && cd lamboot-0.9.1
 sudo ./lamboot-install
 # Reboot → pick "LamBoot" from firmware boot menu
 ```
@@ -91,7 +91,7 @@ sudo ./lamboot-install --signed
 
 ```bash
 # On host
-cp lamboot-0.9.0/OVMF_VARS_lamboot.fd /var/lib/vz/images/100/OVMF_VARS_100.fd
+cp lamboot-0.9.1/OVMF_VARS_lamboot.fd /var/lib/vz/images/100/OVMF_VARS_100.fd
 # In VM
 sudo ./lamboot-install --signed --no-mok
 ```

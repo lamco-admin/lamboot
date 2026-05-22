@@ -115,7 +115,7 @@ Every signed LamBoot binary includes a `.sbat` PE section:
 
 ```csv
 sbat,1,SBAT Version,sbat,1,https://github.com/rhboot/shim/blob/main/SBAT.md
-lamboot,1,Lamco Development,LamBoot,0.2.0,https://github.com/lamco-admin/lamboot-dev
+lamboot,1,Lamco Development,lamboot,0.9.1,https://github.com/lamco-admin/lamboot
 ```
 
 When a security vulnerability is found and fixed:

@@ -117,6 +117,37 @@ Should show our cert subject. If absent, repeat step 3 — sometimes the reboot 
 
 **Recovery:** see §7.
 
+### 4.1 Optimization: pre-enroll LamBoot cert in firmware `db` to skip MokManager
+
+If you control the firmware NVRAM ahead of time (Proxmox host operator, libvirt fleet admin, etc.), you can put LamBoot's signing cert in **firmware `db`** before running `lamboot-install --signed` from inside the guest. The install still chooses the Config 3 shim-chain layout (because shim is present in the distro), but the **first-boot MokManager pause is avoided entirely**:
+
+```
+firmware db  ──trusts──→  Microsoft UEFI CA   (already there)
+firmware db  ──trusts──→  LamBoot signing cert (you pre-enrolled it)
+Microsoft CA ──signed──→  distro shim (shimx64.efi)
+shim         ──checks db first, then MOK──→  LamBoot's grubx64.efi
+              ↑ finds LamBoot cert in db; accepts; never falls through to MOK
+LamBoot cert ──signed──→  grubx64.efi (= lambootx64-signed.efi renamed)
+```
+
+Mechanics: shim's verification order is firmware `db` first, MOK second, hash list third. Because LamBoot's cert is now in `db`, shim's first check succeeds — it never queries MOK, so there's nothing for MokManager to prompt the user about.
+
+**On evidence:** the v0.9.0 release binary writes a *summary*-format `boot.json` to `/boot/efi/EFI/LamBoot/reports/` that records the selected entry and timing but does **not** include a `verified_via` field. The cross-distro test results documented `verified_via=shim_mok`-style events from a richer trust-log path that runs only when SDS-3's native PE loader is exercised (entry_type `native_pe`). When the BLS entry resolves to firmware `LoadImage` instead (entry_type `linux_legacy`, observed on Debian 13/ext2 in §`OVMF-VARS-PROXMOX.md` §5a.5), no `verified_via` is emitted by LamBoot — verification still happens, but in shim itself (where LamBoot can't observe it).
+
+Practical observability for this path is therefore indirect:
+- **Boot succeeds** — shim accepted LamBoot's `grubx64.efi`, which only happens if the cert is in db or MOK; combined with our pve1 step having only touched db (not MOK), boot success is the trust-path proof.
+- **`BootCurrent`** post-boot should match LamBoot's `Boot####`; if it dropped to the distro shim entry, db trust failed and firmware fell through to the next BootOrder entry.
+
+For richer trust evidence, configure `policy.toml` to force native PE loader on this kernel and re-test (caveat: native PE loader requires LamBoot's own backend to read `/boot`, which currently means ext4-via-ext4-view; ext2 and other filesystems fall back to legacy LoadImage).
+
+**When this helps:** fleet deployment, headless installs, scripted bring-up — anywhere a console-keyboard MokManager confirmation is inconvenient.
+
+**When it doesn't apply:** bare-metal installs on hardware you don't have firmware-key-management access to. Stick with §4's standard MOK enrollment in that case.
+
+**How to pre-enroll:** see `docs/OVMF-VARS-PROXMOX.md` §5 (fleet template approach) or §5a (in-place modification of an existing VM's firmware NVRAM). The cert needs to land in `db`, not `MOK` — see `OVMF-VARS-PROXMOX.md §1.1` for why `--add-mok` alone fails.
+
+This optimization composes with Config 3, doesn't replace it. Skipping MokManager is purely a UX improvement; the trust path still flows through shim.
+
 ---
 
 ## 5. Config 2 — Firmware db enrollment (advanced, owner-controlled hardware)

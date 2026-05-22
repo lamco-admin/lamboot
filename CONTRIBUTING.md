@@ -113,6 +113,25 @@ refactor: extract BLS parser to separate crate
 - Touch screen input
 - NVMe diagnostic module implementation
 
+## Issue Lifecycle
+
+LamBoot follows a release-anchored issue lifecycle:
+
+- **Open**: an issue stays open while the work it describes is incomplete or unshipped to users.
+- **Closed on release, not on commit**: a fix landing in `main` does not close its issue. The issue closes when a release that contains the fix is published. This keeps the issue tracker honest about what users actually have access to.
+
+If you're a contributor sending a PR, you do not need to close the linked issue. Reference it with `Refs #N` (rather than `Closes #N`) and let the maintainers close it as part of a release cycle. Using `Closes #N` is fine if the change ships imminently; just be aware the maintainers may reopen it briefly if the release is delayed.
+
+## Labels
+
+The repository uses three orthogonal label axes:
+
+- **`type:*`** — what kind of issue (`bug`, `enhancement`, `documentation`, `question`, `tracking`, `packaging`, `security`). Pick one.
+- **`area:*`** — what part of the project (`boot`, `trust-log`, `filesystem`, `install`, `policy`, `modules`, `proxmox`, `testing`). Pick zero or more.
+- **`distro:*`** — which distribution is affected, when distro-specific (`debian`, `ubuntu`, `fedora`, `arch`, `opensuse`, `nixos`). Pick zero or more.
+
+Priority is tracked via milestones, not labels. If an issue is slated for a release, it gets that milestone.
+
 ## License
 
 Contributions are dual-licensed under MIT/Apache-2.0.
