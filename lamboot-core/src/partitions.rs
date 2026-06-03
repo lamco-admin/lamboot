@@ -1,3 +1,5 @@
+//! Layer: 4 — Policy & State.
+//!
 //! Discoverable partition scanning via UEFI PartitionInfo protocol.
 //!
 //! Implements UAPI.2 Discoverable Partitions Specification:
@@ -17,7 +19,7 @@ use uefi::{
 };
 
 use crate::{
-    discovery::EntryKind,
+    boot_types::EntryKind,
     fs::{partition_guid_for, Volume, VolumeIdentity},
     fs_backend::FsBackend as _,
     fs_backend_fat::FatBackend,
@@ -152,7 +154,7 @@ pub(crate) fn format_partuuid(guid: &Guid) -> String {
 
 /// Append root=PARTUUID=... to Linux entries that lack a root= parameter.
 pub(crate) fn auto_append_root(
-    entries: &mut [crate::discovery::BootEntry],
+    entries: &mut [crate::boot_types::BootEntry],
     partitions: &[DiscoveredPartition],
 ) {
     // Find the first root partition
@@ -179,35 +181,83 @@ pub(crate) fn auto_append_root(
     }
 }
 
-/// Try to mount the XBOOTLDR partition as a `Volume` backed by the FAT
-/// adapter. Returns `None` if no XBOOTLDR partition exists, the handle is
-/// inaccessible, or the filesystem is not FAT (ext4 XBOOTLDR support lands
-/// with SDS-2). The XBOOTLDR partition may contain BLS entries and kernels.
+/// Try to mount the XBOOTLDR partition as a `Volume`. Returns `None` if no
+/// XBOOTLDR partition exists or it can be read by neither the firmware nor the
+/// native FAT reader. The XBOOTLDR partition may contain BLS entries and
+/// kernels.
+///
+/// Two-tier read path:
+///   1. **Firmware `SimpleFileSystem`** (primary) — but only if `open_volume()`
+///      actually succeeds. Some OVMF/i440FX configs expose an SFS handle for a
+///      secondary FAT partition yet return `EFI_UNSUPPORTED` from
+///      `open_volume()` (root cause: memory obs `4d6f6a9a`); that handle yields
+///      a dead `FatBackend`, so we must probe before trusting it.
+///   2. **Native `FatRo`** (fallback) — reads the FAT bytes directly over
+///      BlockIO when the firmware refuses. Closes LamBoot's last firmware
+///      dependency in the `/boot`-read path. See `fs_backend_fat_ro`.
 pub(crate) fn mount_xbootldr(partitions: &[DiscoveredPartition]) -> Option<Volume> {
     let xbootldr = partitions
         .iter()
         .find(|p| p.partition_type == PartType::Xbootldr)?;
 
-    // Open SimpleFileSystem eagerly so we fail fast on non-FAT / missing driver.
-    if uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(xbootldr.handle).is_err() {
-        log::warn!("XBOOTLDR partition found but SimpleFileSystem is unavailable");
-        return None;
+    // Tier 1: firmware FAT, only if it can actually open the volume.
+    if firmware_fat_readable(xbootldr.handle) {
+        if let Ok(backend) = FatBackend::new(xbootldr.handle) {
+            let identity = VolumeIdentity {
+                partition_guid: partition_guid_for(xbootldr.handle).or(Some(xbootldr.unique_guid)),
+                fs_uuid: backend.uuid(),
+                label: backend.label().map(alloc::string::ToString::to_string),
+                // XBOOTLDR is always numbered after the ESP (which is index 0).
+                // Subsequent extra FAT volumes from `enumerate_volumes()` use
+                // higher indices; a minor overlap is acceptable because the
+                // index is only used for display.
+                index: u32::MAX,
+                backend_tag: FatBackend::TAG,
+            };
+            log::info!(
+                "Mounted XBOOTLDR partition (firmware FAT) {}",
+                identity.describe()
+            );
+            return Some(Volume::from_fat(identity, backend));
+        }
     }
 
-    let backend = FatBackend::new(xbootldr.handle).ok()?;
-    let identity = VolumeIdentity {
-        partition_guid: partition_guid_for(xbootldr.handle).or(Some(xbootldr.unique_guid)),
-        fs_uuid: backend.uuid(),
-        label: backend.label().map(alloc::string::ToString::to_string),
-        // XBOOTLDR is always numbered after the ESP (which is index 0).
-        // Subsequent extra FAT volumes from `enumerate_volumes()` use higher
-        // indices; a minor overlap is acceptable because the index is only
-        // used for display.
-        index: u32::MAX,
-        backend_tag: FatBackend::TAG,
+    // Tier 2: native read-only FAT over BlockIO.
+    match crate::fs_backend_fat_ro::FatRoBackend::open(xbootldr.handle) {
+        Ok(backend) => {
+            let identity = VolumeIdentity {
+                partition_guid: partition_guid_for(xbootldr.handle).or(Some(xbootldr.unique_guid)),
+                fs_uuid: backend.uuid(),
+                label: backend.label().map(alloc::string::ToString::to_string),
+                index: u32::MAX,
+                backend_tag: crate::fs_backend_fat_ro::FAT_RO_BACKEND_TAG,
+            };
+            log::info!(
+                "Mounted XBOOTLDR partition (native FatRo) {}",
+                identity.describe()
+            );
+            Some(Volume::from_backend(
+                identity,
+                alloc::boxed::Box::new(backend),
+            ))
+        }
+        Err(e) => {
+            log::warn!("XBOOTLDR: firmware refused and FatRo failed: {e}");
+            None
+        }
+    }
+}
+
+/// Probe whether the firmware's `SimpleFileSystem` can actually serve this
+/// handle. A present SFS handle is not sufficient — `open_volume()` can still
+/// return `EFI_UNSUPPORTED` for a secondary FAT partition on some firmware.
+/// The exclusive open is released before returning so the subsequent
+/// `FatBackend::new` (or `FatRo` fallback) can re-open cleanly.
+fn firmware_fat_readable(handle: uefi::Handle) -> bool {
+    let Ok(mut sfs) = uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(handle) else {
+        return false;
     };
-    log::info!("Mounted XBOOTLDR partition {}", identity.describe());
-    Some(Volume::from_fat(identity, backend))
+    sfs.open_volume().is_ok()
 }
 
 // ============================================================================
@@ -365,6 +415,138 @@ pub(crate) fn probe_superblock(handle: uefi::Handle) -> Option<FsInfo> {
     }
 
     None
+}
+
+/// Enumerate raw block-IO handles that represent partitions (not whole
+/// disks, not the ESP), regardless of whether the firmware installed
+/// `PartitionInfo` on them.
+///
+/// `scan_discoverable_partitions` (above) relies on the `PartitionInfo`
+/// protocol, which most firmware installs on every partition handle but
+/// not all. Observed empty-set in the wild on ASUS G10AJ (pve2):
+/// firmware exposes `BlockIO` for every partition but `PartitionInfo`
+/// for only the ESP, so the GPT-based enumerator returns 0 candidates.
+/// This fallback finds those partitions by walking the `BlockIO`
+/// protocol space directly and filtering to logical partitions only.
+///
+/// Used by the LVM-probe loop in main.rs so LVM detection works on
+/// firmware that lacks the PartitionInfo install. Currently NOT
+/// promoted to the ext4/btrfs loops — those still use the GPT-typed
+/// path because they want the GPT GUID for partition-uuid lookups
+/// and for the EFI-fallback path. The LVM probe doesn't need either.
+pub(crate) fn scan_block_io_partitions_for_lvm() -> Vec<uefi::Handle> {
+    use uefi::boot::{OpenProtocolAttributes, OpenProtocolParams};
+
+    let mut out = Vec::new();
+    let Ok(handles) = uefi::boot::find_handles::<BlockIO>() else {
+        return out;
+    };
+
+    // CRITICAL: must NOT use open_protocol_exclusive::<BlockIO> here.
+    // BlockIO is held BY_DRIVER by the firmware's filesystem drivers
+    // (the SFS driver opens its parent BlockIO BY_DRIVER); an
+    // exclusive open of BlockIO on those handles cascades a
+    // disconnect of the BY_DRIVER agent, killing the in-flight ESP
+    // mount mid-boot. Observed on pve2 (ASUS G10AJ firmware):
+    // disconnects produced an empty boot menu with no recovery.
+    //
+    // The non-disturbing alternative is `open_protocol` with
+    // `OpenProtocolAttributes::GetProtocol` (UEFI value 0x02), which
+    // grants short-term shared access without affecting other
+    // holders.
+    let image_handle = uefi::boot::image_handle();
+    for handle in handles {
+        let params = OpenProtocolParams {
+            handle,
+            agent: image_handle,
+            controller: None,
+        };
+        // SAFETY: GetProtocol mode is non-exclusive and does not
+        // invalidate other agents. The ScopedProtocol is dropped
+        // before the loop iteration ends so the protocol close is
+        // synchronous; firmware handles + protocol references remain
+        // valid for the lifetime of the open. We never store the
+        // pointer past the drop.
+        let scoped = unsafe {
+            uefi::boot::open_protocol::<BlockIO>(params, OpenProtocolAttributes::GetProtocol)
+        };
+        let Ok(block_io) = scoped else {
+            continue;
+        };
+        let media = block_io.media();
+        // Whole disks have `logical_partition = false`; partitions
+        // have it true. Skip whole disks — we don't want to probe a
+        // disk's MBR area for LABELONE (LABELONE is at byte 512 of a
+        // PV, and whole disks have MBR there).
+        if !media.is_logical_partition() {
+            continue;
+        }
+        // Probe the LABELONE signature WHILE we still hold the
+        // GetProtocol handle — saves a second open. Same logic as
+        // probe_lvm_pv but inlined here so we don't have to
+        // round-trip through another open.
+        let media_id = media.media_id();
+        let block_size = u64::from(media.block_size());
+        if block_size == 0 {
+            continue;
+        }
+        let lba = 512u64 / block_size;
+        let sectors = 1024usize.div_ceil(block_size as usize);
+        let mut buf = alloc::vec![0u8; sectors * block_size as usize];
+        if block_io.read_blocks(media_id, lba, &mut buf).is_err() {
+            continue;
+        }
+        let offset = 512usize % block_size as usize;
+        if offset + 8 > buf.len() {
+            continue;
+        }
+        if &buf[offset..offset + 8] == b"LABELONE" {
+            // Found one. Drop the GetProtocol handle (synchronous)
+            // before returning so the caller can subsequently
+            // open_protocol_exclusive::<BlockIO> on this same handle
+            // — safe because (a) no fs driver was ever attached to a
+            // raw LVM partition (no LVM-aware FS driver in firmware),
+            // and (b) our GetProtocol slot is released here.
+            drop(block_io);
+            out.push(handle);
+        }
+    }
+    out
+}
+
+/// Probe a partition for an LVM2 Physical Volume label. LVM2 places the
+/// 8-byte ASCII signature `LABELONE` at the start of sector 1 (byte
+/// offset 512) of a PV. This is a cheap O(1-block-read) check that runs
+/// alongside the filesystem-superblock probe.
+///
+/// Returns `true` if the signature is present. Does NOT parse the rest
+/// of the PV header / VG metadata — that work happens in
+/// `fs_backend_lvm::LvmExt4Backend::open` only when a caller commits to
+/// mounting LVs from this partition.
+pub(crate) fn probe_lvm_pv(handle: uefi::Handle) -> bool {
+    let Ok(block_io) = uefi::boot::open_protocol_exclusive::<BlockIO>(handle) else {
+        return false;
+    };
+    let media = block_io.media();
+    let media_id = media.media_id();
+    let block_size = media.block_size() as usize;
+    if block_size == 0 {
+        return false;
+    }
+    // Sector 1 contains the label header. With the smallest practical
+    // block_size (512) we need LBA 1; with larger block sizes the label
+    // is still at byte 512 within LBA 0.
+    let lba = 512u64 / block_size as u64;
+    let sectors = 1024usize.div_ceil(block_size);
+    let mut buf = alloc::vec![0u8; sectors * block_size];
+    if block_io.read_blocks(media_id, lba, &mut buf).is_err() {
+        return false;
+    }
+    let offset = 512usize % block_size;
+    if offset + 8 > buf.len() {
+        return false;
+    }
+    &buf[offset..offset + 8] == b"LABELONE"
 }
 
 /// Parse an ext4 superblock from a byte slice starting at the superblock

@@ -1,3 +1,5 @@
+//! Layer: 4 — Policy & State.
+//!
 //! EFI filesystem driver loading.
 //!
 //! Loads .efi driver binaries from `\EFI\LamBoot\drivers\` on the ESP,
@@ -29,8 +31,8 @@ const DRIVERS_DIR: &str = "/EFI/LamBoot/drivers";
 ///
 /// Post-SDS-2, `Ext4Backend` is unconditionally compiled in, so ext4
 /// and ext2 drivers are always natively covered. Post-SDS-1, FAT is
-/// UEFI-native (no third-party driver ever needed). When v1.1+ adds
-/// a compile-time-gated Btrfs backend, this match gets a `#[cfg]` arm.
+/// UEFI-native (no third-party driver ever needed). Path A added
+/// `BtrfsBackend` via lambutter so btrfs is now natively covered too.
 ///
 /// Filename matching is case-insensitive and tolerates both the
 /// `_x64.efi` (x86_64) and `_aa64.efi` (aarch64) suffixes.
@@ -40,12 +42,16 @@ fn filesystem_natively_covered(driver_filename: &str) -> bool {
     if lower.starts_with("ext4_") || lower.starts_with("ext2_") || lower.starts_with("ext3_") {
         return true;
     }
+    // Path A: lambutter covers btrfs.
+    if lower.starts_with("btrfs_") {
+        return true;
+    }
     // FAT is always UEFI-native; no driver needed (no fat_x64.efi ships
     // in our tarball today, but guard anyway).
     if lower.starts_with("fat_") || lower.starts_with("vfat_") {
         return true;
     }
-    // btrfs/xfs/zfs/ntfs/f2fs/iso9660 — no native backend in v0.9.x.
+    // xfs/zfs/ntfs/f2fs/iso9660 — no native backend yet.
     false
 }
 

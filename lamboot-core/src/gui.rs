@@ -1,3 +1,5 @@
+//! Layer: 6 — Presentation.
+
 use alloc::{format, string::String, vec, vec::Vec};
 use core::time::Duration;
 
@@ -7,7 +9,7 @@ use uefi::{
 };
 
 use crate::{
-    discovery::{BootEntry, EntryKind, Icon},
+    boot_types::{BootEntry, EntryKind, Icon},
     health,
     input::{InputEvent, InputManager, Key},
     policy::Policy,
@@ -235,7 +237,7 @@ impl Framebuffer {
 // ─── System info passed from main ──────────────────────────────────
 
 /// System information displayed in the GUI header
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct SystemInfoDisplay {
     pub vmid: Option<String>,
     pub hypervisor: Option<String>,
@@ -267,6 +269,11 @@ pub(crate) struct GuiContext {
     input: InputManager,
     fb: Framebuffer,
     sys_info: SystemInfoDisplay,
+    /// v0.10 Bug 22 / Option I: when `Some`, the menu draws this
+    /// notice on a dedicated footer line so the operator sees the
+    /// cohort-split anomaly + the policy.toml escape hatch hint
+    /// without having to read the trust log.
+    cohort_notice: Option<String>,
 }
 
 impl GuiContext {
@@ -291,11 +298,16 @@ impl GuiContext {
             input,
             fb,
             sys_info: SystemInfoDisplay::default(),
+            cohort_notice: None,
         })
     }
 
     pub(crate) fn set_system_info(&mut self, info: SystemInfoDisplay) {
         self.sys_info = info;
+    }
+
+    pub(crate) fn set_cohort_notice(&mut self, notice: Option<&str>) {
+        self.cohort_notice = notice.map(String::from);
     }
 
     // ─── Layout helpers ─────────────────────────────────────────
@@ -355,26 +367,47 @@ impl GuiContext {
         let mut timed_out = false;
         let mut user_interacted = false;
         let mut elapsed_frames = 0u32;
+        // Dirty-rect gating: a static menu does not need ~60 full-frame
+        // composites + 8 MB BufferToVideo blits per second. Redraw only when
+        // something visible changed — a selection/cursor move, a key/click, or
+        // the auto-boot countdown second ticking. `dirty` starts true so the
+        // first frame always paints; the countdown is gated on the displayed
+        // whole-second value so the footer stays accurate without per-frame work.
+        let mut dirty = true;
+        let mut last_drawn_second: Option<u32> = None;
 
         loop {
-            self.fb.clear();
-            self.draw_header();
+            let countdown_second = if !user_interacted && timeout_ms > 0 {
+                Some((timeout_ms.saturating_sub(elapsed_frames * 16)) / 1000)
+            } else {
+                None
+            };
+            if countdown_second != last_drawn_second {
+                dirty = true;
+            }
 
-            self.draw_left_column(entries, &boot_entries);
-            self.draw_right_column(entries, &tool_entries);
+            if dirty {
+                self.fb.clear();
+                self.draw_header();
 
-            // Footer
-            self.draw_footer(
-                entries,
-                &boot_entries,
-                &tool_entries,
-                timeout_ms,
-                elapsed_frames,
-                user_interacted,
-            );
+                self.draw_left_column(entries, &boot_entries);
+                self.draw_right_column(entries, &tool_entries);
 
-            self.draw_cursor(self.mouse_x, self.mouse_y);
-            self.fb.present(&mut gop);
+                // Footer
+                self.draw_footer(
+                    entries,
+                    &boot_entries,
+                    &tool_entries,
+                    timeout_ms,
+                    elapsed_frames,
+                    user_interacted,
+                );
+
+                self.draw_cursor(self.mouse_x, self.mouse_y);
+                self.fb.present(&mut gop);
+                last_drawn_second = countdown_second;
+                dirty = false;
+            }
 
             // Auto-boot timeout
             if !user_interacted && timeout_ms > 0 {
@@ -385,16 +418,12 @@ impl GuiContext {
             }
 
             if timed_out && !user_interacted && has_bootable {
-                // Find default entry or use first boot entry
-                let boot_idx = if let Some(ref default_id) = policy.default_entry {
-                    boot_entries
-                        .iter()
-                        .position(|&i| entries[i].id == *default_id)
-                        .unwrap_or(0)
-                } else {
-                    0
-                };
-                let entry_idx = boot_entries[boot_idx];
+                // v0.10 Bug 22 / Option E: select_default_entry honors
+                // policy.default_pattern (glob) > policy.default_entry
+                // (exact id) > caller fallback (first boot-eligible
+                // entry by sort order).
+                let entry_idx = crate::policy::select_default_entry(entries, &boot_entries, policy)
+                    .unwrap_or(boot_entries[0]);
                 self.draw_boot_progress(&entries[entry_idx].name, &mut gop);
                 return Ok(entries[entry_idx].clone());
             }
@@ -404,6 +433,9 @@ impl GuiContext {
             match event {
                 InputEvent::KeyPress(key) => {
                     user_interacted = true;
+                    // Any key may move the selection or open a sub-screen; the
+                    // visible state changed, so repaint next iteration.
+                    dirty = true;
                     match key {
                         Key::Up if self.sel_idx > 0 => {
                             self.sel_idx -= 1;
@@ -461,17 +493,27 @@ impl GuiContext {
                     }
                 }
                 InputEvent::MouseMove { x, y } => {
-                    // Mouse movement alone does NOT cancel auto-boot timer
+                    // Mouse movement alone does NOT cancel auto-boot timer.
+                    // Repaint only if the cursor actually moved or the hover
+                    // changed the selection — a stream of sub-pixel/no-op moves
+                    // no longer forces a full-scene recomposite per event.
+                    if x != self.mouse_x || y != self.mouse_y {
+                        dirty = true;
+                    }
                     self.mouse_x = x;
                     self.mouse_y = y;
                     // Update selection based on mouse position
                     if let Some((col, idx)) = self.hit_test(x, y, &boot_entries, &tool_entries) {
+                        if col != self.sel_col || idx != self.sel_idx {
+                            dirty = true;
+                        }
                         self.sel_col = col;
                         self.sel_idx = idx;
                     }
                 }
                 InputEvent::MouseClick { x, y, .. } => {
                     user_interacted = true;
+                    dirty = true;
                     if let Some((col, idx)) = self.hit_test(x, y, &boot_entries, &tool_entries) {
                         self.sel_col = col;
                         self.sel_idx = idx;
@@ -697,9 +739,9 @@ impl GuiContext {
         // Preflight indicator
         if let Some(ref pf) = entry.preflight {
             let (indicator, color) = match pf.status {
-                crate::preflight::PreflightStatus::Ok => ("", TEXT_COLOR),
-                crate::preflight::PreflightStatus::Warning => ("!", WARNING_COLOR),
-                crate::preflight::PreflightStatus::Error => ("X", BltPixel::new(0xf3, 0x8b, 0xa8)),
+                crate::boot_types::PreflightStatus::Ok => ("", TEXT_COLOR),
+                crate::boot_types::PreflightStatus::Warning => ("!", WARNING_COLOR),
+                crate::boot_types::PreflightStatus::Error => ("X", BltPixel::new(0xf3, 0x8b, 0xa8)),
             };
             if !indicator.is_empty() {
                 let ix = (x + w) as i32 - 20;
@@ -837,6 +879,21 @@ impl GuiContext {
         let hx = (self.width - MARGIN) as i32 - (hints.len() as i32 * FONT_SMALL_W as i32);
         self.fb
             .draw_text(hints, hx, footer_y as i32 + 10, SUBTITLE_COLOR, Font::Small);
+
+        // v0.10 Bug 22 / Option I: cohort-split notice on a second
+        // footer line beneath the status + hints. Only drawn when
+        // discovery detected the anomaly. The notice already includes
+        // the policy.toml escape hatch hint so a stranded operator
+        // can resolve it without consulting the trust log or docs.
+        if let Some(ref notice) = self.cohort_notice {
+            self.fb.draw_text(
+                notice,
+                MARGIN as i32 + 8,
+                footer_y as i32 + 10 + FONT_SMALL_H as i32 + 2,
+                WARNING_COLOR,
+                Font::Small,
+            );
+        }
     }
 
     fn get_selected_status(

@@ -1,3 +1,5 @@
+//! Layer: 4 — Policy & State.
+//!
 //! Preflight validation engine.
 //!
 //! Validates boot entries before presenting them in the menu.
@@ -9,54 +11,10 @@
 use alloc::{format, string::String, vec::Vec};
 
 use crate::{
-    discovery::{EntryKind, Icon},
+    boot_types::{CheckResult, EntryKind, Icon, PreflightResult, Severity},
     fs::Volume,
     secure::SecureBootState,
 };
-
-/// Aggregate preflight result for a boot entry
-#[derive(Debug, Clone)]
-pub(crate) struct PreflightResult {
-    pub status: PreflightStatus,
-    pub checks: Vec<CheckResult>,
-}
-
-impl PreflightResult {
-    pub(crate) fn from_checks(checks: Vec<CheckResult>) -> Self {
-        let status = if checks.iter().any(|c| c.severity == Severity::Error) {
-            PreflightStatus::Error
-        } else if checks.iter().any(|c| c.severity == Severity::Warning) {
-            PreflightStatus::Warning
-        } else {
-            PreflightStatus::Ok
-        };
-        Self { status, checks }
-    }
-
-    pub(crate) fn first_issue(&self) -> Option<&CheckResult> {
-        self.checks.iter().find(|c| c.severity != Severity::Ok)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum PreflightStatus {
-    Ok,
-    Warning,
-    Error,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct CheckResult {
-    pub severity: Severity,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Severity {
-    Ok,
-    Warning,
-    Error,
-}
 
 fn ok() -> CheckResult {
     CheckResult {
@@ -103,10 +61,19 @@ pub(crate) fn run_preflight(
 
             if passed {
                 // PE check needs to read from whichever volume has the file
+                // AT THE PATH WE ACTUALLY RESOLVED. If the BLS entry omitted
+                // the `\boot\` prefix and the file was found via the
+                // boot-fallback in `exists_with_boot_fallback`, reading the
+                // original (un-prefixed) path on the same volume would fail
+                // with "Cannot read file for PE validation" even though the
+                // file is reachable. Re-resolve the path on the chosen
+                // volume and use the resolved form for the reads. (Bug 21)
                 let vol = find_volume_with_file(esp, extra_volumes, path);
-                checks.push(check_pe_header(vol, path));
+                let resolved = exists_with_boot_fallback(vol, path)
+                    .unwrap_or_else(|| alloc::string::ToString::to_string(path));
+                checks.push(check_pe_header(vol, &resolved));
                 if sb_state != SecureBootState::Disabled {
-                    checks.push(check_secure_boot(vol, path, sb_state));
+                    checks.push(check_secure_boot(vol, &resolved, sb_state));
                 }
             }
         }
@@ -122,9 +89,16 @@ pub(crate) fn run_preflight(
 
             if passed {
                 let vol = find_volume_with_file(esp, extra_volumes, kernel_path);
-                checks.push(check_pe_header(vol, kernel_path));
+                // Re-resolve under the boot-fallback in case the BLS entry
+                // omitted `/boot/` (Debian kernel-install sometimes does
+                // this). Without this, check_pe_header / check_secure_boot
+                // read the original path and emit false "Cannot read file"
+                // warnings on entries that are in fact reachable. (Bug 21)
+                let resolved = exists_with_boot_fallback(vol, kernel_path)
+                    .unwrap_or_else(|| alloc::string::ToString::to_string(kernel_path));
+                checks.push(check_pe_header(vol, &resolved));
                 if sb_state != SecureBootState::Disabled {
-                    checks.push(check_secure_boot(vol, kernel_path, sb_state));
+                    checks.push(check_secure_boot(vol, &resolved, sb_state));
                 }
             }
 
@@ -290,7 +264,7 @@ fn check_secure_boot(vol: &mut Volume, path: &str, sb_state: SecureBootState) ->
         return ok();
     }
 
-    match crate::secure::verify_image(&data) {
+    match crate::secure::verify_image(&data, sb_state) {
         Ok(()) => ok(),
         Err(_) => warning("Not signed for Secure Boot"),
     }

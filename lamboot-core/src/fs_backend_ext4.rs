@@ -1,3 +1,5 @@
+//! Layer: 2 — Storage & Filesystems.
+//!
 //! Native read-only ext4 backend.
 //!
 //! Implements `FsBackend` over the [`ext4-view`] crate (v0.9.3, pinned
@@ -293,7 +295,7 @@ fn ext4_path(path: &Path) -> ext4_view::Path<'_> {
 }
 
 /// Translate `ext4_view::Ext4Error` into `FsError`. Table per SDS-2 §7.
-fn translate_ext4_error(err: Ext4Error) -> FsError {
+pub(crate) fn translate_ext4_error(err: Ext4Error) -> FsError {
     match err {
         Ext4Error::NotFound => FsError::NotFound,
         Ext4Error::NotADirectory => FsError::NotDirectory,

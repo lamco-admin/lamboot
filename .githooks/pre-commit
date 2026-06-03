@@ -17,4 +17,16 @@ cargo clippy
 echo "pre-commit: checking x86_64 build..."
 cargo check --target x86_64-unknown-uefi
 
+echo "pre-commit: checking layer contract..."
+python3 tools/check-layers.py
+
+# Installer dual-contract unit tests. Skipped (not failed) when bats is absent so
+# a contributor without it isn't blocked; CI installs bats and always enforces.
+if command -v bats >/dev/null 2>&1; then
+    echo "pre-commit: running installer unit tests (bats)..."
+    bats tools/tests/installer/
+else
+    echo "pre-commit: bats not found; skipping installer unit tests (CI enforces them)"
+fi
+
 echo "pre-commit: all checks passed"

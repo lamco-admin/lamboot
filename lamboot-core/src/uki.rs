@@ -1,3 +1,5 @@
+//! Layer: 3 — Parsers & Shared Types.
+//!
 //! UKI (Unified Kernel Image) PE section parser.
 //!
 //! Parses PE/COFF sections from UKI .efi files to extract metadata:
@@ -52,7 +54,9 @@ fn parse_pe_section_table(header: &[u8]) -> Option<(u16, Vec<SectionLoc>)> {
     }
 
     let pe_offset = read_u32_le(header, 0x3C) as usize;
-    if pe_offset + 4 + 20 > header.len() {
+    // saturating_add so an attacker-supplied pe_offset near usize::MAX can
+    // never wrap the bound check (the subsequent reads are then in range).
+    if pe_offset.saturating_add(24) > header.len() {
         return None;
     }
     if header[pe_offset..pe_offset + 4] != [0x50, 0x45, 0x00, 0x00] {
@@ -65,7 +69,9 @@ fn parse_pe_section_table(header: &[u8]) -> Option<(u16, Vec<SectionLoc>)> {
     let opt_header_size = read_u16_le(header, coff_offset + 16) as usize;
     let section_table = coff_offset + 20 + opt_header_size;
 
-    if section_table + (num_sections * 40) > header.len() {
+    // saturating arithmetic so a crafted num_sections / opt_header_size cannot
+    // wrap the section-table bound check.
+    if section_table.saturating_add(num_sections.saturating_mul(40)) > header.len() {
         return None;
     }
 

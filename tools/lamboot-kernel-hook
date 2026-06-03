@@ -3,26 +3,38 @@
 #
 # Called by:
 #   /usr/lib/kernel/install.d/90-lamboot.install (kernel-install framework)
-#   /etc/kernel/postinst.d/zz-lamboot (Debian/Ubuntu hook)
-#   /etc/kernel/postrm.d/zz-lamboot (Debian/Ubuntu hook)
+#   /etc/kernel/postinst.d/zz-lamboot (Debian/Ubuntu/Proxmox hook)
+#   /etc/kernel/postrm.d/zz-lamboot (Debian/Ubuntu/Proxmox hook)
+#   lamboot-install --proxmox-host --refresh / --repair-bls (bulk backfill)
 #
 # Usage:
 #   lamboot-kernel-hook add KERNEL_VERSION [KERNEL_IMAGE]
 #   lamboot-kernel-hook remove KERNEL_VERSION
 #
-# BLS entries are written to /boot/efi/loader/entries/ (or wherever the ESP
-# is mounted). The entry filename is {distro}-{version}.conf.
+# Entries are written to the ESP at $ESP/loader/entries/{distro}-{version}.conf.
+# The ESP is LamBoot's only reliable BLS source on a host with no separate
+# /boot partition (Proxmox LVM/ZFS root): LamBoot scans /loader/entries on
+# each mounted volume, and only the ESP volume actually has that directory.
+#
+# Two correctness points this hook gets right for the no-separate-/boot case
+# (where naive kernel-install plugins produce non-bootable entries):
+#   * options must carry root= — /etc/kernel/cmdline conventionally omits it,
+#     so the kernel would panic with no rootfs. We inject it from the live
+#     root device when absent.
+#   * linux/initrd paths must keep the /boot/ prefix when /boot lives on the
+#     root filesystem (LamBoot resolves the path against the root volume, not
+#     a /boot partition). See boot_path_prefix().
 
 set -uo pipefail
 
-# --- Configuration ---
+# Default: do not overwrite an existing entry (preserve operator edits).
+# lamboot-install --repair-bls exports LAMBOOT_BLS_FORCE=1 to force a rebuild.
+FORCE="${LAMBOOT_BLS_FORCE:-0}"
 
-# ESP mount point (auto-detected)
 ESP=""
 BLS_DIR=""
+PREFIX=""
 CMDLINE_FILE="/etc/kernel/cmdline"
-
-# --- Functions ---
 
 die() { printf "lamboot-kernel-hook: ERROR: %s\n" "$1" >&2; exit 1; }
 
@@ -35,6 +47,42 @@ find_esp() {
         fi
     done
     die "Cannot find ESP mount point (/boot/efi or /efi)"
+}
+
+# v0.15.0: when /boot is a separate partition LamBoot reads natively (vfat via
+# the FatRo reader; ext2/3/4 + btrfs via native backends), write the BLS entry
+# ON /boot so LamBoot sources the kernel in place — matching lamboot-install's
+# detect_bls_target. Otherwise keep ESP placement (Proxmox LVM/ZFS root; xfs/
+# f2fs/ntfs/zfs separate /boot). boot_path_prefix() already drops the /boot
+# prefix for a separate /boot, so the linux/initrd values stay correct.
+resolve_bls_dir() {
+    mountpoint -q /boot 2>/dev/null || return 0
+    local boot_src esp_src boot_fs
+    boot_src=$(findmnt -n -o SOURCE /boot 2>/dev/null)
+    esp_src=$(findmnt -n -o SOURCE "$ESP" 2>/dev/null)
+    boot_fs=$(findmnt -n -o FSTYPE /boot 2>/dev/null)
+    [ -n "$boot_src" ] && [ "$boot_src" != "$esp_src" ] || return 0
+    case "$boot_fs" in
+        vfat|ext2|ext3|ext4|btrfs) BLS_DIR="/boot/loader/entries" ;;
+    esac
+}
+
+# Path prefix for `linux`/`initrd` BLS fields. LamBoot resolves these against
+# the volume it mounts. When /boot is its own partition LamBoot mounts that
+# partition (its root IS /boot) → no prefix. When /boot lives on the root
+# filesystem (Proxmox LVM/ZFS) LamBoot mounts the root fs → keep /boot/.
+boot_path_prefix() {
+    if mountpoint -q /boot 2>/dev/null; then
+        printf ''
+    else
+        printf '/boot'
+    fi
+}
+
+# Map a real /boot/<file> path to the BLS value for the current layout.
+bls_path() {
+    local real="$1"
+    printf '%s/%s' "$PREFIX" "${real#/boot/}"
 }
 
 get_distro_id() {
@@ -58,99 +106,109 @@ get_distro_name() {
 }
 
 get_kernel_cmdline() {
-    # Priority: /etc/kernel/cmdline > /proc/cmdline (filtered)
     if [ -f "$CMDLINE_FILE" ]; then
         cat "$CMDLINE_FILE"
         return
     fi
-
-    # Fall back to /proc/cmdline, stripping boot-specific params
     if [ -f /proc/cmdline ]; then
         sed 's/BOOT_IMAGE=[^ ]* //; s/initrd=[^ ]* //' /proc/cmdline
     fi
 }
 
+# Inject root= (and ro) when the configured cmdline lacks it. Without root=
+# the kernel cannot mount the rootfs. root= and ro lead, mirroring the layout
+# systemd-boot's 90-loaderentry produces, so entries are byte-comparable.
+ensure_root_in_cmdline() {
+    local cmdline="$1"
+    case " $cmdline " in
+        *" root="*) printf '%s' "$cmdline"; return ;;
+    esac
+    local rootdev
+    rootdev=$(findmnt -no SOURCE / 2>/dev/null)
+    [ -n "$rootdev" ] || { printf '%s' "$cmdline"; return; }
+    if [ -n "$cmdline" ]; then
+        printf 'root=%s ro %s' "$rootdev" "$cmdline"
+    else
+        printf 'root=%s ro' "$rootdev"
+    fi
+}
+
+# Emit one `initrd` line per existing image (microcode first, then the
+# initramfs), already mapped to the BLS path for this layout.
 find_initrd() {
     local version="$1"
-    local initrd_paths=""
-
-    # Check for microcode first
+    local kernel_image="${2:-}"
     for ucode in /boot/intel-ucode.img /boot/amd-ucode.img; do
-        if [ -f "$ucode" ]; then
-            initrd_paths="/$(basename "$ucode")"
-            break
-        fi
+        [ -f "$ucode" ] && bls_path "$ucode"
     done
-
-    # Distro-specific initrd naming
+    # Version-named initramfs first (Debian/Fedora: initramfs-$version.img,
+    # initrd.img-$version). Then fall back to the kernel-image FLAVOR: Arch
+    # names its image vmlinuz-linux and its initramfs initramfs-linux.img,
+    # keyed on the flavor ("linux"), not the kernel version — so the
+    # version-based patterns miss it and the entry would ship initrd-less.
+    local flavor=""
+    case "$kernel_image" in
+        */vmlinuz-*) flavor="${kernel_image##*/vmlinuz-}" ;;
+    esac
+    local pattern
     for pattern in \
         "/boot/initramfs-${version}.img" \
         "/boot/initrd.img-${version}" \
         "/boot/initrd-${version}" \
-        "/boot/initramfs-${version}-fallback.img"; do
+        "/boot/initramfs-${version}-fallback.img" \
+        ${flavor:+"/boot/initramfs-${flavor}.img"} \
+        ${flavor:+"/boot/initrd-${flavor}"} \
+        ${flavor:+"/boot/initramfs-${flavor}-fallback.img"}; do
         if [ -f "$pattern" ]; then
-            if [ -n "$initrd_paths" ]; then
-                initrd_paths="${initrd_paths}
-    /${pattern#/boot/}"
-            else
-                initrd_paths="/${pattern#/boot/}"
-            fi
+            bls_path "$pattern"
             break
         fi
     done
-
-    echo "$initrd_paths"
 }
-
-# --- Actions ---
 
 do_add() {
     local version="$1"
     local kernel_image="${2:-}"
 
     find_esp
+    resolve_bls_dir
+    PREFIX="$(boot_path_prefix)"
     mkdir -p "$BLS_DIR"
 
-    local distro_id
+    local distro_id distro_name
     distro_id=$(get_distro_id)
-    local distro_name
     distro_name=$(get_distro_name)
     local entry_file="${BLS_DIR}/${distro_id}-${version}.conf"
 
-    # Skip if entry already exists (deduplication with kernel-install)
-    if [ -f "$entry_file" ]; then
+    if [ -f "$entry_file" ] && [ "$FORCE" != "1" ]; then
         return 0
     fi
 
-    # Find kernel path
-    local kernel_path=""
+    local kernel_real=""
     if [ -n "$kernel_image" ] && [ -f "$kernel_image" ]; then
-        kernel_path="/${kernel_image#/boot/}"
+        kernel_real="$kernel_image"
     elif [ -f "/boot/vmlinuz-${version}" ]; then
-        kernel_path="/vmlinuz-${version}"
+        kernel_real="/boot/vmlinuz-${version}"
     else
         die "Cannot find kernel image for version ${version}"
     fi
+    local kernel_path
+    kernel_path=$(bls_path "$kernel_real")
 
-    # Find initrd
     local initrd_lines
-    initrd_lines=$(find_initrd "$version")
+    initrd_lines=$(find_initrd "$version" "$kernel_real")
 
-    # Get kernel command line
     local cmdline
-    cmdline=$(get_kernel_cmdline)
+    cmdline=$(ensure_root_in_cmdline "$(get_kernel_cmdline)")
 
-    # Get machine ID
     local machine_id=""
-    if [ -f /etc/machine-id ]; then
-        machine_id=$(cat /etc/machine-id)
-    fi
+    [ -f /etc/machine-id ] && machine_id=$(cat /etc/machine-id)
 
-    # Write BLS entry
     {
         echo "title      ${distro_name} (${version})"
         echo "version    ${version}"
         [ -n "$machine_id" ] && echo "machine-id ${machine_id}"
+        echo "sort-key   ${distro_id}"
         echo "linux      ${kernel_path}"
         if [ -n "$initrd_lines" ]; then
             echo "$initrd_lines" | while IFS= read -r line; do
@@ -167,6 +225,7 @@ do_remove() {
     local version="$1"
 
     find_esp
+    resolve_bls_dir
 
     local distro_id
     distro_id=$(get_distro_id)
@@ -177,8 +236,6 @@ do_remove() {
         echo "lamboot-kernel-hook: removed ${entry_file}"
     fi
 }
-
-# --- Main ---
 
 action="${1:-}"
 version="${2:-}"

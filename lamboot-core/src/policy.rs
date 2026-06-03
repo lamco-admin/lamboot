@@ -1,3 +1,5 @@
+//! Layer: 4 — Policy & State.
+
 use alloc::{string::String, vec::Vec};
 
 use uefi::Result;
@@ -30,6 +32,25 @@ pub(crate) struct Policy {
     pub version: u32,
     pub default_timeout_ms: u32,
     pub default_entry: Option<String>,
+    /// Bug 22 / v0.10 — operator-set glob pattern. When set, the
+    /// default-entry selector picks the highest-version entry whose
+    /// `id` matches `default_pattern` instead of the first entry by
+    /// sort order. Mirrors sd-boot's documented escape hatch (keszybz,
+    /// systemd#23669) for distros that emit `sort-key` inconsistently
+    /// across kernel-install package versions. Pattern matching is
+    /// glob-style (`*` wildcard); see `path_matches_pattern`. Wins
+    /// over `default_entry` when both are set and `default_pattern`
+    /// has at least one match.
+    pub default_pattern: Option<String>,
+    /// Bug 22 / v0.10 — when true, `bls_sort_compare` ignores the
+    /// `sort-key` field entirely (skipping both the presence test and
+    /// the value comparison) and falls through to version + filename
+    /// ordering. Mirrors Fedora bootupd's design choice. Fixes BOTH
+    /// the menu-display order AND the default-entry cursor for the
+    /// cohort-split failure mode.
+    /// Spec deviation when on; default false preserves the
+    /// spec-faithful sort.
+    pub bls_ignore_sort_key: bool,
     pub secure_boot_required: bool,
     pub measured_boot: bool,
     pub fallback_order: Vec<String>,
@@ -47,6 +68,11 @@ pub(crate) struct Policy {
     /// SDS-3: native PE loader policy. Default Auto.
     /// Consumed by `boot.rs` to gate native-vs-firmware load path.
     pub loader_native_pe: LoaderNativePeMode,
+    /// v0.11.0: gates the `diag::append` breadcrumbs throughout the boot
+    /// path. Default false (no breadcrumbs written). Set
+    /// `[diagnostics] verbose = true` in policy.toml to capture a full
+    /// audit-log trace of the boot for troubleshooting.
+    pub diagnostics_verbose: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +184,8 @@ impl Default for Policy {
             version: 1,
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
             default_entry: None,
+            default_pattern: None,
+            bls_ignore_sort_key: false,
             // SB-required stays opt-in since SB-off is a valid homelab
             // posture; measured_boot defaults on because it's free
             // when a TPM exists and a no-op when it doesn't.
@@ -174,6 +202,7 @@ impl Default for Policy {
             modules_enabled: true,
             drivers_legacy: DriversLegacyMode::Auto,
             loader_native_pe: LoaderNativePeMode::Auto,
+            diagnostics_verbose: false,
         }
     }
 }
@@ -334,6 +363,13 @@ fn apply_config_value(policy: &mut Policy, qualified_key: &str, raw_value: &str)
         "default_entry" => {
             policy.default_entry = Some(String::from(value));
         }
+        // Bug 22 / v0.10 — two cohort-split levers (root-level).
+        "default_pattern" => {
+            policy.default_pattern = Some(String::from(value));
+        }
+        "bls_ignore_sort_key" => {
+            policy.bls_ignore_sort_key = value == "true";
+        }
 
         // [security] section
         "security.secure_boot_required" => {
@@ -394,6 +430,10 @@ fn apply_config_value(policy: &mut Policy, qualified_key: &str, raw_value: &str)
             policy.loader_native_pe = LoaderNativePeMode::parse(value);
         }
 
+        // [diagnostics] section — v0.11.0
+        "diagnostics.verbose" => {
+            policy.diagnostics_verbose = value == "true";
+        }
         _ => {
             log::debug!("Unknown config key: {qualified_key}");
         }
@@ -418,8 +458,10 @@ fn parse_toml_array(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// Simple pattern matching for paths
-fn path_matches_pattern(path: &str, pattern: &str) -> bool {
+/// Simple pattern matching for paths. Made `pub(crate)` in v0.10 so
+/// `discovery::select_default_entry` can reuse it for the
+/// `policy.default_pattern` Bug 22 escape hatch.
+pub(crate) fn path_matches_pattern(path: &str, pattern: &str) -> bool {
     if pattern == "*" {
         return true;
     }
@@ -444,4 +486,82 @@ fn path_matches_pattern(path: &str, pattern: &str) -> bool {
     }
 
     path_lower == pattern_lower
+}
+
+/// v0.10 — Bug 22 Option E: select the default entry index honoring
+/// policy precedence. Lookup order:
+///
+///   1. `policy.default_pattern` (glob over entry `id` across all entries):
+///      if at least one boot-eligible entry matches, return the index of
+///      the highest-`version_compare` match. Mirrors sd-boot's
+///      `default <machine-id>*.conf` escape hatch (keszybz,
+///      systemd#23669) for distros that emit `sort-key` inconsistently.
+///
+///   2. `policy.default_entry` (exact id match, current behavior):
+///      returns the index of the first entry whose `id` matches. The
+///      `boot_eligible` slice restricts the candidate set to entries
+///      that are bootable (filters out tools/recovery if caller
+///      pre-filtered).
+///
+///   3. Fall-through: caller picks the first boot-eligible entry by
+///      sort order (the pre-v0.10 default).
+///
+/// The `boot_eligible` parameter is a slice of indices into `entries`
+/// that the caller has already filtered as bootable. Returns `None`
+/// when neither rule matches; callers must fall through to their own
+/// "first entry" default.
+///
+/// Layer note: lives here (Policy & State, Layer 4) rather than in
+/// `discovery` because it is policy application, not discovery. It names
+/// only the pure `bls_parse::version_compare` (Layer 3) and the
+/// `BootEntry` type (Layer 3 types) — no upward dependency.
+pub(crate) fn select_default_entry(
+    entries: &[crate::boot_types::BootEntry],
+    boot_eligible: &[usize],
+    policy: &Policy,
+) -> Option<usize> {
+    use core::cmp::Ordering;
+
+    use crate::bls_parse::version_compare;
+
+    // Rule 1: default_pattern glob over entry.id (highest version wins).
+    if let Some(pattern) = policy.default_pattern.as_deref() {
+        let mut best: Option<(usize, &str)> = None;
+        for &idx in boot_eligible {
+            let entry = &entries[idx];
+            if path_matches_pattern(&entry.id, pattern) {
+                // Use entry.id as the version-comparable string when
+                // no explicit version field is available on BootEntry.
+                // version_compare handles arbitrary strings; in the
+                // BLS-entry case the id is `bls-<filename-stem>` which
+                // sorts roughly version-like (`bls-debian-7.0.7` >
+                // `bls-debian-6.19.11`). Refinement to read the
+                // underlying BLS version is deferred — id-based works
+                // for the documented use cases.
+                let pick = match best {
+                    None => true,
+                    Some((_, current_best_id)) => {
+                        version_compare(&entry.id, current_best_id) == Ordering::Greater
+                    }
+                };
+                if pick {
+                    best = Some((idx, &entry.id));
+                }
+            }
+        }
+        if let Some((idx, _)) = best {
+            return Some(idx);
+        }
+    }
+
+    // Rule 2: default_entry exact id match (current behavior).
+    if let Some(default_id) = policy.default_entry.as_deref() {
+        for &idx in boot_eligible {
+            if entries[idx].id == default_id {
+                return Some(idx);
+            }
+        }
+    }
+
+    None
 }

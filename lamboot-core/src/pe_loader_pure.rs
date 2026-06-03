@@ -1,3 +1,5 @@
+//! Layer: 3 (pure) — Parsers & Shared Types.
+//!
 //! Pure PE-loader logic — parse, validate, relocation math, SHA-256.
 //!
 //! No UEFI, no allocation of pages, no protocol installation. This
@@ -208,10 +210,24 @@ impl From<DataDirectory> for DataDir {
 /// than goblin's opaque `Error::Malformed`. After goblin succeeds we
 /// verify magic, machine, subsystem at the summary level.
 pub fn parse_headers(bytes: &[u8]) -> Result<PeSummary, PeLoadError> {
-    // DOS header is 64 bytes; NT signature lives 4 bytes past
-    // e_lfanew (which is at DOS+0x3C). Minimum viable PE is
-    // DOS (64) + NT sig (4) + COFF header (20) + optional header
-    // (>= 112 for PE32+) + section table (0 sections permitted).
+    parse_headers_with_diag(bytes, None)
+}
+
+/// Diagnostic variant — accepts an optional callback invoked at major
+/// internal checkpoints. Added v0.11.0 for pve2/ASUS G10AJ freeze
+/// investigation; release callers pass None.
+pub fn parse_headers_with_diag(
+    bytes: &[u8],
+    mut diag: Option<&mut dyn FnMut(&str)>,
+) -> Result<PeSummary, PeLoadError> {
+    macro_rules! diag {
+        ($msg:expr) => {
+            if let Some(ref mut cb) = diag {
+                cb($msg);
+            }
+        };
+    }
+    diag!("PRH1 enter\n");
     if bytes.len() < 64 {
         return Err(PeLoadError::TooShort {
             have: bytes.len(),
@@ -229,21 +245,28 @@ pub fn parse_headers(bytes: &[u8]) -> Result<PeSummary, PeLoadError> {
     if bytes[nt_off..nt_off + 4] != *b"PE\0\0" {
         return Err(PeLoadError::BadNtSignature);
     }
+    diag!("PRH2 sigs_ok before_goblin_header\n");
 
-    // Hand off to goblin for the rest. `ParseOptions::default()`
-    // respects the PE layout strictly; we don't need resolve_rva.
-    let pe = PE::parse_with_opts(bytes, &ParseOptions::default())
-        .map_err(|_| PeLoadError::ParseFailed("goblin refused the bytes"))?;
+    // v0.11.0: bypass goblin's full PE::parse_with_opts. It parses
+    // exports, imports, debug, exception (.pdata — huge on Linux
+    // kernels), relocations (we parse ourselves later), TLS, resources,
+    // load_config, certificates — most of which have no opt-out flags.
+    // On the ASUS G10AJ firmware (pve2) parsing the 16MB Linux kernel
+    // hung even with all available options disabled. Call only
+    // Header::parse + CoffHeader::sections — the two pieces we
+    // actually need. Skips ALL the unnecessary sub-parsers.
+    use goblin::pe::header::{Header, SIZEOF_COFF_HEADER, SIZEOF_PE_MAGIC};
+    let header = Header::parse(bytes)
+        .map_err(|_| PeLoadError::ParseFailed("goblin Header::parse failed"))?;
+    diag!("PRH3 after_goblin_header\n");
 
-    let coff = pe.header.coff_header;
+    let coff = header.coff_header;
     let num_sections = coff.number_of_sections;
 
-    // Optional header presence is required by the goblin parser for
-    // PE32+; absence means goblin would have errored already.
-    let oh = pe
-        .header
+    let oh = header
         .optional_header
         .ok_or(PeLoadError::BadOptionalHeaderMagic(0))?;
+    diag!("PRH4 after_optional_header\n");
 
     let opt_magic = oh.standard_fields.magic;
     let preferred_base = oh.windows_fields.image_base;
@@ -259,44 +282,62 @@ pub fn parse_headers(bytes: &[u8]) -> Result<PeSummary, PeLoadError> {
         .copied()
         .map(DataDir::from);
 
-    // Early reject: num_sections > MAX_SECTIONS before we allocate a
-    // SectionPlan vec of that size, which is hostile-input-bounded.
     if num_sections > MAX_SECTIONS {
         return Err(PeLoadError::TooManySections {
             claimed: num_sections,
             max: MAX_SECTIONS,
         });
     }
+    diag!("PRH5 before_manual_section_parse\n");
 
-    // Flatten goblin's section iterator into a Vec<SectionPlan> with
-    // clamped copy_len. Bounds-check happens in `validate_headers`
-    // with the full input slice in hand (we need `bytes.len()` for
-    // that check; keep it there for cleanest separation of parse vs
-    // validate).
+    // v0.11.0: bypass goblin's SectionTable::parse_with_opts. It does
+    // `bytes.pread::<&str>(string_table_offset + idx)` for sections
+    // with long-form names like `.eh_frame` (starting with `/`). On a
+    // Linux kernel where the string table isn't where goblin expects,
+    // this walks up to 16MB of binary kernel bytes looking for a NUL
+    // — per such section. We don't need the section names anyway;
+    // they're not in SectionPlan. Parse 40-byte entries directly.
+    let optional_header_offset =
+        header.dos_header.pe_pointer as usize + SIZEOF_PE_MAGIC + SIZEOF_COFF_HEADER;
+    let sections_offset_start = optional_header_offset + coff.size_of_optional_header as usize;
+    let needed = (num_sections as usize).saturating_mul(40);
+    if sections_offset_start.saturating_add(needed) > bytes.len() {
+        return Err(PeLoadError::ParseFailed(
+            "section table extends past file end",
+        ));
+    }
+
     let mut sections: Vec<SectionPlan> = Vec::with_capacity(num_sections as usize);
     let mut entry_in_executable_section = false;
-    for (i, s) in pe.sections.iter().enumerate() {
-        let raw_size = s.size_of_raw_data;
-        let virt_size = s.virtual_size;
+    for i in 0..num_sections as usize {
+        let base = sections_offset_start + i * 40;
+        // Name (8 bytes at base) — skipped, we don't use it.
+        let virt_size = u32::from_le_bytes(bytes[base + 8..base + 12].try_into().unwrap());
+        let virt_addr = u32::from_le_bytes(bytes[base + 12..base + 16].try_into().unwrap());
+        let raw_size = u32::from_le_bytes(bytes[base + 16..base + 20].try_into().unwrap());
+        let raw_offset = u32::from_le_bytes(bytes[base + 20..base + 24].try_into().unwrap());
+        // pointer_to_relocations [24..28], pointer_to_linenumbers [28..32],
+        // number_of_relocations [32..34], number_of_linenumbers [34..36] — skipped.
+        let characteristics = u32::from_le_bytes(bytes[base + 36..base + 40].try_into().unwrap());
+
         let copy_len = raw_size.min(virt_size);
-        // IMAGE_SCN_MEM_EXECUTE = 0x2000_0000
-        let executable = (s.characteristics & 0x2000_0000) != 0;
+        let executable = (characteristics & 0x2000_0000) != 0;
         sections.push(SectionPlan {
             index: i,
-            virt_addr: s.virtual_address,
+            virt_addr,
             virt_size,
-            raw_offset: s.pointer_to_raw_data,
+            raw_offset,
             copy_len,
             executable,
         });
-        // Entry-in-executable check: entry RVA in [virt_addr, virt_addr + virt_size)
         if executable
-            && entry_rva >= s.virtual_address
-            && (entry_rva as u64) < (s.virtual_address as u64 + virt_size as u64)
+            && entry_rva >= virt_addr
+            && (entry_rva as u64) < (virt_addr as u64 + virt_size as u64)
         {
             entry_in_executable_section = true;
         }
     }
+    diag!("PRH6 after_manual_section_parse\n");
 
     Ok(PeSummary {
         machine: coff.machine,

@@ -72,6 +72,20 @@ pub mod trust_log_pure;
 #[path = "../../lamboot-core/src/discovery_pure.rs"]
 pub mod discovery_pure;
 
+// v0.14.1 dual-contract extractions — pure decision cores re-hosted verbatim so
+// the security/flexibility truth tables are exercised on the host. The
+// Volume/firmware-bound shells that adapt into these (`boot::choose_load_path`,
+// `fs_backend::checked_full_read_len`, `secure::read_secure_boot_enabled`) stay
+// in lamboot-core and are covered by the QEMU harness.
+#[path = "../../lamboot-core/src/boot_route_pure.rs"]
+pub mod boot_route_pure;
+
+#[path = "../../lamboot-core/src/read_limit_pure.rs"]
+pub mod read_limit_pure;
+
+#[path = "../../lamboot-core/src/sb_classify_pure.rs"]
+pub mod sb_classify_pure;
+
 pub(crate) mod cache;
 pub(crate) mod mock;
 

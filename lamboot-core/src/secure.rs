@@ -1,3 +1,5 @@
+//! Layer: 0 — Platform Introspection.
+//!
 //! Secure Boot awareness and shim integration.
 //!
 //! LamBoot supports two Secure Boot modes:
@@ -35,16 +37,15 @@ pub(crate) enum SecureBootState {
     ActiveDirect,
 }
 
-/// Detect the current Secure Boot state
+/// Detect the current Secure Boot state.
+///
+/// Reads the `SecureBoot` EFI variable and fails CLOSED on anything other than
+/// a clean read or a genuine absence. A read error must never silently downgrade
+/// to the no-verification `Disabled` posture: that would let a flaky firmware
+/// read — or an oversized/torn variable returning `BUFFER_TOO_SMALL` against the
+/// 1-byte buffer — become a free verification skip.
 pub(crate) fn detect_secure_boot() -> SecureBootState {
-    // Read the SecureBoot EFI variable
-    let mut buf = [0u8; 1];
-    let sb_enabled = match runtime::get_variable(SECURE_BOOT_VAR, EFI_GLOBAL_VARIABLE, &mut buf) {
-        Ok((data, _)) if !data.is_empty() => data[0] == 1,
-        _ => false,
-    };
-
-    if !sb_enabled {
+    if !read_secure_boot_enabled() {
         return SecureBootState::Disabled;
     }
 
@@ -56,12 +57,54 @@ pub(crate) fn detect_secure_boot() -> SecureBootState {
     }
 }
 
+/// Whether shim's `ShimLock` protocol is currently installed.
+///
+/// Re-probed at kernel-verify time (not only at the early single detection)
+/// because shim **< 15.8** uninstalls `ShimLock` after its first use: a legacy
+/// FS driver loaded for an XFS/ZFS/NTFS `/boot` between the early detection and
+/// the kernel verify can consume it. Verifying against a vanished `ShimLock`
+/// would hard-reject a kernel that should degrade to the firmware-`db` path.
+pub(crate) fn shim_lock_present() -> bool {
+    uefi::boot::get_handle_for_protocol::<ShimLock>().is_ok()
+}
+
+/// Read the SecureBoot variable into a yes/no.
+///
+/// Fails closed (assume ON) on a genuinely indeterminate read, so a flaky or
+/// attacker-perturbed read on a real SB box never becomes a free verification
+/// skip. BUT it must NOT over-fail-closed: a `NOT_FOUND`/`UNSUPPORTED` firmware
+/// has no Secure Boot at all, and a single transient blip on an SB-OFF box must
+/// not wrongly force verification and refuse a perfectly good unsigned kernel.
+/// So: absence/unsupported → off; the variable existing-but-oversized
+/// (`BUFFER_TOO_SMALL`) → on; an indeterminate transient error → retry once,
+/// then fail closed.
+fn read_secure_boot_enabled() -> bool {
+    use crate::sb_classify_pure::{classify_secure_boot, SbReadOutcome};
+
+    // One firmware read → pure outcome; the retry/fail-closed classification
+    // lives in sb_classify_pure and is host-tested there.
+    classify_secure_boot(|| {
+        let mut buf = [0u8; 1];
+        match runtime::get_variable(SECURE_BOOT_VAR, EFI_GLOBAL_VARIABLE, &mut buf) {
+            Ok((data, _)) if !data.is_empty() => SbReadOutcome::Value(Some(data[0])),
+            Ok(_) => SbReadOutcome::Value(None),
+            Err(e) if e.status() == Status::NOT_FOUND => SbReadOutcome::NotFound,
+            Err(e) if e.status() == Status::UNSUPPORTED => SbReadOutcome::Unsupported,
+            Err(e) if e.status() == Status::BUFFER_TOO_SMALL => SbReadOutcome::BufferTooSmall,
+            Err(_) => SbReadOutcome::TransientError,
+        }
+    })
+}
+
 /// Verify a PE image buffer against shim's embedded certificate.
 /// Returns Ok(()) if verification succeeds or Secure Boot is disabled.
 /// Returns Err if verification fails.
-pub(crate) fn verify_image(image_data: &[u8]) -> uefi::Result {
-    let state = detect_secure_boot();
-
+///
+/// Takes the already-detected `state` rather than re-reading the SecureBoot
+/// variable, so every consumer in one boot acts on a single source of truth
+/// (the variable is stable for a boot; re-detecting only risked the verify
+/// path, the report, and the trust log disagreeing).
+pub(crate) fn verify_image(image_data: &[u8], state: SecureBootState) -> uefi::Result {
     match state {
         SecureBootState::Disabled => {
             // No verification needed
@@ -85,9 +128,9 @@ pub(crate) fn verify_image(image_data: &[u8]) -> uefi::Result {
     }
 }
 
-/// Log the Secure Boot state at startup
-pub(crate) fn log_secure_boot_state() {
-    let state = detect_secure_boot();
+/// Log the Secure Boot state at startup. Takes the already-detected `state`
+/// (see `verify_image`) rather than re-reading the variable.
+pub(crate) fn log_secure_boot_state(state: SecureBootState) {
     match state {
         SecureBootState::Disabled => {
             log::info!("Secure Boot: disabled");

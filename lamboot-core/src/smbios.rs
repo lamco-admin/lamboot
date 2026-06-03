@@ -1,3 +1,5 @@
+//! Layer: 0 — Platform Introspection.
+//!
 //! SMBIOS table reading for VM identification and fleet management.
 //!
 //! Reads SMBIOS Type 1 (System Information) and Type 11 (OEM Strings)
@@ -136,9 +138,20 @@ fn walk_smbios_structures(
 ) {
     let mut offset: usize = 0;
 
+    // Defensive cap on a firmware/host-controlled length. Real SMBIOS structure
+    // tables are well under 64 KiB; on Proxmox/QEMU the entry point is
+    // influenceable by anyone who can set VM args. Treat an oversized (or zero)
+    // length as "no SMBIOS" rather than mapping a giant or empty region.
+    const MAX_SMBIOS_TABLE_LEN: usize = 1024 * 1024;
+    if table_length == 0 || table_length > MAX_SMBIOS_TABLE_LEN {
+        log::warn!("SMBIOS table_length {table_length} implausible — skipping");
+        return;
+    }
+
     // SAFETY: table_start points to the SMBIOS structure table,
-    // validated by the firmware's Configuration Table entry.
-    // We bounds-check against table_length on every access.
+    // validated by the firmware's Configuration Table entry, and
+    // table_length is bounded above by MAX_SMBIOS_TABLE_LEN. We
+    // bounds-check against table_length on every access below.
     let table = unsafe { core::slice::from_raw_parts(table_start, table_length) };
 
     while offset + 4 <= table_length {

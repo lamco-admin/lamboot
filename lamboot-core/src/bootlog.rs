@@ -1,3 +1,5 @@
+//! Layer: 5 — Trust & Audit.
+//!
 //! Persistent boot log — writes boot trace to ESP for post-boot retrieval.
 //!
 //! Two modes:

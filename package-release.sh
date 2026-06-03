@@ -65,6 +65,8 @@ cd "$STAGING/lamboot-${VERSION}"
 cp -a /home/greg/lamboot-dev/tools/lamboot-install ./lamboot-install
 cp -a /home/greg/lamboot-dev/tools/lamboot-kernel-hook ./lamboot-kernel-hook
 cp -a /home/greg/lamboot-dev/tools/lamboot-monitor.py ./lamboot-monitor.py
+# v0.11.13 — Proxmox-host runtime metrics sampler
+cp -a /home/greg/lamboot-dev/tools/lamboot-host-sampler ./lamboot-host-sampler 2>/dev/null || true
 cp -a /home/greg/lamboot-dev/tools/sign-lamboot.sh ./sign-lamboot.sh
 cp -a /home/greg/lamboot-dev/tools/sign-unlock ./sign-unlock
 cp -a /home/greg/lamboot-dev/tools/sign-lock ./sign-lock
@@ -106,6 +108,23 @@ cp -a /home/greg/lamboot-dev/dist/kernel-hooks/* kernel-hooks/ 2>/dev/null || tr
 mkdir -p systemd
 cp -a /home/greg/lamboot-dev/dist/systemd/* systemd/ 2>/dev/null || true
 
+# v0.11.15 — archinstall plugin + AUR alpm hook. PKGBUILD's package()
+# references these paths inside the extracted tarball (lines that copy
+# packaging/installers/archinstall/ and packaging/aur/lamboot/
+# 95-lamboot.hook). Before v0.11.15 the tarball did not stage these
+# and the AUR build would have failed on those install -Dm0644 lines.
+mkdir -p packaging/installers/archinstall packaging/installers/calamares packaging/installers/openSUSE
+mkdir -p packaging/aur/lamboot
+
+cp -a /home/greg/lamboot-dev/packaging/installers/archinstall/. \
+    packaging/installers/archinstall/ 2>/dev/null || true
+cp -a /home/greg/lamboot-dev/packaging/installers/calamares/. \
+    packaging/installers/calamares/ 2>/dev/null || true
+cp -a /home/greg/lamboot-dev/packaging/installers/openSUSE/. \
+    packaging/installers/openSUSE/ 2>/dev/null || true
+cp -a /home/greg/lamboot-dev/packaging/aur/lamboot/95-lamboot.hook \
+    packaging/aur/lamboot/95-lamboot.hook 2>/dev/null || true
+
 # Documentation
 mkdir -p docs
 cp /home/greg/lamboot-dev/CHANGELOG.md ./CHANGELOG.md
@@ -126,6 +145,7 @@ for d in \
     MOK-ENROLLMENT-GUIDE.md \
     OVMF-VARS-PROXMOX.md \
     PROXMOX-GUIDE.md \
+    PROXMOX-GUEST-INTEGRATION-LAYER.md \
     KEY-GENERATION.md \
     INSTALL-REFERENCE.md \
     CONFIGURATION-GUIDE.md \
@@ -136,8 +156,7 @@ for d in \
     ARCHITECTURE.md \
     ARCHITECTURE-LAYERS.md \
     LAMBOOT-TOOLS-OVERVIEW.md \
-    LAMBOOT-INSPECT.md \
-    ROADMAP.md; do
+    LAMBOOT-INSPECT.md; do
     if [[ -f "/home/greg/lamboot-dev/docs/$d" ]]; then
         cp "/home/greg/lamboot-dev/docs/$d" "docs/$d"
     fi
@@ -159,6 +178,7 @@ TARBALL_DOCS=(
     MOK-ENROLLMENT-GUIDE.md
     OVMF-VARS-PROXMOX.md
     PROXMOX-GUIDE.md
+    PROXMOX-GUEST-INTEGRATION-LAYER.md
     KEY-GENERATION.md
     INSTALL-REFERENCE.md
     CONFIGURATION-GUIDE.md
@@ -170,7 +190,6 @@ TARBALL_DOCS=(
     ARCHITECTURE-LAYERS.md
     LAMBOOT-TOOLS-OVERVIEW.md
     LAMBOOT-INSPECT.md
-    ROADMAP.md
 )
 declare -A _ALLOWED_DOC=()
 for _d in "${TARBALL_DOCS[@]}"; do _ALLOWED_DOC["$_d"]=1; done
@@ -201,6 +220,42 @@ if [[ -n "$_LEAK_REPORT" ]]; then
 fi
 echo "✓ no cross-reference leaks in tarball tree"
 
+# ── Signature integrity gate ───────────────────────────────────────────
+# v0.11.9: defense-in-depth. Re-verify every signed binary in the
+# staging tree right before we tar. Any non-write-intent process that
+# happens to strip a PE signature (e.g. `llvm-objcopy --dump-section`,
+# which we discovered the hard way mutates its input file even though
+# it's nominally read-only) gets caught HERE rather than shipping a
+# corrupt tarball.
+#
+# This was the v0.11.8 mystery: signed binaries became "unsigned with
+# SBAT" some time after sign-lamboot.sh ran, and we only discovered
+# it post-tarball. With this gate, any future strip-on-read bug fails
+# the release loudly at packaging time.
+echo
+echo "══ Signature integrity gate ══"
+sig_failures=0
+DB_CERT_ABS="/home/greg/lamboot-dev/keys/db.crt"
+for signed in $(find . -name '*-signed.efi' | sort); do
+    if sbverify --cert "$DB_CERT_ABS" "$signed" >/dev/null 2>&1; then
+        echo "  ✓ $signed"
+    else
+        echo "  ✗ $signed — SIGNATURE INVALID"
+        sig_failures=$((sig_failures + 1))
+    fi
+done
+if (( sig_failures > 0 )); then
+    echo
+    echo "ABORT: $sig_failures signed binary/binaries failed sbverify in staging."
+    echo "       Re-run sign-lamboot.sh and avoid touching dist/EFI/LamBoot/"
+    echo "       between sign and re-run of package-release.sh."
+    echo "       NEVER use llvm-objcopy --dump-section on a signed binary;"
+    echo "       it mutates the input file even when targeting /dev/stdout."
+    rm -rf "$STAGING"
+    exit 1
+fi
+echo "✓ all signed binaries verify against $DB_CERT_ABS"
+
 # Checksum manifest for reproducibility
 echo "══ Writing manifest ══"
 find . -type f ! -name MANIFEST.sha256 | sort | xargs sha256sum > MANIFEST.sha256
@@ -215,8 +270,12 @@ echo "══ Creating tarball ══"
 tar czf "${ABSOLUTE_OUTPUT}/${TARBALL_NAME}" "lamboot-${VERSION}/"
 ls -la "${ABSOLUTE_OUTPUT}/${TARBALL_NAME}"
 
-# SHA256
-sha256sum "${ABSOLUTE_OUTPUT}/${TARBALL_NAME}" | tee "${ABSOLUTE_OUTPUT}/${TARBALL_NAME}.sha256"
+# SHA256 — emit with bare filename only (not the full build-host path).
+# Otherwise the .sha256 file embeds `/home/<builder>/lamboot-dev/dist/...`
+# which (a) leaks the build environment into a public artifact and
+# (b) breaks `sha256sum -c` for users whose tarball isn't at that
+# absolute path.
+(cd "${ABSOLUTE_OUTPUT}" && sha256sum "${TARBALL_NAME}") | tee "${ABSOLUTE_OUTPUT}/${TARBALL_NAME}.sha256"
 
 # Cleanup staging
 rm -rf "$STAGING"

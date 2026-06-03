@@ -1,14 +1,16 @@
+//! Layer: 6 — Presentation.
+//!
 //! Serial/text console fallback for environments without GOP (graphics).
 //!
 //! When GraphicsOutput protocol is unavailable (serial console, SOL, headless VMs),
 //! falls back to UEFI SimpleTextOutput for a text-mode boot menu.
 
-use alloc::format;
+use alloc::{format, string::String, vec::Vec};
 
 use uefi::{prelude::*, proto::console::gop::GraphicsOutput, Result};
 
 use crate::{
-    discovery::{BootEntry, Icon},
+    boot_types::{BootEntry, Icon},
     health,
     input::{InputEvent, InputManager, Key},
     policy::Policy,
@@ -23,6 +25,10 @@ pub(crate) fn has_graphics() -> bool {
 pub(crate) struct TextMenu {
     selected_index: usize,
     input: InputManager,
+    /// v0.10 Bug 22 / Option I: cohort-split notice rendered as a
+    /// single line above the menu when `Some`. Plain-text mirror of
+    /// the GUI footer notice.
+    cohort_notice: Option<String>,
 }
 
 impl TextMenu {
@@ -32,7 +38,12 @@ impl TextMenu {
         Self {
             selected_index: 0,
             input,
+            cohort_notice: None,
         }
+    }
+
+    pub(crate) fn set_cohort_notice(&mut self, notice: Option<&str>) {
+        self.cohort_notice = notice.map(String::from);
     }
 
     /// Run the text-mode boot menu
@@ -54,10 +65,18 @@ impl TextMenu {
             if !user_interacted && timeout_ms > 0 {
                 let elapsed_ms = elapsed_frames * 100;
                 if elapsed_ms >= timeout_ms && has_bootable {
-                    if let Some(ref default_id) = policy.default_entry {
-                        if let Some(idx) = entries.iter().position(|e| &e.id == default_id) {
-                            self.selected_index = idx;
-                        }
+                    // v0.10 Bug 22 / Option E: select_default_entry
+                    // honors policy.default_pattern > default_entry >
+                    // fallback. Mirrors the gui.rs default-selection
+                    // path. boot_eligible here is "every entry's
+                    // index" because the console UI doesn't filter
+                    // entries the way the GUI does — the
+                    // has_bootable check upstream is the only filter.
+                    let all_indices: Vec<usize> = (0..entries.len()).collect();
+                    if let Some(idx) =
+                        crate::policy::select_default_entry(entries, &all_indices, policy)
+                    {
+                        self.selected_index = idx;
                     }
                     if self.selected_index < entries.len() {
                         println_console(&format!(
@@ -143,6 +162,13 @@ impl TextMenu {
         ));
         println_console("");
 
+        // v0.10 Bug 22 / Option I: cohort-split notice line above
+        // the entry list when discovery flagged the anomaly.
+        if let Some(ref notice) = self.cohort_notice {
+            println_console(&format!("[!] {notice}"));
+            println_console("");
+        }
+
         if entries.is_empty() {
             println_console("  No bootable entries found.");
             println_console("  LamBoot searched: BLS entries, UKIs, Windows, GRUB, rEFInd");
@@ -151,8 +177,8 @@ impl TextMenu {
             for (i, entry) in entries.iter().enumerate() {
                 let marker = if i == self.selected_index { ">" } else { " " };
                 let status = match entry.preflight.as_ref().map(|p| p.status) {
-                    Some(crate::preflight::PreflightStatus::Warning) => " [!]",
-                    Some(crate::preflight::PreflightStatus::Error) => " [X]",
+                    Some(crate::boot_types::PreflightStatus::Warning) => " [!]",
+                    Some(crate::boot_types::PreflightStatus::Error) => " [X]",
                     _ => "",
                 };
                 println_console(&format!(" {marker} {i}) {}{status}", entry.name));

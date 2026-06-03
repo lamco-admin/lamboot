@@ -1,6 +1,6 @@
 # LamBoot Quick Start
 
-**Version:** 0.8.3 — Updated 2026-04-21
+**Version:** 0.12.0
 
 ## From a release tarball (recommended)
 
@@ -29,7 +29,7 @@ rustup target add x86_64-unknown-uefi aarch64-unknown-uefi
 # Build
 ./build.sh
 
-# Output: dist/EFI/LamBoot/lambootx64.efi (~215 KB, x86_64)
+# Output: dist/EFI/LamBoot/lambootx64.efi (~600 KB, x86_64)
 #         dist/EFI/LamBoot/lambootaa64.efi (aarch64)
 ```
 

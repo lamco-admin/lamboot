@@ -46,7 +46,7 @@ fi
 
 # --- Constants ---
 
-readonly LAMBOOT_VERSION="0.8.4"
+readonly LAMBOOT_VERSION="0.15.2"
 readonly LAMBOOT_LABEL="LamBoot"
 
 readonly EFI_DIR="EFI/LamBoot"
@@ -59,6 +59,19 @@ readonly FALLBACK_NAME_AA64="BOOTAA64.EFI"
 readonly MANIFEST_FILE=".install-manifest"
 readonly MANIFEST_PATH="EFI/LamBoot/${MANIFEST_FILE}"
 
+# If find_esp had to mount an unmounted ESP at a temp dir (block-device GUID
+# scan, Method 4), it records the mountpoint here so the EXIT trap below
+# unmounts it and removes the dir — otherwise a privileged run leaks a mount +
+# /tmp dir that can hide the ESP from other tooling.
+_LAMBOOT_TMP_ESP_MOUNT=""
+_lamboot_cleanup() {
+    if [ -n "$_LAMBOOT_TMP_ESP_MOUNT" ]; then
+        umount "$_LAMBOOT_TMP_ESP_MOUNT" 2>/dev/null || true
+        rmdir "$_LAMBOOT_TMP_ESP_MOUNT" 2>/dev/null || true
+    fi
+}
+trap _lamboot_cleanup EXIT
+
 # --- Shared ESP file-layout library ---
 #
 # Encodes the canonical "what files where on the ESP, with the
@@ -67,9 +80,13 @@ readonly MANIFEST_PATH="EFI/LamBoot/${MANIFEST_FILE}"
 # copy). See lib/esp-deploy.sh + docs/specs/SPEC-LAMBOOT-TOOLKIT-V1.md
 # §14.2 canonical-source-map.
 _lamboot_install_script_dir() {
-    local s="$0"
+    # Resolve from BASH_SOURCE, not $0: $0 is the executable name and is the
+    # SOURCING shell's name when this file is sourced (the bats unit suite does
+    # this), which would resolve the lib search path to the wrong directory.
+    # BASH_SOURCE[0] is always this file whether executed or sourced.
+    local s="${BASH_SOURCE[0]}"
     if command -v readlink >/dev/null 2>&1; then
-        s=$(readlink -f "$0" 2>/dev/null) || s="$0"
+        s=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null) || s="${BASH_SOURCE[0]}"
     fi
     cd "$(dirname "$s")" && pwd
 }
@@ -97,22 +114,95 @@ fi
 readonly ESP_PARTTYPE_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
 readonly MIN_ESP_SPACE_KIB=2048
 
-readonly SYSTEMD_UNIT_DIR="/usr/lib/systemd/system"
-readonly KERNEL_INSTALL_DIR="/usr/lib/kernel/install.d"
+# v0.10.1: base paths — actual paths are computed via resolve_target_paths()
+# after arg parsing, so --root can prefix them. Do not use these bare in
+# code that runs after arg parsing — use SYSTEMD_UNIT_DIR / KERNEL_INSTALL_DIR
+# (resolved variants).
+readonly SYSTEMD_UNIT_DIR_BASE="/usr/lib/systemd/system"
+readonly KERNEL_INSTALL_DIR_BASE="/usr/lib/kernel/install.d"
+SYSTEMD_UNIT_DIR="$SYSTEMD_UNIT_DIR_BASE"
+KERNEL_INSTALL_DIR="$KERNEL_INSTALL_DIR_BASE"
+KERNEL_CMDLINE_PATH="/etc/kernel/cmdline"
 
 readonly BLS_DIR="loader/entries"
+
+# BLS entry placement (set by detect_bls_target after the ESP is resolved).
+# Default is ESP-staged (firmware-served FAT) — always correct, the historical
+# behavior. When /boot is a separate partition LamBoot reads natively (vfat via
+# the FatRo reader; ext2/3/4 + btrfs via native backends), entries go ON /boot
+# so LamBoot sources the kernel in place — no ESP kernel mirror, no band-aid.
+BLS_INSTALL_DIR=""        # absolute dir the .conf files are written to
+BLS_ON_BOOT=0            # 1 = read-in-place (entries on the separate /boot)
+BLS_PLACEMENT="esp"      # "esp" | "boot_in_place" — surfaced in the report
 
 readonly EXIT_OK=0
 readonly EXIT_ERROR=1
 readonly EXIT_PARTIAL=2
 readonly EXIT_NOOP=3
+# v0.10.1 — lamboot-installer-protocol v1 extends the exit-code vocabulary
+# to match the lamboot-tools toolkit-wide set. Codes 0-3 retain their
+# existing meaning. See docs/specs/SPEC-LAMBOOT-INSTALLER-PROTOCOL-V1.md §3.
+readonly EXIT_UNSAFE=4
+readonly EXIT_ABORT=5
+readonly EXIT_NOT_APPLICABLE=6
+readonly EXIT_PREREQUISITE_MISSING=7
+
+# v0.10.1 — lamboot-installer-protocol v1. See docs/specs/SPEC-LAMBOOT-INSTALLER-PROTOCOL-V1.md.
+readonly LAMBOOT_INSTALLER_PROTOCOL_VERSION=1
+
+# Emit the JSON capabilities object per SPEC-LAMBOOT-INSTALLER-PROTOCOL-V1 §4.
+# Pure read of build-time constants; no privileged operations.
+# Heredoc keeps the schema declarative; jq is NOT a hard dependency
+# (the heredoc is already well-formed compact JSON).
+# v0.10.1 — lamboot-installer-protocol v1: structured event emission.
+# In --json mode, emits a single JSON object on stdout. In text mode,
+# becomes a debug-level log line (info goes to existing detail/info/warn
+# helpers; emit_event is the structured wire format consumers parse).
+# Free-form extra args become extra JSON fields (split on first '=').
+emit_event() {
+    local event="$1" phase="${2:-}"; shift 2 || true
+    if (( OPT_JSON )); then
+        local extra=""
+        for kv in "$@"; do
+            local k="${kv%%=*}" v="${kv#*=}"
+            extra+=",\"${k}\":\"$(printf '%s' "$v" | sed 's/\\/\\\\/g; s/"/\\"/g')\""
+        done
+        local phase_field=""
+        [[ -n "$phase" ]] && phase_field=",\"phase\":\"${phase}\""
+        printf '{"event":"%s"%s,"ts":%d%s}\n' \
+            "$event" "$phase_field" "$(date +%s)" "$extra"
+    else
+        # Text mode: surface as a structured detail line for grep-ability.
+        detail "[event:${event}${phase:+:${phase}}] $*"
+    fi
+}
+
+emit_capabilities() {
+    # Read lamboot bootloader version from packaged metadata if available;
+    # otherwise fall back to "unknown" so consumers can tell the difference.
+    local lamboot_version="unknown"
+    if [[ -f "/usr/share/lamboot/VERSION" ]]; then
+        lamboot_version=$(< /usr/share/lamboot/VERSION)
+    elif [[ -f "/usr/share/lamboot/EFI/LamBoot/.version" ]]; then
+        lamboot_version=$(< /usr/share/lamboot/EFI/LamBoot/.version)
+    fi
+    cat <<EOF
+{"protocol_version":${LAMBOOT_INSTALLER_PROTOCOL_VERSION},"tool":"lamboot-install","tool_version":"${LAMBOOT_VERSION}","lamboot_version":"${lamboot_version}","filesystems":{"native":["fat","ext2","ext3","ext4","btrfs"],"via_driver":["xfs","f2fs","ntfs","iso9660","zfs"]},"signing_modes":{"signed_release":true,"signed_mok":true,"signed_db":true,"unsigned":true},"secure_boot":{"shim_chain_supported":true,"shim_search_paths":["/EFI/ubuntu/shimx64.efi","/EFI/debian/shimx64.efi","/EFI/fedora/shimx64.efi","/EFI/centos/shimx64.efi","/EFI/rhel/shimx64.efi","/EFI/rocky/shimx64.efi","/EFI/almalinux/shimx64.efi","/EFI/opensuse/shimx64.efi","/EFI/proxmox/shimx64.efi","/EFI/systemd/shim.efi","/EFI/BOOT/BOOTX64.EFI"],"detect_default_loader":true},"trust_log_tokens":["shim_mok","degraded_trust_sb_direct","degraded_trust_sb_off","firmware_loadimage"],"commands":["install","update","remove"],"flags":["--esp","--signed","--no-shim","--no-mok","--with-drivers","--with-drivers-legacy","--with-modules","--update","--remove","--dry-run","--force","--force-foreign-esp","--quiet","--verbose","--fallback","--no-fallback","--replace-fallback","--replace","--no-bls","--keep-entries","--keep-logs","--install-toolkit","--no-install-toolkit","--kernel-firmware-db-signed","--set-default","--no-make-default","--no-efi-entry","--protocol-version","--capabilities","--json","--no-prompt","--root","--proxmox-host","--replace-grub","--refresh","--repair-bls","--capcheck-json"],"exit_codes":{"ok":0,"error":1,"partial":2,"noop":3,"unsafe":4,"abort":5,"not_applicable":6,"prerequisite_missing":7}}
+EOF
+}
 
 # --- Global State ---
 
 OPT_ESP=""
 OPT_NO_EFI_ENTRY=0
+OPT_NO_EFI_ENTRY_EXPLICIT=0   # v0.11.9: distinguish operator-set vs auto-set
 OPT_SET_DEFAULT=1   # Install makes LamBoot the default boot entry; override with --no-make-default
 OPT_FALLBACK=0
+OPT_FALLBACK_EXPLICIT=0   # v0.11.9: operator passed --fallback or --no-fallback
+OPT_FALLBACK_AUTO=0       # v0.11.9: auto-enabled by --root rule (for warning emission)
+OPT_REPLACE_FALLBACK=0    # explicit opt-in to overwrite a FOREIGN loader at the
+                          # firmware fallback path; generic --force no longer
+                          # authorizes this (decoupled — see install_fallback)
 OPT_WITH_DRIVERS=-1  # -1=auto, 0=no, 1=yes (pre-SDS-6 legacy knob; still honored)
 # SDS-6: legacy UEFI FS driver installation policy.
 # Values: "auto" (default; install only for non-natively-covered FSs),
@@ -125,6 +215,10 @@ OPT_REMOVE=0
 OPT_UPDATE=0
 OPT_DRY_RUN=0
 OPT_FORCE=0
+OPT_FORCE_FOREIGN_ESP=0   # dedicated opt-in to write to a partition that is NOT
+                          # ESP-typed (prepare-foreign-disk / removable-media).
+                          # generic --force no longer bypasses the ESP-type
+                          # assertion — see validate_esp.
 OPT_NO_BLS=0
 OPT_KEEP_ENTRIES=0
 OPT_KEEP_LOGS=0
@@ -135,9 +229,54 @@ OPT_SIGNED=0
 OPT_KERNEL_DB_SIGNED=0   # asserts kernel is firmware-DB-signed (rare); allows --no-shim under SB
 OPT_NO_SHIM=0
 OPT_NO_MOK=0
+# v0.10.1 — lamboot-installer-protocol v1 flags
+OPT_NO_PROMPT=0          # SPEC §7 — refuse to read from TTY; abort with EXIT_PREREQUISITE_MISSING
+OPT_JSON=0               # SPEC §5 — emit JSON event stream instead of pretty text
+OPT_ROOT=""              # SPEC §6 — chroot install target
 # Tri-state: -1=auto (prompt if interactive TTY, skip otherwise);
 # 0=explicit skip (--no-install-toolkit); 1=explicit install (--install-toolkit).
 OPT_INSTALL_TOOLKIT=-1
+
+# v0.11.0 — Proxmox VE host install modes. See
+# docs/proxmox-host-install/research/INDEX.md for the path framework and
+# docs/proxmox-host-install/research/HOST-SERVICE-ARCHITECTURE.md §2.1/§2.3
+# for the per-path service inventory.
+#
+# OPT_PROXMOX_HOST = 1 enables PATH C (coexist with GRUB; LamBoot at a new
+# ESP path + GRUB chainload menuentry; GRUB stays default; no BLS
+# generation; no kernel hooks). This is the safe first deployment on any
+# Proxmox host.
+#
+# OPT_PROXMOX_HOST_REPLACE_GRUB = 1 escalates to PATH A (LamBoot replaces
+# grubx64.efi via dpkg-divert; generates BLS entries for every Proxmox
+# kernel; installs cmdline-sync hook so /etc/kernel/cmdline tracks
+# /etc/default/grub across update-grub runs). Implies OPT_PROXMOX_HOST=1.
+# Only run AFTER PATH C has validated on the host.
+#
+# OPT_REFRESH = 1 is the postinst-hook callback mode: skip phases 1-4 +
+# 6-8; just re-sync BLS entries and /etc/kernel/cmdline. Implies
+# OPT_PROXMOX_HOST_REPLACE_GRUB context (the hook is only installed by
+# the replace-grub path).
+OPT_PROXMOX_HOST=0
+OPT_PROXMOX_HOST_REPLACE_GRUB=0
+OPT_REFRESH=0
+# OPT_REPAIR_BLS = 1 turns --refresh from additive (preserve existing entries)
+# into a force-rebuild: re-derive /etc/kernel/cmdline from GRUB, overwrite every
+# ESP BLS entry, and prune entries for removed kernels. The explicit "fix it"
+# switch; plain --refresh and kernel-install never modify customized entries.
+OPT_REPAIR_BLS=0
+
+# v0.11.2 — Optional capability hints from lamboot-capcheck (separately
+# installed and run; not a dependency). Operator passes a pre-generated
+# capcheck audit JSON via --capcheck-json PATH. lamboot-install reads
+# the report and:
+#   - Aborts (unless --force) when capcheck matched a quirk with
+#     severity=critical (hardware-damage class).
+#   - Implies --signed when secure-boot.state reports deployed_mode=true.
+#   - Surfaces informational notes for other quirks/warnings.
+# No subprocess call, no jq dependency at the call site (we use a small
+# inline shell JSON walker; jq is used when available but not required).
+OPT_CAPCHECK_JSON=""
 
 ESP=""
 ARCH=""
@@ -165,6 +304,9 @@ declare -a EXISTING_UKI=()
 KERNEL_CMDLINE=""
 ENTRY_TOKEN=""
 HAS_BLS_NATIVE=0
+declare -a COVERED_VERSIONS=()      # kernel versions that already have a consumable BLS entry (matched by `version` field)
+NATIVE_ENTRY_MANAGER=""             # systemd-kernel-install | sdbootutil | proxmox-boot-tool | debian-hooks | none
+KERNEL_INSTALL_LAYOUT_DETECTED=""   # bls | other | uki (from `kernel-install inspect`); empty if N/A
 
 declare -a MANIFEST_ENTRIES=()
 
@@ -175,33 +317,65 @@ MANIFEST_ARCH=""
 
 PARTIAL_FAILURE=0
 
+# Two-phase NVRAM commit: the BootOrder in effect BEFORE LamBoot mutated it is
+# captured once at the first NVRAM write and mirrored to a restore marker on the
+# ESP (.bootorder-backup) so a later --remove (or manual recovery) can put it
+# back. This guard ensures the snapshot is taken exactly once per run.
+PRIOR_BOOTORDER_CAPTURED=0
+
 # ============================================================================
 # Utility Functions
 # ============================================================================
 
+# v0.10.1 — --json mode suppresses pretty-print to stdout (spec §5: "--json
+# SUPPRESSES the human-readable pretty-print output on stdout. Both must not
+# interleave."). Stderr (warn/die/fail) is unchanged — installers and humans
+# both want to see errors. Use emit_event in --json mode for structured
+# stdout output.
 msg() {
+    (( OPT_JSON )) && return 0
     (( OPT_QUIET )) || printf '%s\n' "$1"
 }
 
 detail() {
+    (( OPT_JSON )) && return 0
     (( OPT_VERBOSE )) && printf '  %s\n' "$1" || true
 }
 
 warn() {
-    printf 'WARNING: %s\n' "$1" >&2
+    if (( OPT_JSON )); then
+        printf '{"event":"warning","msg":"%s","ts":%d}\n' \
+            "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')" "$(date +%s)"
+    else
+        printf 'WARNING: %s\n' "$1" >&2
+    fi
 }
 
 die() {
-    printf 'ERROR: %s\n' "$1" >&2
+    if (( OPT_JSON )); then
+        printf '{"event":"error","msg":"%s","exit_code":%d,"ts":%d}\n' \
+            "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')" \
+            "$EXIT_ERROR" "$(date +%s)"
+        printf '{"event":"done","exit_code":%d,"exit_name":"error","ts":%d}\n' \
+            "$EXIT_ERROR" "$(date +%s)"
+    else
+        printf 'ERROR: %s\n' "$1" >&2
+    fi
     exit $EXIT_ERROR
 }
 
 ok() {
+    (( OPT_JSON )) && return 0
     (( OPT_QUIET )) || printf '  \xe2\x9c\x93 %s\n' "$1"
 }
 
 fail() {
-    printf '  \xe2\x9c\x97 %s\n' "$1" >&2
+    if (( OPT_JSON )); then
+        printf '{"event":"error","msg":"%s","ts":%d}\n' \
+            "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')" "$(date +%s)"
+    else
+        printf '  \xe2\x9c\x97 %s\n' "$1" >&2
+    fi
 }
 
 run() {
@@ -214,8 +388,46 @@ run() {
     "$@"
 }
 
+# Refuse a write whose destination resolves OUTSIDE the ESP. On a real FAT ESP
+# symlinks cannot exist, so this is a no-op there; the guard matters when the
+# "ESP" is a redirected/foreign target — a --root target tree, or a partition
+# accepted under --force-foreign-esp — where a symlinked path component could
+# divert a privileged write outside the intended volume. Resolves the deepest
+# EXISTING ancestor (the leaf may not exist yet) and checks it lies within the
+# real ESP path.
+assert_within_esp() {
+    local target="$1"
+    [ -n "$ESP" ] || { detail "assert_within_esp: ESP unset"; return 1; }
+    command -v readlink >/dev/null 2>&1 || return 0   # cannot resolve → do not block
+
+    local esp_real probe real_probe
+    esp_real=$(readlink -f -- "$ESP" 2>/dev/null) || return 1
+    probe="$target"
+    while [ ! -e "$probe" ] && [ "$probe" != "/" ] && [ "$probe" != "." ]; do
+        probe=$(dirname "$probe")
+    done
+    real_probe=$(readlink -f -- "$probe" 2>/dev/null) || return 1
+
+    case "$real_probe/" in
+        "$esp_real"/*) return 0 ;;
+        *)             return 1 ;;
+    esac
+}
+
 atomic_copy() {
     local src="$1" dst="$2"
+
+    # Symlink/realpath guard runs before any mkdir/cp/mv so a symlinked path
+    # component cannot redirect the write off the ESP. assert_within_esp already
+    # refuses a dst (or dst ancestor) whose real path escapes the ESP, including
+    # an escaping symlink; a symlink that resolves WITHIN the ESP is fine — the
+    # final `mv -f` replaces the link itself rather than following it. Skipped
+    # under --dry-run (no writes happen) to avoid resolving hypothetical paths.
+    if ! (( OPT_DRY_RUN )); then
+        assert_within_esp "$dst" \
+            || { fail "refusing write outside ESP (symlink/realpath guard): ${dst}"; return 1; }
+    fi
+
     local dst_dir
     dst_dir=$(dirname "$dst")
 
@@ -231,11 +443,66 @@ file_sha256() {
     sha256sum -- "$1" 2>/dev/null | cut -d' ' -f1
 }
 
+# read_keyval_field(file, KEY) — extract one KEY=VALUE field as DATA.
+#
+# Never `source`s the file: under `--root` the os-release / grub-default come
+# from the TARGET filesystem (a downloaded/extracted rootfs or a chroot built
+# by an unprivileged step), so `. "$file"` would execute attacker-controlled
+# shell as root. We parse instead and treat the value as literal text — no
+# command substitution, no expansion.
+#
+# But it must reproduce what `source` extracted for the LEGITIMATE forms found
+# across distros, or it corrupts BLS titles and kernel cmdlines:
+#   - CRLF line endings (rootfs/images built or edited on Windows, common with
+#     --root on prebuilt cloud/appliance images) — strip the trailing CR.
+#   - an inline `# comment` after the value (Debian/Ubuntu ship grub-default
+#     with comments; admins add inline notes) — `source` drops it; so do we.
+#   - trailing content after a closing quote (a comment, CR, or stray token) —
+#     take the value up to the MATCHING closing quote, not "first char == quote
+#     AND last char == quote" (which failed whenever anything followed).
+read_keyval_field() {
+    local file="$1" key="$2"
+    [ -r "$file" ] || return 0
+    local line val
+    # Last matching assignment wins (mirrors shell's source semantics for
+    # repeated keys) without executing anything.
+    line=$(grep -E "^[[:space:]]*${key}=" "$file" 2>/dev/null | tail -n1)
+    [ -n "$line" ] || return 0
+    line=${line%$'\r'}          # strip a trailing CR (CRLF files)
+    val=${line#*=}
+    case "$val" in
+        \"*)  val=${val#\"}; val=${val%%\"*} ;;   # up to the matching " (rest = comment/junk)
+        \'*)  val=${val#\'}; val=${val%%\'*} ;;   # up to the matching '
+        *)    val=${val%%[[:space:]]\#*}          # unquoted: drop a trailing " # comment"
+              val=${val%%[[:space:]]} ;;          # and one trailing space
+    esac
+    printf '%s' "$val"
+}
+
 manifest_add() {
     local rel="$1"
     local hash
     hash=$(file_sha256 "${ESP}/${rel}")
     MANIFEST_ENTRIES+=("sha256:${hash}  ${rel}")
+}
+
+# Record a BLS entry in the manifest, location-aware. ESP-staged entries keep
+# the historical ESP-relative path (`loader/entries/X.conf`). Read-in-place
+# entries live on a different partition (/boot), so they get a `boot:`-prefixed
+# path (`boot:loader/entries/X.conf`) — the manifest is anchored on the ESP and
+# cannot hold a second partition's files by a plain relative path. The `boot:`
+# rows still contain the substring `loader/entries/X.conf`, so the existing
+# substring-based manifest greps in the stale/removal paths keep matching; the
+# NVRAM gate skips `boot:` rows (they are not part of the Secure Boot chain).
+manifest_add_bls() {
+    local conf_name="$1"
+    if (( BLS_ON_BOOT )); then
+        local hash
+        hash=$(file_sha256 "${BLS_INSTALL_DIR}/${conf_name}")
+        MANIFEST_ENTRIES+=("sha256:${hash}  boot:${BLS_DIR}/${conf_name}")
+    else
+        manifest_add "${BLS_DIR}/${conf_name}"
+    fi
 }
 
 # find_dist_file(relative_path) — search for a dist file across multiple layouts
@@ -311,6 +578,68 @@ efi_loader_path() {
     fi
 }
 
+# A genuine shim is distinguishable from GRUB / systemd-boot / rEFInd / a
+# foreign loader parked at the same path by markers no other EFI binary
+# carries: its SBAT metadata declares a `shim,<gen>,UEFI shim` component, and
+# it embeds MokManager handoff strings. The prior check was merely `file ... |
+# grep PE32+`, which accepts ANY EFI binary at a shim search path — including a
+# distro's GRUB or systemd-boot — as the Secure Boot anchor LamBoot then chains
+# through and copies in under a shim loader name. Trusting a non-shim binary as
+# the SB anchor undermines the whole shim->MOK chain.
+# Portable "is this a PE/EFI binary?" — prefer `file`, but DEGRADE to an
+# od-based header read when `file` is absent (BusyBox/Alpine rescue shells,
+# minimal containers, stripped initramfs/live ISOs — common recovery/imaging
+# contexts) rather than rejecting every candidate. Reads the `MZ` magic at
+# offset 0 and the `PE\0\0` signature at e_lfanew (uint32 LE at 0x3C), the same
+# shape validate_efi_binary uses. od is coreutils (a declared dependency).
+_is_pe_binary() {
+    local p="$1"
+    if command -v file >/dev/null 2>&1; then
+        file "$p" 2>/dev/null | grep -q 'PE32+'
+        return
+    fi
+    [ "$(od -An -tx1 -N2 "$p" 2>/dev/null | tr -d ' \n')" = "4d5a" ] || return 1
+    local e_lfanew
+    e_lfanew=$(od -An -tu4 -j60 -N4 "$p" 2>/dev/null | tr -d ' \n')
+    [ -n "$e_lfanew" ] || return 1
+    [ "$(od -An -tx1 -j"$e_lfanew" -N4 "$p" 2>/dev/null | tr -d ' \n')" = "50450000" ]
+}
+
+# A genuine shim is distinguishable from GRUB / systemd-boot / rEFInd / a
+# foreign loader parked at the same path by markers no other EFI binary carries.
+# The prior bare `file ... | grep PE32+` accepted ANY EFI binary at a shim
+# search path as the Secure Boot anchor; trusting a non-shim there undermines
+# the whole shim->MOK chain. But REJECTING a genuine shim is equally dangerous
+# (SB install silently degrades to a direct-loader entry that won't boot on a
+# MOK-only host), so the markers below are calibrated to accept every real shim
+# — modern (SBAT) AND pre-SBAT (15.3-era, still on Ubuntu 20.04 / RHEL 8 ESPs).
+is_genuine_shim() {
+    local path="$1"
+    [ -f "$path" ] || return 1
+    _is_pe_binary "$path" || return 1
+
+    # Marker 1 (ASCII `.sbat` row): shim's SBAT component. Major distros keep the
+    # canonical `shim,<gen>,UEFI shim` even when rebuilding (only the generation
+    # changes), so a strings-free `grep -a` finds it. GRUB carries `grub,<gen>`,
+    # systemd-boot `systemd-boot,<gen>`; neither matches. (NOT keyed on
+    # `shim_lock`: GRUB's shim_lock verifier module embeds that string.)
+    if grep -aqE 'shim,[0-9]+,UEFI shim' "$path" 2>/dev/null; then
+        return 0
+    fi
+    # Marker 2 (MokManager handoff): shim launches \EFI\<vendor>\mm{x64,aa64}.efi
+    # and presents "MokManager". These are CHAR16 (UTF-16LE) EFI strings, so a
+    # byte-wise `grep -a` CANNOT see them (the bytes are m\0m\0x\0...). Strip the
+    # NULs first — `tr -d '\0'` collapses UTF-16LE-of-ASCII back to ASCII — which
+    # is strings-free (no binutils dependency) and ALSO matches any ASCII copy.
+    # This is the safety net for a pre-SBAT shim (no `.sbat` section at all) or a
+    # downstream that reworded its SBAT vendor field.
+    if tr -d '\0' < "$path" 2>/dev/null \
+        | grep -qE 'mmx64\.efi|mmaa64\.efi|MokManager' 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
 # Find the distro's shim binary for Secure Boot chain loading
 find_distro_shim() {
     local shim_paths=(
@@ -319,17 +648,26 @@ find_distro_shim() {
         "${ESP}/EFI/fedora/shimx64.efi"
         "${ESP}/EFI/centos/shimx64.efi"
         "${ESP}/EFI/rhel/shimx64.efi"
+        "${ESP}/EFI/rocky/shimx64.efi"
+        "${ESP}/EFI/almalinux/shimx64.efi"
         "${ESP}/EFI/opensuse/shimx64.efi"
+        "${ESP}/EFI/proxmox/shimx64.efi"
+        "${ESP}/EFI/systemd/shim.efi"
         "${ESP}/EFI/BOOT/BOOTX64.EFI"
     )
 
+    local path
     for path in "${shim_paths[@]}"; do
-        if [ -f "$path" ]; then
-            # Verify it's actually shim (check for MokManager reference or shim signature)
-            if file "$path" 2>/dev/null | grep -q "PE32+"; then
-                SHIM_SOURCE="$path"
-                return 0
-            fi
+        [ -f "$path" ] || continue
+        if is_genuine_shim "$path"; then
+            SHIM_SOURCE="$path"
+            return 0
+        fi
+        # A PE binary parked at a shim path that fails the authenticity check
+        # (e.g. a distro's GRUB or systemd-boot at \EFI\BOOT\BOOTX64.EFI) is
+        # NOT a usable SB anchor — record and keep looking.
+        if file "$path" 2>/dev/null | grep -q 'PE32+'; then
+            detail "not a genuine shim, skipping as SB anchor: ${path}"
         fi
     done
 
@@ -338,6 +676,43 @@ find_distro_shim() {
 }
 
 SHIM_SOURCE=""
+
+# Inspect a shim binary and return the .efi filename it chainloads by
+# default. Upstream shim hardcodes "grubx64.efi"; SUSE's downstream
+# shim hardcodes "grub.efi"; future distros may pick other names.
+#
+# The default-loader name is embedded as a UTF-16LE string in the shim
+# binary (CHAR16, as required by EFI conventions). We extract it via
+# `strings -e l` and filter out unrelated .efi references (MokManager,
+# fallback, revocations, certificate names).
+#
+# Returns the bare basename (e.g. "grub.efi" or "grubx64.efi") on
+# success, empty string on failure (caller should default to
+# "grubx64.efi" — the most common case).
+#
+# Identification is by the DOUBLE-BACKSLASH prefix shim uses for the
+# default loader path. Single-backslash strings (`\fbx64.efi`,
+# `\fallback.efi`, `\mmx64.efi`) are the fallback bootloader or
+# MokManager — never the default. Negative-filter heuristics (Bug 18
+# original) are brittle: Proxmox's fallback bootloader is named
+# `fbx64.efi` which slips past name-based exclusion lists like
+# `grep -v fallback`, and picking it as the default-loader name
+# would cause lamboot-install to OVERWRITE the legitimate Proxmox
+# fallback bootloader with LamBoot. (Bug 18.5)
+detect_shim_default_loader() {
+    local shim="$1"
+    [ -n "$shim" ] && [ -f "$shim" ] || { echo ""; return 1; }
+
+    command -v strings >/dev/null 2>&1 || { echo ""; return 1; }
+
+    # Positive identification by the `\\<name>.efi` marker.
+    # The shell regex needs four backslashes to match two literal
+    # backslashes in the string (shell escape + grep ERE escape).
+    strings -e l "$shim" 2>/dev/null \
+      | grep -E '^\\\\[a-zA-Z0-9._-]+\.efi$' \
+      | head -1 \
+      | sed 's|^\\\\||'
+}
 
 fallback_name() {
     case "$ARCH" in
@@ -401,11 +776,145 @@ find_source_dir() {
 }
 
 detect_chroot() {
+    # v0.10.1: --root PATH explicitly tells us we're operating on a target
+    # different from the running host. Treat identically to in-chroot mode
+    # so the deferral logic for NVRAM / MOK / TPM operations fires.
+    if [[ -n "$OPT_ROOT" && "$OPT_ROOT" != "/" ]]; then
+        IS_CHROOT=1
+        return 0
+    fi
     if [ ! -d /sys/firmware/efi ]; then
         if [ -e /proc/1/root ] && [ "$(stat -c %d:%i /)" != "$(stat -c %d:%i /proc/1/root 2>/dev/null)" ]; then
             IS_CHROOT=1
         fi
     fi
+}
+
+# v0.11.2 — Consume a capcheck audit JSON and derive install hints.
+#
+# Contract: this is OPTIONAL. We never invoke lamboot-capcheck; the
+# operator (or upstream tooling) generated the JSON. If the file is
+# missing, unreadable, or malformed, we WARN and continue — there is
+# no hard dependency on lamboot-capcheck.
+#
+# Actions taken:
+#   1. quirks_matched[severity=critical] AND no --force → die_unsafe
+#   2. secure-boot.state.claim.deployed_mode == true AND --signed not set
+#      → imply --signed (sets OPT_SIGNED=1)
+#   3. Any quirk match → log id + severity for operator visibility
+#   4. summary.exit_code > 4 (FAIL) AND no --force → die_unsafe
+#
+# JSON parsing: we prefer jq when available (cleanest), but fall back
+# to grep/sed for the small set of fields we read. That keeps jq off
+# the hard-dependency list. Plain-grep robustness is acceptable here
+# because we only consume capcheck's schema-v1 fields we control.
+consume_capcheck_json() {
+    local path="$1"
+
+    if [ ! -f "$path" ]; then
+        warn "--capcheck-json: file not found: $path (continuing without hints)"
+        return 0
+    fi
+    if [ ! -r "$path" ]; then
+        warn "--capcheck-json: file not readable: $path (continuing without hints)"
+        return 0
+    fi
+
+    local schema_version
+    local critical_quirks=""
+    local all_quirks=""
+    local deployed_mode=""
+    local checks_fail=""
+    local exit_code=""
+    local capcheck_version=""
+
+    if command -v jq >/dev/null 2>&1; then
+        # Validate JSON first
+        if ! jq -e . "$path" >/dev/null 2>&1; then
+            warn "--capcheck-json: $path is not valid JSON (continuing without hints)"
+            return 0
+        fi
+        schema_version=$(jq -r '.schema_version // empty' "$path")
+        capcheck_version=$(jq -r '.capcheck_version // empty' "$path")
+        critical_quirks=$(jq -r '.quirks_matched[]? | select(.severity == "critical") | .id' "$path")
+        all_quirks=$(jq -r '.quirks_matched[]? | "\(.severity)\t\(.id)\t\(.one_line)"' "$path")
+        deployed_mode=$(jq -r '.domains[]? | select(.name == "secure-boot") | .checks[]? | select(.name == "secure-boot.state") | .claim.deployed_mode // empty' "$path")
+        checks_fail=$(jq -r '.summary.checks_fail // 0' "$path")
+        exit_code=$(jq -r '.summary.exit_code // 0' "$path")
+    else
+        # Minimal grep-based reader. Limited but adequate.
+        schema_version=$(grep -oE '"schema_version":[[:space:]]*[0-9]+' "$path" | head -1 | grep -oE '[0-9]+$' || true)
+        capcheck_version=$(grep -oE '"capcheck_version":[[:space:]]*"[^"]*"' "$path" | head -1 | cut -d'"' -f4 || true)
+        # Critical quirks: very crude — scan for severity":"critical" within a quirks_matched object.
+        critical_quirks=$(awk '/"quirks_matched"/{in_q=1} in_q && /"severity":[[:space:]]*"critical"/{crit=1} in_q && /"id":[[:space:]]*"/{gsub(/.*"id":[[:space:]]*"/,""); gsub(/".*/,""); if (crit) print; crit=0}' "$path" || true)
+        deployed_mode=$(grep -oE '"deployed_mode":[[:space:]]*(true|false)' "$path" | head -1 | awk -F: '{gsub(/[[:space:]]/, "", $2); print $2}' || true)
+        checks_fail=$(grep -oE '"checks_fail":[[:space:]]*[0-9]+' "$path" | head -1 | grep -oE '[0-9]+$' || echo 0)
+        exit_code=$(grep -oE '"exit_code":[[:space:]]*-?[0-9]+' "$path" | head -1 | grep -oE '\-?[0-9]+$' || echo 0)
+    fi
+
+    # Schema gate — refuse anything we don't know.
+    if [ -n "$schema_version" ] && [ "$schema_version" != "1" ]; then
+        warn "--capcheck-json: schema_version=$schema_version, expected 1 (continuing best-effort)"
+    fi
+
+    msg "capcheck audit (v${capcheck_version:-?}) consulted: schema=$schema_version, checks_fail=${checks_fail:-?}, exit_code=${exit_code:-?}"
+
+    # 1. Critical-quirk gate.
+    if [ -n "$critical_quirks" ]; then
+        local idlist
+        idlist=$(printf '%s' "$critical_quirks" | tr '\n' ',' | sed 's/,$//')
+        if (( OPT_FORCE )); then
+            warn "capcheck matched CRITICAL quirk(s): $idlist — proceeding because --force is set."
+        else
+            die "capcheck matched CRITICAL quirk(s): $idlist. Install refuses to proceed. Address the underlying issue or pass --force to override (NOT recommended on critical hardware-safety quirks)."
+        fi
+    fi
+
+    # 2. Surface non-critical quirks as info.
+    if [ -n "$all_quirks" ]; then
+        local count
+        count=$(printf '%s\n' "$all_quirks" | wc -l)
+        msg "capcheck matched ${count} quirk(s):"
+        printf '%s\n' "$all_quirks" | while IFS=$'\t' read -r sev id one; do
+            msg "  [$sev] $id — $one"
+        done
+    fi
+
+    # 3. SB-deployed-mode → imply --signed.
+    if [ "$deployed_mode" = "true" ]; then
+        if (( ! OPT_SIGNED )); then
+            msg "capcheck: Secure Boot deployed mode detected → implying --signed"
+            OPT_SIGNED=1
+        fi
+    fi
+
+    # 4. FAIL-status gate.
+    if [ -n "$checks_fail" ] && [ "$checks_fail" != "0" ]; then
+        if (( OPT_FORCE )); then
+            warn "capcheck reported ${checks_fail} FAIL check(s) — proceeding because --force is set."
+        else
+            warn "capcheck reported ${checks_fail} FAIL check(s); review with: lamboot-capcheck audit. Continuing (not a hard gate unless quirk is critical)."
+        fi
+    fi
+}
+
+# v0.10.1: --root PATH — prefix host paths with the chroot root so writes
+# land under the target system, not the host. Called once from main()
+# after parse_options. SPEC-LAMBOOT-INSTALLER-PROTOCOL-V1.md §6.
+resolve_target_paths() {
+    [[ -z "$OPT_ROOT" || "$OPT_ROOT" == "/" ]] && return 0
+
+    # Normalize: strip trailing slash
+    OPT_ROOT="${OPT_ROOT%/}"
+
+    # Validate: must be an existing directory
+    if [[ ! -d "$OPT_ROOT" ]]; then
+        die "--root path does not exist or is not a directory: ${OPT_ROOT}"
+    fi
+
+    SYSTEMD_UNIT_DIR="${OPT_ROOT}${SYSTEMD_UNIT_DIR_BASE}"
+    KERNEL_INSTALL_DIR="${OPT_ROOT}${KERNEL_INSTALL_DIR_BASE}"
+    KERNEL_CMDLINE_PATH="${OPT_ROOT}/etc/kernel/cmdline"
 }
 
 # Refuse to install on BIOS/legacy-booted systems. The kernel only
@@ -496,12 +1005,21 @@ detect_secure_boot() {
 }
 
 detect_distro() {
-    if [ -r /etc/os-release ]; then
-        # shellcheck source=/dev/null
-        . /etc/os-release
-        DISTRO_ID="${ID:-unknown}"
-        DISTRO_NAME="${PRETTY_NAME:-Linux}"
-        DISTRO_VERSION="${VERSION_ID:-}"
+    # v0.10.1: --root — read the TARGET's os-release, not the host's.
+    local osr="/etc/os-release"
+    [[ -n "$OPT_ROOT" && "$OPT_ROOT" != "/" ]] && osr="${OPT_ROOT}/etc/os-release"
+
+    if [ -r "$osr" ]; then
+        # Parse as DATA, never `source` — under --root this file comes from
+        # the (untrusted) target image; sourcing it would run its contents
+        # as root. See read_keyval_field.
+        local id pn vid
+        id=$(read_keyval_field "$osr" ID)
+        pn=$(read_keyval_field "$osr" PRETTY_NAME)
+        vid=$(read_keyval_field "$osr" VERSION_ID)
+        DISTRO_ID="${id:-unknown}"
+        DISTRO_NAME="${pn:-Linux}"
+        DISTRO_VERSION="$vid"
     else
         DISTRO_ID="unknown"
         DISTRO_NAME="Linux"
@@ -521,17 +1039,45 @@ is_esp_partition() {
     [ -n "$dev" ] || return 1
     local parttype
     parttype=$(lsblk -nro PARTTYPE "$dev" 2>/dev/null)
-    echo "$parttype" | grep -qi "$ESP_PARTTYPE_GUID"
+    # A real ESP is the GPT ESP type GUID, OR — on an MBR/msdos-labelled disk —
+    # the EFI System partition type byte 0xEF. Removable USB boot media and
+    # prebuilt appliance images are routinely MBR-labelled and report PARTTYPE
+    # `0xef`, not the GPT GUID. These ARE ESPs and worked under plain --force
+    # before --force-foreign-esp existed; keep accepting them so the dedicated
+    # flag is only needed for a genuinely non-ESP-typed vfat partition.
+    echo "$parttype" | grep -qiE "${ESP_PARTTYPE_GUID}|^0xef$"
 }
 
 validate_esp() {
     local mp="$1"
 
-    mountpoint -q "$mp" 2>/dev/null || { detail "not a mountpoint: ${mp}"; return 1; }
-    is_vfat "$mp"                   || { detail "not vfat: ${mp}"; return 1; }
+    # v0.10.1: under --root the chroot's "ESP" is a plain directory under
+    # the target's tree, not a separately-mounted vfat partition on the
+    # installer host. The mountpoint/vfat/partition-type checks all
+    # examine the *host's* view, so they would falsely reject a valid
+    # target-ESP path. Skip them — the target system is responsible for
+    # mounting its own ESP at boot time.
+    if [[ -z "$OPT_ROOT" || "$OPT_ROOT" == "/" ]]; then
+        mountpoint -q "$mp" 2>/dev/null || { detail "not a mountpoint: ${mp}"; return 1; }
+        is_vfat "$mp"                   || { detail "not vfat: ${mp}"; return 1; }
 
-    if ! (( OPT_FORCE )); then
-        is_esp_partition "$mp"      || { detail "not ESP partition type: ${mp}"; return 1; }
+        # The ESP partition-type assertion is NOT bypassed by generic --force.
+        # Writing a bootloader to a vfat partition that is not GPT-typed as an
+        # ESP is a distinct, higher-consequence choice (prepare-foreign-disk /
+        # removable media) that must be named explicitly — otherwise a --force
+        # added to clear an unrelated gate (ESP space, the fallback overwrite)
+        # would silently authorize writing to the wrong partition.
+        if ! (( OPT_FORCE_FOREIGN_ESP )); then
+            if ! is_esp_partition "$mp"; then
+                detail "not ESP partition type: ${mp}"
+                if (( OPT_FORCE )); then
+                    warn "${mp} is vfat but NOT GPT-typed as an EFI System Partition."
+                    warn "Generic --force does not authorize writing here; pass --force-foreign-esp"
+                    warn "if this is a deliberate removable-media / foreign-disk preparation."
+                fi
+                return 1
+            fi
+        fi
     fi
 
     if ! (( OPT_DRY_RUN )); then
@@ -572,6 +1118,51 @@ find_esp() {
         fi
         _resolve_esp_device
         return 0
+    fi
+
+    # --root PATH: ESP lives under the chroot at PATH/boot/efi (or
+    # PATH/efi or PATH/boot). Two flows exist: archinstall-style
+    # (target ESP is mounted on the HOST under <root>/boot before
+    # lamboot-install runs — host mount table sees it) and offline
+    # image-builder-style (chroot is pure filesystem, no mount on the
+    # host). Acceptance signals below handle both.
+    if [[ -n "$OPT_ROOT" && "$OPT_ROOT" != "/" ]]; then
+        # Two acceptance signals for a chrooted ESP, in order of preference:
+        #   (1) EFI/ subdirectory present — established ESP (existing install,
+        #       offline service flow, etc.)
+        #   (2) Path is a vfat mountpoint on the HOST — archinstall-style
+        #       fresh-install flow: archinstall mounts the target's ESP
+        #       at <root>/boot BEFORE pacstrap, so by the time the
+        #       lamboot archinstall plugin's on_add_bootloader hook
+        #       fires lamboot-install --root /mnt, the partition is
+        #       mounted, vfat, and empty of EFI content. That's still a
+        #       valid ESP — we'll create EFI/ during the install.
+        # We accept either signal. v0.10.1 only checked (1), which broke
+        # the archinstall flow with "ESP not found" on fresh installs.
+        local rooted_mp
+        for rooted_mp in "${OPT_ROOT}/boot/efi" "${OPT_ROOT}/efi" "${OPT_ROOT}/boot"; do
+            [ -d "$rooted_mp" ] || continue
+            local accept=0
+            if [ -d "${rooted_mp}/EFI" ]; then
+                accept=1
+                detail "ESP candidate ${rooted_mp}: established (EFI/ present)"
+            elif mountpoint -q "$rooted_mp" 2>/dev/null && is_vfat "$rooted_mp"; then
+                accept=1
+                detail "ESP candidate ${rooted_mp}: fresh-install (vfat mountpoint, no EFI/ yet)"
+                # Create EFI/ so downstream phases don't trip on its absence.
+                mkdir -p "${rooted_mp}/EFI" 2>/dev/null || true
+            fi
+            if (( accept )) && validate_esp "$rooted_mp"; then
+                ESP="$rooted_mp"
+                detail "ESP found under --root: ${ESP}"
+                # Device-resolution skipped under --root (we can't run
+                # efibootmgr against the chroot anyway; first-boot does it)
+                ESP_DISK=""
+                ESP_PARTNUM=""
+                return 0
+            fi
+        done
+        die "ESP not found under --root ${OPT_ROOT} (looked for /boot/efi, /efi, /boot — none had an EFI/ subdir OR were a vfat mountpoint on the host)"
     fi
 
     # Method 1: Standard mount points (bootctl order)
@@ -619,7 +1210,13 @@ find_esp() {
         if [ -z "$mp" ]; then
             mp=$(mktemp -d /tmp/lamboot-esp-XXXXXX)
             detail "Mounting ESP from block scan: ${esp_part} -> ${mp}"
-            mount "$esp_part" "$mp" 2>/dev/null || { rmdir "$mp" 2>/dev/null; mp=""; }
+            if mount "$esp_part" "$mp" 2>/dev/null; then
+                # Hand ownership to the EXIT trap so the mount + dir are
+                # cleaned up when the tool exits (was previously leaked).
+                _LAMBOOT_TMP_ESP_MOUNT="$mp"
+            else
+                rmdir "$mp" 2>/dev/null; mp=""
+            fi
         fi
         if [ -n "$mp" ] && validate_esp "$mp"; then
             ESP="$mp"
@@ -685,12 +1282,14 @@ phase1_detect_environment() {
 # driver for it)? Mirrors lamboot-core/src/drivers.rs::filesystem_natively_covered.
 #
 # Kept in sync by convention — if you add a native backend in lamboot-core,
-# extend this list too. Both sides cover ext2/ext3/ext4 via ext4-view (SDS-2)
-# and FAT is always UEFI-native.
+# extend this list too. Both sides cover:
+#   * ext2/ext3/ext4 via ext4-view (SDS-2)
+#   * btrfs via lambutter (Path A; lamboot-core/src/fs_backend_btrfs.rs)
+#   * FAT is always UEFI-native
 is_filesystem_natively_covered() {
     case "$1" in
-        ext2|ext3|ext4|vfat|fat|fat32) return 0 ;;
-        # Future v1.1+: btrfs, xfs if native backends land in lamboot-core.
+        ext2|ext3|ext4|btrfs|vfat|fat|fat32) return 0 ;;
+        # Future: xfs if native backend lands in lamboot-core.
         *) return 1 ;;
     esac
 }
@@ -767,19 +1366,32 @@ phase2_assess_drivers() {
             fi
             ;;
         auto)
-            # SDS-6 default. If the filesystem is natively covered AND the
-            # legacy flag didn't force-on, skip the driver install.
+            # SDS-6 default + Path A. If the filesystem is natively covered
+            # by a compiled-in backend (ext4-view for ext2/3/4, lambutter
+            # for btrfs, UEFI for FAT), skip the legacy driver install
+            # unconditionally. The legacy --with-drivers flag used to
+            # force-on here as a v0.8.3 escape hatch; that override is
+            # obsolete now that native coverage is the canonical path
+            # (and a release tarball post-SDS-6 may not even ship the
+            # corresponding _x64.efi files). The --with-drivers flag is
+            # still honored for FS types that lack native coverage; see
+            # the post-case check below.
             if is_filesystem_natively_covered "$BOOT_FSTYPE"; then
-                if (( OPT_WITH_DRIVERS != 1 )); then
-                    detail "${BOOT_FSTYPE} is natively covered by LamBoot (SDS-2); skipping driver install"
-                    NEED_FS_DRIVER=0
-                fi
+                detail "${BOOT_FSTYPE} is natively covered by LamBoot; skipping driver install"
+                NEED_FS_DRIVER=0
             fi
             ;;
     esac
 
-    # Legacy --with-drivers=1 (force) still wins unless policy is "none".
-    if (( OPT_WITH_DRIVERS == 1 )) && [ "$OPT_WITH_DRIVERS_LEGACY" != "none" ]; then
+    # Legacy --with-drivers=1 (force) still wins unless policy is "none"
+    # OR the filesystem is natively covered by a compiled-in backend. The
+    # latter exception matters because lamboot-migrate (SDS-7) hardcodes
+    # --with-drivers in its lamboot-install invocation; without this
+    # exemption, every Path-A btrfs install would warn-then-fail on a
+    # btrfs_x64.efi driver that no longer ships nor is needed.
+    if (( OPT_WITH_DRIVERS == 1 )) \
+       && [ "$OPT_WITH_DRIVERS_LEGACY" != "none" ] \
+       && ! is_filesystem_natively_covered "$BOOT_FSTYPE"; then
         NEED_FS_DRIVER=1
     fi
 
@@ -817,9 +1429,9 @@ prune_natively_covered_drivers() {
 
     local removed=0
     local pruned
-    for pruned in ext4_x64.efi ext2_x64.efi ext3_x64.efi \
-                  ext4_x64-signed.efi ext2_x64-signed.efi ext3_x64-signed.efi \
-                  aarch64/ext4_aa64.efi aarch64/ext2_aa64.efi aarch64/ext3_aa64.efi; do
+    for pruned in ext4_x64.efi ext2_x64.efi ext3_x64.efi btrfs_x64.efi \
+                  ext4_x64-signed.efi ext2_x64-signed.efi ext3_x64-signed.efi btrfs_x64-signed.efi \
+                  aarch64/ext4_aa64.efi aarch64/ext2_aa64.efi aarch64/ext3_aa64.efi aarch64/btrfs_aa64.efi; do
         local f="${drivers_dir}/${pruned}"
         if [ -f "$f" ]; then
             # The `run` wrapper takes a description first, then the
@@ -850,13 +1462,233 @@ prune_natively_covered_drivers() {
 # Phase 3: Boot Entry Discovery
 # ============================================================================
 
+synthesize_cmdline_from_mount() {
+    # v0.11.11 — Under --root, query the LIVE HOST's mount table for what
+    # is actually mounted at $OPT_ROOT. That is authoritative regardless
+    # of whether the chroot's /etc/fstab has been populated yet by the
+    # distro installer.
+    #
+    # v0.11.10 read $OPT_ROOT/etc/fstab — which on archinstall fails
+    # because archinstall fires the bootloader plugin BEFORE its
+    # genfstab step. On VM 363 v0.11.10 left BLS `options` empty and
+    # the kernel error'd at root-fs mount ("failed to mount /sysroot").
+    #
+    # findmnt -no SOURCE,UUID,FSTYPE,OPTIONS gives us source device,
+    # UUID, filesystem type, and live mount options (including btrfs
+    # subvol=, etc.). Use UUID= form for root= because device paths
+    # can drift across reboots; UUID is stable.
+    #
+    # Fall back to /etc/fstab read only when findmnt is unavailable
+    # (offline image-builder scenarios on minimal hosts).
+    if ! command -v findmnt >/dev/null 2>&1; then
+        detail "findmnt not available; falling back to fstab read"
+        synthesize_cmdline_from_fstab_fallback
+        return $?
+    fi
+
+    local root_info
+    root_info=$(findmnt -no SOURCE,UUID,FSTYPE,OPTIONS --target "$OPT_ROOT" 2>/dev/null)
+    [ -n "$root_info" ] || {
+        detail "findmnt found no mount for ${OPT_ROOT}; cmdline synthesis skipped"
+        return 1
+    }
+
+    local root_src root_uuid root_type root_opts
+    read -r root_src root_uuid root_type root_opts <<<"$root_info"
+
+    detail "live mount for ${OPT_ROOT}: src=${root_src} uuid=${root_uuid} type=${root_type}"
+
+    # Prefer UUID= (stable across reboots) over device path. Fall back
+    # to device source if filesystem reports no UUID (uncommon).
+    local root_spec
+    if [ -n "$root_uuid" ]; then
+        root_spec="UUID=${root_uuid}"
+    else
+        root_spec="$root_src"
+    fi
+
+    local cmdline="root=${root_spec} rw"
+
+    # Filesystem-specific cmdline additions
+    case "$root_type" in
+        btrfs)
+            # archinstall btrfs layouts use subvol=@ or subvol=/@.
+            # The subvol/subvolid is in the LIVE mount options.
+            local subvol_opt
+            subvol_opt=$(echo "$root_opts" | tr ',' '\n' \
+                | grep -E '^(subvol|subvolid)=' | head -1)
+            if [ -n "$subvol_opt" ]; then
+                cmdline="${cmdline} rootflags=${subvol_opt}"
+            fi
+            ;;
+    esac
+
+    # LUKS handling (v0.11.12). Detect LUKS by walking the device chain
+    # under $root_src via `lsblk -snro NAME,TYPE`. If any layer is type
+    # "crypt", root is on LUKS (possibly LVM-on-LUKS or plain LUKS).
+    #
+    # For systemd-cryptsetup (sd-encrypt initramfs hook) on first boot
+    # we need BOTH:
+    #   rd.luks.uuid=<luks-header-uuid>
+    #   rd.luks.name=<luks-header-uuid>=<mapper-name>
+    # The mapper name matters because the chroot's LVM/fstab refers to
+    # the named mapper (e.g. /dev/mapper/cryptlvm); without rd.luks.name=
+    # systemd picks "luks-<uuid>" by default and the LVM PV scan finds
+    # nothing under the chroot-expected name.
+    #
+    # We get name + underlying device from lsblk (immune to the same
+    # archinstall ordering issue that v0.11.10 fstab read hit, since
+    # the live mount layer is already active at plugin-fire time).
+    # We get the LUKS-header UUID from `cryptsetup luksUUID` on the
+    # underlying device, which is more authoritative than parsing the
+    # chroot's possibly-empty /etc/crypttab.
+    local crypt_name="" luks_underlying=""
+    local _in_crypt=0
+    if command -v lsblk >/dev/null 2>&1; then
+        while read -r _node _ntype; do
+            case "$_ntype" in
+                crypt)
+                    crypt_name="$_node"
+                    _in_crypt=1
+                    ;;
+                part)
+                    if (( _in_crypt )); then
+                        luks_underlying="/dev/${_node}"
+                        break
+                    fi
+                    ;;
+            esac
+        done < <(lsblk -snro NAME,TYPE "$root_src" 2>/dev/null)
+    fi
+
+    if [ -n "$crypt_name" ]; then
+        local luks_uuid=""
+        if [ -n "$luks_underlying" ] && command -v cryptsetup >/dev/null 2>&1; then
+            luks_uuid=$(cryptsetup luksUUID "$luks_underlying" 2>/dev/null)
+            [ -n "$luks_uuid" ] && detail "LUKS UUID via cryptsetup luksUUID ${luks_underlying}: ${luks_uuid}"
+        fi
+
+        # Crypttab fallback for the UUID (in case lsblk/cryptsetup
+        # didn't surface a partition node — e.g. LUKS-on-LV or
+        # LUKS-on-md). Handles UUID=, /dev/disk/by-uuid/, and plain
+        # device path forms.
+        if [ -z "$luks_uuid" ] && [ -r "${OPT_ROOT}/etc/crypttab" ]; then
+            local _cline _cname _cdev _crest
+            while IFS= read -r _cline; do
+                case "$_cline" in '#'*|'') continue;; esac
+                read -r _cname _cdev _crest <<<"$_cline"
+                [ -n "$_cname" ] && [ -n "$_cdev" ] || continue
+                case "$_cdev" in
+                    UUID=*)              luks_uuid="${_cdev#UUID=}" ;;
+                    /dev/disk/by-uuid/*) luks_uuid="${_cdev#/dev/disk/by-uuid/}" ;;
+                    /dev/*)
+                        luks_uuid=$(blkid -s UUID -o value "$_cdev" 2>/dev/null)
+                        ;;
+                esac
+                break
+            done < "${OPT_ROOT}/etc/crypttab"
+            [ -n "$luks_uuid" ] && detail "LUKS UUID via crypttab fallback: ${luks_uuid}"
+        fi
+
+        if [ -n "$luks_uuid" ]; then
+            cmdline="${cmdline} rd.luks.uuid=${luks_uuid}"
+            cmdline="${cmdline} rd.luks.name=${luks_uuid}=${crypt_name}"
+        else
+            warn "LUKS detected (mapper=${crypt_name}) but no LUKS-header UUID resolvable;"
+            warn "  first boot will hang on root unless cmdline is fixed manually."
+            PARTIAL_FAILURE=1
+        fi
+    fi
+
+    KERNEL_CMDLINE="$cmdline"
+    detail "synthesized cmdline (live mount): ${KERNEL_CMDLINE}"
+    return 0
+}
+
+synthesize_cmdline_from_fstab_fallback() {
+    # v0.11.10 fallback path — used only if findmnt is unavailable.
+    # Keeps offline image-builder flows with a populated chroot fstab
+    # working.
+    local fstab="${OPT_ROOT}/etc/fstab"
+    [ -r "$fstab" ] || { detail "fstab not readable at ${fstab}; cmdline synthesis skipped"; return 1; }
+
+    local fs_spec mountpoint fs_type fs_opts _dump _pass
+    local root_spec="" root_type="" root_opts=""
+    while read -r fs_spec mountpoint fs_type fs_opts _dump _pass; do
+        case "$fs_spec" in '#'*|'') continue;; esac
+        if [ "$mountpoint" = "/" ]; then
+            root_spec="$fs_spec"
+            root_type="$fs_type"
+            root_opts="$fs_opts"
+            break
+        fi
+    done < "$fstab"
+
+    [ -n "$root_spec" ] || { detail "no root mount in ${fstab}; cmdline synthesis skipped"; return 1; }
+    detail "fstab root: ${root_spec} type=${root_type} opts=${root_opts}"
+
+    local cmdline="root=${root_spec} rw"
+
+    case "$root_type" in
+        btrfs)
+            local subvol_opt
+            subvol_opt=$(echo "$root_opts" | tr ',' '\n' \
+                | grep -E '^(subvol|subvolid)=' | head -1)
+            if [ -n "$subvol_opt" ]; then
+                cmdline="${cmdline} rootflags=${subvol_opt}"
+            fi
+            ;;
+    esac
+
+    if [[ "$root_spec" == /dev/mapper/* ]] || [[ "$root_spec" == UUID=* && -r "${OPT_ROOT}/etc/crypttab" ]]; then
+        local crypt_uuid
+        crypt_uuid=$(awk '/^[^#]/ && NF>=2 {
+            sub(/UUID=/,"",$2); print $2; exit
+        }' "${OPT_ROOT}/etc/crypttab" 2>/dev/null)
+        if [ -n "$crypt_uuid" ]; then
+            cmdline="${cmdline} rd.luks.uuid=${crypt_uuid}"
+        fi
+    fi
+
+    KERNEL_CMDLINE="$cmdline"
+    detail "synthesized cmdline (fstab fallback): ${KERNEL_CMDLINE}"
+    return 0
+}
+
+# Debian/Proxmox /etc/kernel/cmdline conventionally omits root= (the native
+# BLS generator supplies it). Reading it verbatim would yield a BLS entry that
+# boots the kernel but cannot mount the rootfs. Inject root= (+ ro) from the
+# live root device when absent, so generate_bls_entry produces bootable entries
+# on every layout. No-op when root= is already present (/proc/cmdline, --root
+# synthesis), so mainstream installs are unaffected.
+ensure_root_in_kernel_cmdline() {
+    case " $KERNEL_CMDLINE " in
+        *" root="*) return 0 ;;
+    esac
+    local rootdev
+    rootdev=$(findmnt -no SOURCE "${OPT_ROOT:-/}" 2>/dev/null)
+    [ -n "$rootdev" ] || return 0
+    if [ -n "$KERNEL_CMDLINE" ]; then
+        KERNEL_CMDLINE="root=${rootdev} ro ${KERNEL_CMDLINE}"
+    else
+        KERNEL_CMDLINE="root=${rootdev} ro"
+    fi
+}
+
 get_kernel_cmdline() {
-    if [ -r /etc/kernel/cmdline ]; then
-        KERNEL_CMDLINE=$(cat /etc/kernel/cmdline)
-    elif [ -r /proc/cmdline ]; then
+    if [ -r "$KERNEL_CMDLINE_PATH" ]; then
+        KERNEL_CMDLINE=$(cat "$KERNEL_CMDLINE_PATH")
+    elif [ -r /proc/cmdline ] && [[ -z "$OPT_ROOT" || "$OPT_ROOT" == "/" ]]; then
+        # Host's /proc/cmdline is only meaningful when installing on the host
+        # itself.
         KERNEL_CMDLINE=$(sed 's/\bBOOT_IMAGE=[^ ]* *//;s/\binitrd=[^ ]* *//' /proc/cmdline)
+    elif [[ -n "$OPT_ROOT" && "$OPT_ROOT" != "/" ]]; then
+        # v0.11.11 — under --root, query live mount table at $OPT_ROOT.
+        # Authoritative regardless of distro-installer fstab-write timing.
+        synthesize_cmdline_from_mount || true
     fi
     KERNEL_CMDLINE=$(echo "$KERNEL_CMDLINE" | xargs)
+    ensure_root_in_kernel_cmdline
 }
 
 get_entry_token() {
@@ -872,19 +1704,22 @@ get_entry_token() {
 
 scan_existing_bls() {
     local bls_dir="${ESP}/${BLS_DIR}"
+    local f _ver
     if [ -d "$bls_dir" ]; then
-        local f
         for f in "$bls_dir"/*.conf; do
             [ -f "$f" ] || continue
             EXISTING_BLS+=("$(basename "$f")")
+            _ver=$(awk '/^version[[:space:]]/{print $2; exit}' "$f")
+            [ -n "$_ver" ] && COVERED_VERSIONS+=("$_ver")
         done
     fi
 
     if [ -d /boot/loader/entries ]; then
-        local f
         for f in /boot/loader/entries/*.conf; do
             [ -f "$f" ] || continue
             EXISTING_BLS+=("$(basename "$f")")
+            _ver=$(awk '/^version[[:space:]]/{print $2; exit}' "$f")
+            [ -n "$_ver" ] && COVERED_VERSIONS+=("$_ver")
         done
     fi
 
@@ -925,24 +1760,110 @@ scan_existing_bls() {
     fi
 }
 
+# v0.11.19 — Detect the system's native kernel->boot-entry manager and, for
+# systemd kernel-install, the layout it would use. Best-effort and non-fatal;
+# drives cooperative gap-fill (phase5), layout normalization (phase7), and the
+# coverage assertions (phase8). Works on-host and (file-based) under --root.
+detect_boot_entry_manager() {
+    NATIVE_ENTRY_MANAGER="none"
+    KERNEL_INSTALL_LAYOUT_DETECTED=""
+    local on_host=0
+    [[ -z "$OPT_ROOT" || "$OPT_ROOT" == "/" ]] && on_host=1
+
+    if command -v proxmox-boot-tool >/dev/null 2>&1; then
+        NATIVE_ENTRY_MANAGER="proxmox-boot-tool"
+    elif command -v sdbootutil >/dev/null 2>&1; then
+        NATIVE_ENTRY_MANAGER="sdbootutil"
+    elif [ -d "${KERNEL_INSTALL_DIR}" ] || { (( on_host )) && command -v kernel-install >/dev/null 2>&1; }; then
+        NATIVE_ENTRY_MANAGER="systemd-kernel-install"
+        if (( on_host )) && command -v kernel-install >/dev/null 2>&1; then
+            KERNEL_INSTALL_LAYOUT_DETECTED=$(kernel-install inspect 2>/dev/null \
+                | awk -F': *' '/^[[:space:]]*Layout:/{gsub(/[[:space:]]/,"",$2); print $2; exit}')
+        fi
+    elif [ -d "${OPT_ROOT}/etc/kernel/postinst.d" ]; then
+        NATIVE_ENTRY_MANAGER="debian-hooks"
+    fi
+
+    detail "Native boot-entry manager: ${NATIVE_ENTRY_MANAGER}${KERNEL_INSTALL_LAYOUT_DETECTED:+ (kernel-install layout=${KERNEL_INSTALL_LAYOUT_DETECTED})}"
+}
+
 # Check BLS entries we own for stale kernel references. Returns 0 if any
 # of our entries references a missing kernel (caller should regenerate).
+# Decide where BLS entries go: ESP-staged (default, always correct) or
+# read-in-place on a separate /boot LamBoot can read natively. Idempotent;
+# emits the decision to the report. Must run after ESP is resolved and before
+# the stale-check / generation consume BLS_INSTALL_DIR.
+detect_bls_target() {
+    # Default: ESP-staged.
+    BLS_INSTALL_DIR="${ESP}/${BLS_DIR}"
+    BLS_ON_BOOT=0
+    BLS_PLACEMENT="esp"
+
+    local reason="default"
+
+    # --root/chroot: the host's /boot is not the target's; never infer
+    # read-in-place from the installer host's mount table. Keep ESP placement.
+    if [ -n "$OPT_ROOT" ] && [ "$OPT_ROOT" != "/" ]; then
+        reason="chroot_root"
+    # /boot must be a SEPARATE mountpoint (its own partition), not the ESP and
+    # not just a directory on the root fs.
+    elif ! mountpoint -q /boot 2>/dev/null; then
+        reason="boot_not_separate"
+    else
+        local boot_src esp_src boot_fs
+        boot_src=$(findmnt -n -o SOURCE /boot 2>/dev/null)
+        esp_src=$(findmnt -n -o SOURCE "$ESP" 2>/dev/null)
+        boot_fs=$(findmnt -n -o FSTYPE /boot 2>/dev/null)
+        if [ -z "$boot_src" ] || [ "$boot_src" = "$esp_src" ]; then
+            # /boot IS the ESP (e.g. ESP mounted directly at /boot).
+            reason="boot_is_esp"
+        else
+            case "$boot_fs" in
+                # Filesystems LamBoot reads natively. vfat is covered by the
+                # FatRo reader (v0.15.0); ext2/3/4 + btrfs by the native
+                # backends. xfs/f2fs/ntfs/zfs are via-driver/none — stay ESP.
+                vfat|ext2|ext3|ext4|btrfs)
+                    BLS_INSTALL_DIR="/boot/${BLS_DIR}"
+                    BLS_ON_BOOT=1
+                    BLS_PLACEMENT="boot_in_place"
+                    reason="native_readable_boot:${boot_fs}"
+                    ;;
+                *)
+                    reason="boot_fs_not_native:${boot_fs:-unknown}"
+                    ;;
+            esac
+        fi
+    fi
+
+    emit_event bls_placement bls \
+        "mode=${BLS_PLACEMENT}" "dir=${BLS_INSTALL_DIR}" "reason=${reason}"
+    if (( BLS_ON_BOOT )); then
+        detail "BLS placement: read-in-place on separate /boot (${reason})"
+    else
+        detail "BLS placement: ESP-staged (${reason})"
+    fi
+}
+
 our_bls_entries_are_stale() {
     local manifest_path="${ESP}/${MANIFEST_PATH}"
     [ -f "$manifest_path" ] || return 1
 
-    local bls_dir="${ESP}/${BLS_DIR}"
-    local entry conf_path linux_line kpath
+    local bls_dir="${BLS_INSTALL_DIR}"
+    local entry conf_path linux_line
     for entry in "${EXISTING_BLS[@]}"; do
         grep -qF "${BLS_DIR}/${entry}" "$manifest_path" || continue
         conf_path="${bls_dir}/${entry}"
         [ -f "$conf_path" ] || continue
         linux_line=$(awk '/^linux[[:space:]]/{print $2; exit}' "$conf_path")
         [ -n "$linux_line" ] || continue
-        # BLS `linux /boot/vmlinuz-x.y.z` — absolute path on ext4 root
-        kpath="$linux_line"
-        if [ ! -f "$kpath" ]; then
-            detail "Stale BLS entry ${entry}: kernel ${kpath} missing"
+        # The BLS `linux` field is relative to the boot volume, not the running
+        # root: with /boot on the root fs it is `/boot/vmlinuz-X` (resolves as
+        # an absolute path); on a SEPARATE /boot partition it is `/vmlinuz-X`,
+        # whose file lives at `/boot/vmlinuz-X`. So an entry is stale only when
+        # the kernel is absent at BOTH candidates — checking just `$linux_line`
+        # false-flagged every separate-/boot entry as stale (empty-menu wipe).
+        if [ ! -f "$linux_line" ] && [ ! -f "/boot${linux_line}" ]; then
+            detail "Stale BLS entry ${entry}: kernel ${linux_line} missing"
             return 0
         fi
     done
@@ -955,15 +1876,17 @@ remove_stale_our_bls_entries() {
     local manifest_path="${ESP}/${MANIFEST_PATH}"
     [ -f "$manifest_path" ] || return 0
 
-    local bls_dir="${ESP}/${BLS_DIR}"
-    local entry conf_path linux_line kpath
+    local bls_dir="${BLS_INSTALL_DIR}"
+    local entry conf_path linux_line
     for entry in "${EXISTING_BLS[@]}"; do
         grep -qF "${BLS_DIR}/${entry}" "$manifest_path" || continue
         conf_path="${bls_dir}/${entry}"
         [ -f "$conf_path" ] || continue
         linux_line=$(awk '/^linux[[:space:]]/{print $2; exit}' "$conf_path")
-        kpath="$linux_line"
-        if [ -n "$kpath" ] && [ ! -f "$kpath" ]; then
+        # Layout-aware (see our_bls_entries_are_stale): on a separate /boot
+        # partition the kernel for `linux /vmlinuz-X` lives at /boot/vmlinuz-X.
+        # Remove only when the kernel is absent at BOTH candidate locations.
+        if [ -n "$linux_line" ] && [ ! -f "$linux_line" ] && [ ! -f "/boot${linux_line}" ]; then
             run "remove stale ${entry}" rm -f "$conf_path" \
                 || warn "Failed to remove stale BLS entry ${entry}"
             ok "Removed stale BLS entry: ${entry}"
@@ -984,29 +1907,32 @@ scan_existing_uki() {
 
 find_initrd() {
     local ver="$1"
+    # v0.10.1: --root — search under the TARGET's /boot, not the host's.
+    local b="/boot"
+    [[ -n "$OPT_ROOT" && "$OPT_ROOT" != "/" ]] && b="${OPT_ROOT}/boot"
 
     local -a patterns=()
     case "$DISTRO_ID" in
         fedora|rhel|centos|rocky|alma)
-            patterns=("/boot/initramfs-${ver}.img") ;;
+            patterns=("${b}/initramfs-${ver}.img") ;;
         debian|ubuntu|linuxmint|pop)
-            patterns=("/boot/initrd.img-${ver}") ;;
+            patterns=("${b}/initrd.img-${ver}") ;;
         opensuse*|sles)
-            patterns=("/boot/initrd-${ver}") ;;
+            patterns=("${b}/initrd-${ver}") ;;
         void)
-            patterns=("/boot/initramfs-${ver}.img") ;;
+            patterns=("${b}/initramfs-${ver}.img") ;;
         gentoo)
             patterns=(
-                "/boot/initramfs-${ver}.img"
-                "/boot/initramfs-genkernel-*-${ver}"
+                "${b}/initramfs-${ver}.img"
+                "${b}/initramfs-genkernel-*-${ver}"
             ) ;;
         alpine)
-            patterns=("/boot/initramfs-${ver}") ;;
+            patterns=("${b}/initramfs-${ver}") ;;
         *)
             patterns=(
-                "/boot/initramfs-${ver}.img"
-                "/boot/initrd.img-${ver}"
-                "/boot/initrd-${ver}"
+                "${b}/initramfs-${ver}.img"
+                "${b}/initrd.img-${ver}"
+                "${b}/initrd-${ver}"
             ) ;;
     esac
 
@@ -1021,9 +1947,16 @@ find_initrd() {
 }
 
 find_initrd_arch() {
-    if [ -f /boot/initramfs-linux.img ]; then
+    # v0.11.13 — honor $OPT_ROOT so chroot installs (archinstall etc.)
+    # find /mnt/boot/initramfs-linux.img, not the live ISO's /boot
+    # which doesn't have a real Arch initramfs. Previously returned
+    # empty under --root, which produced BLS entries with `initrd `
+    # (empty) — exposed on VM 363 post-install.
+    local b="/boot"
+    [[ -n "$OPT_ROOT" && "$OPT_ROOT" != "/" ]] && b="${OPT_ROOT}/boot"
+    if [ -f "${b}/initramfs-linux.img" ]; then
         echo "/boot/initramfs-linux.img"
-    elif [ -f /boot/initramfs-linux-fallback.img ]; then
+    elif [ -f "${b}/initramfs-linux-fallback.img" ]; then
         echo "/boot/initramfs-linux-fallback.img"
     else
         echo ""
@@ -1032,32 +1965,43 @@ find_initrd_arch() {
 
 discover_kernels() {
     local kpath version initrd
+    # v0.10.1: under --root, discover the TARGET's kernels (under OPT_ROOT)
+    # not the installer host's. Both the search path and the recorded
+    # KERNEL_PATHS are stored as paths-on-the-target (no OPT_ROOT prefix)
+    # so generated BLS entries reference the correct paths post-boot.
+    local boot_root="/boot"
+    [[ -n "$OPT_ROOT" && "$OPT_ROOT" != "/" ]] && boot_root="${OPT_ROOT}/boot"
 
-    for kpath in /boot/vmlinuz-*; do
+    for kpath in "${boot_root}"/vmlinuz-*; do
         [ -f "$kpath" ] || continue
-        version="${kpath#/boot/vmlinuz-}"
+        version="${kpath#${boot_root}/vmlinuz-}"
         initrd=$(find_initrd "$version")
 
         KERNEL_VERSIONS+=("$version")
-        KERNEL_PATHS+=("$kpath")
-        INITRD_PATHS+=("$initrd")
+        # Strip OPT_ROOT prefix so BLS entries record paths-on-target
+        KERNEL_PATHS+=("${kpath#${OPT_ROOT}}")
+        INITRD_PATHS+=("${initrd#${OPT_ROOT}}")
     done
 
     # Arch Linux: /boot/vmlinuz-linux
-    if [ -f /boot/vmlinuz-linux ] && [ "$DISTRO_ID" = "arch" ]; then
+    if [ -f "${boot_root}/vmlinuz-linux" ] && [ "$DISTRO_ID" = "arch" ]; then
         local uname_ver
-        uname_ver=$(file /boot/vmlinuz-linux 2>/dev/null | sed -n 's/.*version \([^ ]*\).*/\1/p' || true)
+        uname_ver=$(file "${boot_root}/vmlinuz-linux" 2>/dev/null | sed -n 's/.*version \([^ ]*\).*/\1/p' || true)
         if [ -z "$uname_ver" ]; then
-            uname_ver=$(uname -r)
+            # uname -r is the host's kernel; only useful when installing
+            # on the host itself.
+            [[ -z "$OPT_ROOT" || "$OPT_ROOT" == "/" ]] && uname_ver=$(uname -r) || uname_ver=""
         fi
-        local dup=0 v
-        for v in "${KERNEL_VERSIONS[@]}"; do
-            [ "$v" = "$uname_ver" ] && dup=1 && break
-        done
-        if ! (( dup )); then
-            KERNEL_VERSIONS+=("$uname_ver")
-            KERNEL_PATHS+=("/boot/vmlinuz-linux")
-            INITRD_PATHS+=("$(find_initrd_arch)")
+        if [ -n "$uname_ver" ]; then
+            local dup=0 v
+            for v in "${KERNEL_VERSIONS[@]}"; do
+                [ "$v" = "$uname_ver" ] && dup=1 && break
+            done
+            if ! (( dup )); then
+                KERNEL_VERSIONS+=("$uname_ver")
+                KERNEL_PATHS+=("/boot/vmlinuz-linux")
+                INITRD_PATHS+=("$(find_initrd_arch)")
+            fi
         fi
     fi
 }
@@ -1070,6 +2014,7 @@ phase3_discover_entries() {
     scan_existing_bls
     scan_existing_uki
     discover_kernels
+    detect_boot_entry_manager
 
     detail "Entry token: ${ENTRY_TOKEN}"
     detail "Kernel cmdline: ${KERNEL_CMDLINE}"
@@ -1109,7 +2054,13 @@ install_efi_binary() {
   (see docs/SECURE-BOOT-DEPLOYMENT.md)"
     fi
 
-    if (( SECURE_BOOT )) && ! (( OPT_SIGNED )) && ! (( OPT_FORCE )); then
+    # v0.10.1: under --root we don't know the TARGET's Secure Boot state
+    # (the SECURE_BOOT variable reflects the installer host, which is
+    # irrelevant). The installer (calamares, archinstall, etc.) is
+    # responsible for passing --signed / --no-signed deliberately under
+    # --root; without --signed we install unsigned and document it.
+    if (( SECURE_BOOT )) && ! (( OPT_SIGNED )) && ! (( OPT_FORCE )) \
+       && [[ -z "$OPT_ROOT" || "$OPT_ROOT" == "/" ]]; then
         die "Secure Boot is enabled but --signed was not specified.
   Installing an unsigned binary will not boot on this system.
   Use --signed (recommended), or --force to proceed anyway, or disable Secure Boot.
@@ -1215,6 +2166,17 @@ identify_bootloader() {
 install_fallback() {
     (( OPT_FALLBACK )) || return 0
 
+    # v0.11.9 — surface the auto-enable decision so consumers (operators
+    # reading the log, distro-installer plugins consuming the JSON event
+    # stream) understand why \EFI\BOOT\BOOTX64.EFI was placed even
+    # though they didn't ask. The text mirrors the documented rationale.
+    if (( OPT_FALLBACK_AUTO )); then
+        warn "auto-enabled --fallback under --root: \\EFI\\BOOT\\$(fallback_name) is the only first-boot discovery path available (NVRAM writes deferred). Pass --no-fallback to override."
+        emit_event "warning" "install" \
+            "msg=auto-enabled --fallback under --root" \
+            "reason=deferred-NVRAM-no-other-discovery-path"
+    fi
+
     local src="${ESP}/${EFI_DIR}/$(efi_binary)"
     local dst="${ESP}/${FALLBACK_DIR}/$(fallback_name)"
     local backup="${dst}.lamboot-backup"
@@ -1230,15 +2192,20 @@ install_fallback() {
     # is now buried under our backup suffix, so recovery requires manual
     # ESP editing.
     #
-    # Refuse --fallback when an existing non-LamBoot distro bootloader
-    # is present. --force overrides for advanced operators preparing a
-    # removable-media disk.
+    # Refuse --fallback when an existing non-LamBoot distro bootloader is
+    # present. Overwriting it requires the dedicated --replace-fallback
+    # opt-in, NOT generic --force. The two are decoupled deliberately:
+    # operators routinely add --force to push past unrelated checks (the
+    # signed-binary gate, the ESP-space gate), and that must never silently
+    # also authorize burying another OS's firmware fallback loader under our
+    # backup suffix. Destroying the foreign default loader is a distinct,
+    # higher-consequence decision that has to be named explicitly.
     if [ -f "$dst" ]; then
         local existing_kind
         existing_kind=$(identify_bootloader "$dst")
         case "$existing_kind" in
             shim|grub|systemd-boot|refind|windows)
-                if ! (( OPT_FORCE )); then
+                if ! (( OPT_REPLACE_FALLBACK )); then
                     die "--fallback would overwrite an existing ${existing_kind} at
   ${dst}
 
@@ -1252,12 +2219,14 @@ install_fallback() {
     1. Install without --fallback (recommended). LamBoot will register a
        Boot#### entry via efibootmgr; your existing ${existing_kind}
        stays as the firmware fallback, catching any LamBoot failure.
-    2. Re-run with --force if you explicitly want LamBoot to take over
-       the fallback path (e.g. a removable disk with no other OS). A
-       restore marker is written so 'lamboot-install --remove' can
-       recover the ${existing_kind}."
+    2. Re-run with --replace-fallback if you explicitly want LamBoot to
+       take over the fallback path (e.g. a removable disk with no other
+       OS). A restore marker is written so 'lamboot-install --remove' can
+       recover the ${existing_kind}. NOTE: plain --force does NOT do this
+       any more — overwriting another OS's fallback loader now requires
+       this dedicated flag so it can't happen as a side effect."
                 fi
-                warn "--force set; replacing existing ${existing_kind} at fallback path"
+                warn "--replace-fallback set; replacing existing ${existing_kind} at fallback path"
                 warn "On future LamBoot failure, firmware will re-invoke LamBoot via fallback"
                 warn "Original ${existing_kind} will be preserved at ${backup}"
                 ;;
@@ -1426,18 +2395,27 @@ phase3b_backup_and_migrate() {
         cp /etc/default/grub "$grub_backup"
         ok "GRUB config backed up to ${grub_backup}"
 
-        # Extract kernel cmdline for LamBoot
+        # Extract kernel cmdline for LamBoot — read the TARGET's grub
+        # defaults (under OPT_ROOT if set) and write the TARGET's
+        # /etc/kernel/cmdline.
         local cmdline=""
-        # shellcheck disable=SC1091
-        . /etc/default/grub 2>/dev/null || true
-        cmdline="${GRUB_CMDLINE_LINUX:-} ${GRUB_CMDLINE_LINUX_DEFAULT:-}"
-        cmdline=$(echo "$cmdline" | sed 's/^ *//;s/ *$//')
+        local grub_default="${OPT_ROOT}/etc/default/grub"
+        if [[ -r "$grub_default" ]]; then
+            # Parse the two GRUB_CMDLINE_* fields as DATA — never `source`.
+            # The target's /etc/default/grub is untrusted under --root, and
+            # sourcing it would execute its contents as root.
+            local gcl gcld
+            gcl=$(read_keyval_field "$grub_default" GRUB_CMDLINE_LINUX)
+            gcld=$(read_keyval_field "$grub_default" GRUB_CMDLINE_LINUX_DEFAULT)
+            cmdline=$(printf '%s %s' "$gcl" "$gcld" | sed 's/^ *//;s/ *$//')
+        fi
 
-        if [ -n "$cmdline" ] && [ ! -f /etc/kernel/cmdline ]; then
-            echo "$cmdline" > /etc/kernel/cmdline
-            ok "Extracted kernel cmdline to /etc/kernel/cmdline: ${cmdline}"
-        elif [ -f /etc/kernel/cmdline ]; then
-            detail "Existing /etc/kernel/cmdline preserved"
+        if [ -n "$cmdline" ] && [ ! -f "$KERNEL_CMDLINE_PATH" ]; then
+            mkdir -p "$(dirname "$KERNEL_CMDLINE_PATH")"
+            echo "$cmdline" > "$KERNEL_CMDLINE_PATH"
+            ok "Extracted kernel cmdline to ${KERNEL_CMDLINE_PATH}: ${cmdline}"
+        elif [ -f "$KERNEL_CMDLINE_PATH" ]; then
+            detail "Existing ${KERNEL_CMDLINE_PATH} preserved"
         fi
     fi
 
@@ -1484,9 +2462,19 @@ install_secure_boot_chain() {
 
     # Find the distro's shim for chain loading
     if ! find_distro_shim; then
-        warn "Secure Boot is enabled but no shim binary found on ESP."
-        warn "LamBoot may not load without shim. Consider disabling Secure Boot"
-        warn "or installing the shim-signed package for your distribution."
+        warn "Secure Boot is enabled but no genuine shim binary found on ESP."
+        warn "The UEFI entry will point directly at LamBoot. On a host where"
+        warn "LamBoot is signed only with an enrolled MOK (not firmware db),"
+        warn "firmware will reject that direct load and the system will NOT boot."
+        warn "Install your distribution's shim-signed package and re-run, pass"
+        warn "--no-shim only if LamBoot is firmware-db-signed, or disable Secure Boot."
+        # Not a clean install: surface it as a partial outcome and a structured
+        # event so a --json consumer (Calamares/archinstall) does not treat an
+        # exit 0 as a bootable result.
+        emit_event secure_boot_no_shim install \
+            "reason=Secure Boot on but no genuine shim found; NVRAM will point directly at LamBoot" \
+            "risk=unbootable if LamBoot is MOK-only-signed"
+        PARTIAL_FAILURE=1
         return 0
     fi
 
@@ -1500,15 +2488,37 @@ install_secure_boot_chain() {
     fi
     manifest_add "${EFI_DIR}/shimx64.efi"
 
-    # Deploy LamBoot as grubx64.efi (shim's expected follow-on loader name)
-    # The destination lambootx64.efi is already the signed variant when --signed
-    # was used, so chain-copying it works for shim verification.
+    # Deploy LamBoot as shim's expected chainload target. Upstream shim
+    # looks for grubx64.efi; SUSE's downstream shim looks for grub.efi.
+    # The name is embedded in the shim binary as a UTF-16LE string, so we
+    # detect it dynamically and place LamBoot at BOTH the detected name
+    # AND grubx64.efi (so the chain works regardless of which name shim
+    # actually resolves at boot time).
+    local shim_loader
+    shim_loader=$(detect_shim_default_loader "$SHIM_SOURCE")
     local lamboot_src="${ESP}/${EFI_DIR}/$(efi_binary)"
-    local lamboot_shim_dst="${ESP}/${EFI_DIR}/grubx64.efi"
+
+    # Always place at grubx64.efi (upstream default). Route through atomic_copy
+    # so these shim-chain loader writes get the same realpath/symlink guard and
+    # --dry-run handling as every other ESP write (a bare `cp -f` would follow a
+    # symlinked component off-volume under --root and would write during a dry
+    # run on --update/--refresh).
+    local upstream_dst="${ESP}/${EFI_DIR}/grubx64.efi"
     if [ -f "$lamboot_src" ]; then
-        cp -f "$lamboot_src" "$lamboot_shim_dst" \
+        atomic_copy "$lamboot_src" "$upstream_dst" \
             || warn "Failed to create grubx64.efi shim chain link"
         manifest_add "${EFI_DIR}/grubx64.efi"
+    fi
+
+    # Also place at the shim-embedded name if different (SUSE: grub.efi)
+    if [ -n "$shim_loader" ] && [ "$shim_loader" != "grubx64.efi" ]; then
+        local distro_dst="${ESP}/${EFI_DIR}/${shim_loader}"
+        if [ -f "$lamboot_src" ]; then
+            atomic_copy "$lamboot_src" "$distro_dst" \
+                || warn "Failed to create ${shim_loader} shim chain link"
+            manifest_add "${EFI_DIR}/${shim_loader}"
+            detail "shim default loader detected as ${shim_loader}; LamBoot placed at both grubx64.efi and ${shim_loader}"
+        fi
     fi
 
     ok "Secure Boot shim chain configured"
@@ -1526,6 +2536,15 @@ install_secure_boot_chain() {
 # set only takes effect on the SECOND boot. Pre-populating here from
 # userspace ensures the first post-install boot already has it.
 set_shim_retain_protocol() {
+    # v0.10.1: --root or chroot — efivarfs is the host's NVRAM, not the
+    # target's. The first-boot script (written by stage_first_boot_script
+    # when IS_CHROOT) will set this on the first boot of the target.
+    if (( IS_CHROOT )); then
+        emit_event shim_retain_protocol_deferred install \
+            "reason=chroot or --root mode; NVRAM write deferred to first boot"
+        detail "ShimRetainProtocol NVRAM write deferred to first-boot script (chroot mode)"
+        return 0
+    fi
     local var="/sys/firmware/efi/efivars/ShimRetainProtocol-605dab50-e046-4300-abb6-3dd810dd8b23"
     # Attributes: NON_VOLATILE(1) | BOOTSERVICE_ACCESS(2) | RUNTIME_ACCESS(4) = 7
     # Data: single byte 0x01 meaning "retain ShimLock across StartImage".
@@ -1589,32 +2608,54 @@ install_mok_enrollment() {
         return 0
     fi
 
-    echo ""
-    echo "========================================================================"
-    echo "  MOK ENROLLMENT REQUIRED"
-    echo "========================================================================"
-    echo "  Secure Boot is enabled and LamBoot is deployed behind the distro"
-    echo "  shim. For shim to trust the LamBoot binary, its signing certificate"
-    echo "  must be enrolled into the Machine Owner Key list (MOK)."
-    echo ""
-    echo "  mokutil will now prompt for a one-time password. Choose any password"
-    echo "  and remember it — you will need to type it into the blue MokManager"
-    echo "  screen during the NEXT reboot to confirm the enrollment."
-    echo ""
-    echo "  After this install finishes and you reboot:"
-    echo "    1. The blue MokManager screen will appear automatically."
-    echo "    2. Choose: Enroll MOK -> View key 0 -> Continue -> Yes"
-    echo "    3. Enter the password you are about to set."
-    echo "    4. Choose: Reboot."
-    echo ""
-    echo "  After that second reboot, LamBoot will load normally."
-    echo ""
-    echo "  Full walkthrough: docs/MOK-ENROLLMENT-GUIDE.md"
-    echo "========================================================================"
-    echo ""
+    # v0.10.1: human-only guidance text; suppress under --json
+    if (( ! OPT_JSON )); then
+        echo ""
+        echo "========================================================================"
+        echo "  MOK ENROLLMENT REQUIRED"
+        echo "========================================================================"
+        echo "  Secure Boot is enabled and LamBoot is deployed behind the distro"
+        echo "  shim. For shim to trust the LamBoot binary, its signing certificate"
+        echo "  must be enrolled into the Machine Owner Key list (MOK)."
+        echo ""
+        echo "  mokutil will now prompt for a one-time password. Choose any password"
+        echo "  and remember it — you will need to type it into the blue MokManager"
+        echo "  screen during the NEXT reboot to confirm the enrollment."
+        echo ""
+        echo "  After this install finishes and you reboot:"
+        echo "    1. The blue MokManager screen will appear automatically."
+        echo "    2. Choose: Enroll MOK -> View key 0 -> Continue -> Yes"
+        echo "    3. Enter the password you are about to set."
+        echo "    4. Choose: Reboot."
+        echo ""
+        echo "  After that second reboot, LamBoot will load normally."
+        echo ""
+        echo "  Full walkthrough: docs/MOK-ENROLLMENT-GUIDE.md"
+        echo "========================================================================"
+        echo ""
+    fi
 
     if (( OPT_DRY_RUN )); then
         detail "[dry-run] Would: mokutil --import ${cert_dst}"
+        return 0
+    fi
+
+    # v0.10.1 — lamboot-installer-protocol v1: --no-prompt and --root both
+    # defer mokutil --import. mokutil reads a one-time password from the
+    # controlling TTY; with --no-prompt that read would block or fail, and
+    # under --root the NVRAM target is wrong anyway (chroot doesn't own
+    # the host's MokAuth variable). Stage the cert for the first-boot
+    # script and emit a structured warning. SPEC §6.3, §7.
+    if (( OPT_NO_PROMPT )) || [[ -n "$OPT_ROOT" ]]; then
+        local stage_dir="${OPT_ROOT}/var/lib/lamboot"
+        mkdir -p "$stage_dir"
+        cp -f "$cert_dst" "${stage_dir}/pending-mok.der"
+        chmod 0644 "${stage_dir}/pending-mok.der"
+        emit_event mok_enrollment_deferred install \
+            "reason=--no-prompt or --root; mokutil --import deferred to first boot" \
+            "staged_cert=/var/lib/lamboot/pending-mok.der"
+        warn "MOK enrollment deferred to first boot (staged at ${stage_dir}/pending-mok.der)"
+        warn "The first-boot script at /etc/lamboot/first-boot-nvram.sh will run mokutil --import on next boot."
         return 0
     fi
 
@@ -1633,6 +2674,22 @@ install_mok_enrollment() {
 kernel_esp_path() {
     local hpath="$1"
     [ -n "$hpath" ] || { echo ""; return; }
+
+    # v0.11.10 — under --root, ESP is "<OPT_ROOT>/boot" (or similar).
+    # The kernel host path is stored chroot-relative as "/boot/vmlinuz-*"
+    # so it doesn't start with the ESP path on the host. Detect this
+    # case explicitly: if ESP ends in /boot AND hpath starts with /boot/,
+    # the kernel IS on the ESP and the BLS-relative path is the basename.
+    # v0.11.8 bug: this case fell through to the last branch and kept
+    # the full /boot/ prefix, producing an unbootable BLS entry that
+    # LamBoot couldn't resolve at runtime ("file not found
+    # /boot/vmlinuz-linux") — exposed on VM 362 archinstall 2026-05-28.
+    if [[ -n "$OPT_ROOT" && "$OPT_ROOT" != "/" ]] \
+       && [[ "$ESP" == "${OPT_ROOT}/boot" || "$ESP" == "${OPT_ROOT%/}/boot" ]] \
+       && [[ "$hpath" == /boot/* ]]; then
+        echo "/${hpath#/boot/}"
+        return
+    fi
 
     # If /boot IS the ESP, path is relative to ESP root
     if [ "$ESP" = "/boot" ]; then
@@ -1665,11 +2722,11 @@ generate_bls_entry() {
     local ipath="${INITRD_PATHS[$idx]}"
 
     local conf_name="${ENTRY_TOKEN}-${version}.conf"
-    local conf_path="${ESP}/${BLS_DIR}/${conf_name}"
+    local conf_path="${BLS_INSTALL_DIR}/${conf_name}"
 
     if [ -f "$conf_path" ]; then
         detail "BLS entry exists: ${conf_name}"
-        manifest_add "${BLS_DIR}/${conf_name}"
+        manifest_add_bls "${conf_name}"
         return 0
     fi
 
@@ -1680,13 +2737,21 @@ generate_bls_entry() {
     local machine_id
     machine_id=$(cat /etc/machine-id 2>/dev/null || echo "unknown")
 
+    # v0.11.13 — skip the `initrd` line entirely when empty (UKI-style
+    # entries don't have one; writing an empty `initrd ` would have a
+    # trailing space and confuse some BLS parsers). Only emit when
+    # initrd_rel is a non-empty path.
     local content
     content="title      ${DISTRO_NAME} (${version})
 version    ${version}
 machine-id ${machine_id}
 sort-key   ${ENTRY_TOKEN}
-linux      ${linux_rel}
-initrd     ${initrd_rel}
+linux      ${linux_rel}"
+    if [ -n "$initrd_rel" ]; then
+        content="${content}
+initrd     ${initrd_rel}"
+    fi
+    content="${content}
 options    ${KERNEL_CMDLINE}"
 
     if (( OPT_DRY_RUN )); then
@@ -1700,7 +2765,7 @@ options    ${KERNEL_CMDLINE}"
     mv -f "$tmp" "$conf_path" || { rm -f "$tmp"; warn "Failed to finalize BLS entry ${conf_name}"; return 1; }
 
     ok "Generated BLS entry: ${conf_name}"
-    manifest_add "${BLS_DIR}/${conf_name}"
+    manifest_add_bls "${conf_name}"
 }
 
 phase5_generate_bls() {
@@ -1711,16 +2776,10 @@ phase5_generate_bls() {
         return 0
     fi
 
-    if (( HAS_BLS_NATIVE )) && ! (( OPT_FORCE )); then
-        ok "Distro provides native BLS entries; skipping generation"
-        local e
-        for e in "${EXISTING_BLS[@]}"; do
-            if [ -f "${ESP}/${BLS_DIR}/${e}" ]; then
-                manifest_add "${BLS_DIR}/${e}"
-            fi
-        done
-        return 0
-    fi
+    # Resolve where entries go (ESP-staged vs read-in-place on a separate
+    # natively-readable /boot) before anything consumes BLS_INSTALL_DIR.
+    detect_bls_target
+    (( OPT_DRY_RUN )) || mkdir -p "$BLS_INSTALL_DIR" 2>/dev/null || true
 
     # BLS entries that we own may reference kernels that have since been
     # purged (common on Ubuntu/Debian where apt upgrades remove old kernels
@@ -1728,6 +2787,14 @@ phase5_generate_bls() {
     if our_bls_entries_are_stale; then
         detail "Detected stale LamBoot-owned BLS entries; regenerating"
         remove_stale_our_bls_entries
+        # COVERED_VERSIONS / EXISTING_BLS were captured (phase 3) BEFORE the
+        # removal above. Without refreshing them, the coverage gap-fill below
+        # would still consider the just-deleted kernels "covered" and skip
+        # regenerating them — leaving an empty menu. Reset and re-scan so the
+        # gap-fill sees the true post-removal state.
+        COVERED_VERSIONS=()
+        EXISTING_BLS=()
+        scan_existing_bls
     fi
 
     if (( ${#KERNEL_VERSIONS[@]} == 0 )); then
@@ -1735,10 +2802,49 @@ phase5_generate_bls() {
         return 0
     fi
 
-    local i
+    # v0.11.19 — coverage-driven gap-fill. Generate an entry for every installed
+    # kernel that lacks a consumable BLS entry, matched by the `version` field
+    # (COVERED_VERSIONS, populated in scan_existing_bls) so we cooperate with —
+    # and never duplicate — whatever native tooling already produced
+    # (sdbootutil / kernel-install / proxmox-boot-tool, regardless of its entry
+    # naming). Replaces the old all-or-nothing "native exists -> skip" return,
+    # which left kernels installed during a no-generator window permanently
+    # uncovered. --force regenerates all; fully-covered hosts are left untouched.
+    local i ver covered cv gen=0 skipped=0
     for i in "${!KERNEL_VERSIONS[@]}"; do
-        generate_bls_entry "$i" || PARTIAL_FAILURE=1
+        ver="${KERNEL_VERSIONS[$i]}"
+        covered=0
+        if ! (( OPT_FORCE )); then
+            for cv in "${COVERED_VERSIONS[@]}"; do
+                [ "$cv" = "$ver" ] && { covered=1; break; }
+            done
+        fi
+        if (( covered )); then
+            detail "Kernel ${ver}: already has a BLS entry; leaving native entry in place"
+            skipped=$((skipped+1))
+            # If the covering entry is OURS (our placement dir + ENTRY_TOKEN
+            # naming), re-record it in the manifest even though we didn't
+            # regenerate it this run. write_manifest overwrites with only what
+            # MANIFEST_ENTRIES holds, so without this a plain --update would
+            # drop our existing entries from the manifest and leave --remove
+            # unable to clean them up. Native-tooling entries (different path or
+            # name) stay untracked — we never claim what we didn't create.
+            local our_conf="${BLS_INSTALL_DIR}/${ENTRY_TOKEN}-${ver}.conf"
+            [ -f "$our_conf" ] && manifest_add_bls "${ENTRY_TOKEN}-${ver}.conf"
+            continue
+        fi
+        if generate_bls_entry "$i"; then
+            gen=$((gen+1))
+        else
+            PARTIAL_FAILURE=1
+        fi
     done
+
+    if (( gen > 0 )); then
+        ok "Gap-filled ${gen} missing BLS entr$( (( gen == 1 )) && echo y || echo ies ); ${skipped} already covered"
+    elif (( skipped > 0 )); then
+        ok "All ${skipped} installed kernel(s) already have BLS entries"
+    fi
 }
 
 # ============================================================================
@@ -1749,12 +2855,27 @@ check_efi_prerequisites() {
     [ -d /sys/firmware/efi ] \
         || die "Not booted in EFI mode. LamBoot requires UEFI firmware."
 
-    command -v efibootmgr >/dev/null 2>&1 \
-        || die "efibootmgr not found. Install it:
+    # v0.11.15 — under --update/--refresh on a host where efibootmgr is
+    # absent (eg first-boot retry after archinstall without efibootmgr
+    # pacstrap'd), we still want Phases 5/7/manifest to run. Mark
+    # PARTIAL_FAILURE, emit a warning event, and have the caller skip
+    # phase 6's NVRAM work. die() on a fresh install where the operator
+    # explicitly chose us as the bootloader — that's a real config error.
+    if ! command -v efibootmgr >/dev/null 2>&1; then
+        if (( OPT_UPDATE )) || (( OPT_REFRESH )); then
+            warn "efibootmgr not found; NVRAM update will be skipped (PARTIAL)."
+            emit_event uefi_entry_deferred uefi_entry \
+                "reason=efibootmgr_missing" \
+                "remedy=install efibootmgr and re-run lamboot-install --update"
+            PARTIAL_FAILURE=1
+            return 1
+        fi
+        die "efibootmgr not found. Install it:
   Fedora/RHEL: dnf install efibootmgr
   Debian/Ubuntu: apt install efibootmgr
   Arch: pacman -S efibootmgr
   openSUSE: zypper install efibootmgr"
+    fi
 
     if ! grep -q 'efivarfs' /proc/mounts 2>/dev/null; then
         die "efivarfs not mounted. Mount it:
@@ -1771,13 +2892,119 @@ check_efi_prerequisites() {
 }
 
 find_lamboot_entry() {
+    # Match the boot-entry DESCRIPTION exactly against $LAMBOOT_LABEL, not an
+    # unanchored substring over the whole efibootmgr line. A loose
+    # `grep -i LamBoot` also matches an entry whose loader PATH contains
+    # \EFI\LamBoot\ (e.g. a distro entry pointing at our shim) or one a user
+    # renamed to include "lamboot" — risking targeting/deleting the wrong entry.
+    #
+    # The description is NOT always the rest of the line: modern efibootmgr
+    # prints `Boot####<*| > <description>\t<device-path>` — a TAB then the
+    # loader path — even WITHOUT -v. So the description runs up to the first TAB
+    # or end-of-line, and the exact match must terminate there, not at `$`.
+    # (The earlier `[[:space:]]*$` form regressed on real hardware: it required
+    # the label to be the last thing on the line, so a genuine entry carrying
+    # the \t-path suffix never matched and --update created a DUPLICATE entry.)
+    # Uses a POSIX literal TAB, not the GNU `\t` regex extension, for portability.
+    #
+    # The active-flag is a `[* ]` CHARACTER CLASS, not `\*\{0,1\}`: efibootmgr's
+    # format is `Boot%04X%c %s` where %c is `*` for an ACTIVE entry and a literal
+    # SPACE for an INACTIVE one — so an inactive entry renders `Boot0003  LamBoot`
+    # (TWO spaces). `\*\{0,1\} ` only consumed ONE of those, so an inactive
+    # LamBoot entry never matched and --update/--remove mishandled it. `[* ] `
+    # matches both forms (and is consistent with the first-boot grep + the
+    # label-strip sed elsewhere in this file).
+    local re tab
+    tab=$(printf '\t')
+    re='^Boot\([0-9A-Fa-f]\{4\}\)[* ] '"$LAMBOOT_LABEL"' *\('"$tab"'.*\)\{0,1\}$'
     efibootmgr 2>/dev/null \
-        | grep -i 'LamBoot' \
-        | head -1 \
-        | sed -n 's/.*Boot\([0-9A-Fa-f]\{4\}\).*/\1/p' | head -1
+        | sed -n "s/${re}/\1/p" \
+        | head -1
+}
+
+# Phase-ordering guard for the NVRAM mutation (two-phase commit). Confirms every
+# file the firmware Boot#### entry will actually traverse to reach LamBoot is
+# present on the ESP BEFORE we create the entry or rewrite BootOrder. Without
+# this, a failed/partial copy in phase 4 followed by an unconditional NVRAM
+# write in phase 6 leaves firmware pointing at a file that was never placed — an
+# unbootable next boot. Under Secure Boot the entry points at shim, which chains
+# grubx64.efi(=LamBoot), so ALL of shim + grub + the bare loader must exist, not
+# just the loader (efi_loader_path / install_secure_boot_chain). Where an
+# in-memory manifest hash exists for a file, the on-disk bytes must also match.
+verify_loader_present_for_nvram() {
+    local rels=("${EFI_DIR}/$(efi_binary)")
+    # Mirror efi_loader_path: if the entry will point at the shim chain, the
+    # shim and the grubx64.efi chain target are equally load-bearing. These
+    # names match what install_secure_boot_chain writes.
+    if (( SECURE_BOOT )) && [ -n "$SHIM_SOURCE" ] && ! (( OPT_NO_SHIM )); then
+        rels+=("${EFI_DIR}/shimx64.efi" "${EFI_DIR}/grubx64.efi")
+    fi
+
+    local rel abs entry want got
+    for rel in "${rels[@]}"; do
+        abs="${ESP}/${rel}"
+        [ -f "$abs" ] || return 1
+        for entry in "${MANIFEST_ENTRIES[@]}"; do
+            # entry form: "sha256:<hash>  <rel>" (two-space delimiter)
+            if [ "${entry##*  }" = "$rel" ]; then
+                want="${entry%%  *}"; want="${want#sha256:}"
+                got=$(file_sha256 "$abs")
+                [ -n "$want" ] && [ -n "$got" ] && [ "$want" != "$got" ] && return 1
+                break
+            fi
+        done
+    done
+    return 0
+}
+
+# Snapshot the pre-LamBoot BootOrder once, before the first NVRAM mutation, and
+# mirror it to a restore marker on the ESP so --remove can roll back.
+capture_prior_bootorder() {
+    (( PRIOR_BOOTORDER_CAPTURED )) && return 0
+    PRIOR_BOOTORDER_CAPTURED=1
+
+    local marker="${ESP}/${EFI_DIR}/.bootorder-backup"
+    # First install wins. On an --update/--refresh re-run LamBoot is ALREADY
+    # first in BootOrder, so re-capturing would record our own bootnum and bury
+    # the true pre-install default. Never overwrite an existing marker.
+    if [ -f "$marker" ]; then
+        detail "prior BootOrder marker already present; preserving it"
+        return 0
+    fi
+
+    local order
+    order=$(efibootmgr 2>/dev/null | grep '^BootOrder:' | cut -d: -f2 | tr -d ' ')
+    [ -n "$order" ] || return 0
+
+    # Defensive: drop any current LamBoot bootnum so the marker names only
+    # entries that predate us, even on the (now guarded) re-capture path.
+    local lb_bootnum
+    lb_bootnum=$(find_lamboot_entry)
+    if [ -n "$lb_bootnum" ]; then
+        local cleaned="" e
+        local -a ents
+        IFS=',' read -ra ents <<< "$order"
+        for e in "${ents[@]}"; do
+            [ "$e" = "$lb_bootnum" ] && continue
+            cleaned="${cleaned:+$cleaned,}$e"
+        done
+        order="$cleaned"
+    fi
+    [ -n "$order" ] || return 0
+
+    (( OPT_DRY_RUN )) && { detail "[dry-run] would record prior BootOrder ${order}"; return 0; }
+    # Best-effort; the ESP must be writable. Never fatal — rollback is a
+    # convenience, not a gate.
+    printf '%s\n' "$order" > "$marker" 2>/dev/null \
+        && detail "recorded prior BootOrder for rollback: ${order}" \
+        || detail "could not write BootOrder restore marker (non-fatal)"
 }
 
 create_efi_entry() {
+    # Snapshot the pre-LamBoot BootOrder before any --create / --bootorder
+    # mutation below (covers the make-default-last reorder and set_default_entry).
+    capture_prior_bootorder
+
     local existing
     existing=$(find_lamboot_entry)
 
@@ -1842,6 +3069,18 @@ set_default_entry() {
         return 1
     fi
 
+    # On BIOS hosts (no efivarfs), efibootmgr can't write NVRAM, so the
+    # set-default action is meaningless until firmware is flipped to UEFI.
+    # This is the lamboot-migrate BIOS->UEFI path: install lamboot now,
+    # firmware flip later, set-default deferred. Skip without flagging
+    # PARTIAL_FAILURE so the install reports success.
+    if [ ! -d /sys/firmware/efi/efivars ]; then
+        msg "Skipping --set-default: not in UEFI runtime (no efivarfs)."
+        msg "After firmware flip to UEFI, run: efibootmgr --bootorder <LamBoot-bootnum>,..."
+        msg "Or simpler: firmware fallback path (\\EFI\\BOOT\\BOOTX64.EFI) will pick up LamBoot automatically."
+        return 0
+    fi
+
     local current_order
     current_order=$(efibootmgr 2>/dev/null | grep '^BootOrder:' | cut -d: -f2 | tr -d ' ')
 
@@ -1868,12 +3107,239 @@ phase6_efi_boot_entry() {
     fi
 
     if (( IS_CHROOT )); then
-        detail "Skipped (chroot environment detected)"
+        # v0.10.1: --root or chroot — NVRAM belongs to the host, not the
+        # target system. Stage the first-boot script that creates the
+        # Boot#### entry on the first boot of the target.
+        stage_first_boot_script
+        emit_event uefi_entry_deferred uefi_entry \
+            "reason=chroot or --root mode; NVRAM write deferred to first boot" \
+            "first_boot_script=/etc/lamboot/first-boot-nvram.sh"
+        detail "UEFI boot entry deferred to first boot (chroot mode); first-boot script staged"
+        # Mark this as a partial outcome so the caller knows deferrals happened
+        PARTIAL_FAILURE=1
         return 0
     fi
 
-    check_efi_prerequisites
+    # v0.11.15 — if prerequisites fail under --update/--refresh (efibootmgr
+    # missing), bail out of phase 6 but keep PARTIAL_FAILURE bookkeeping so
+    # later phases still run + write the manifest.
+    check_efi_prerequisites || return 0
+
+    # Two-phase commit: do NOT touch NVRAM until the loader the entry will point
+    # at is confirmed on the ESP. phase 8 (verify) runs AFTER this, so it cannot
+    # protect the NVRAM write — the gate has to be here.
+    if ! (( OPT_DRY_RUN )) && ! verify_loader_present_for_nvram; then
+        fail "Refusing to write the UEFI boot entry: LamBoot loader not present/verified on the ESP."
+        detail "  expected ${ESP}/${EFI_DIR}/$(efi_binary) (present + matching the in-memory manifest hash)"
+        detail "  skipping NVRAM mutation so firmware is never pointed at a missing loader"
+        emit_event uefi_entry_skipped uefi_entry \
+            "reason=loader absent or hash-mismatch on ESP at NVRAM-commit time" \
+            "loader=${EFI_DIR}/$(efi_binary)"
+        PARTIAL_FAILURE=1
+        return 0
+    fi
+
     create_efi_entry
+}
+
+# v0.10.1: stage the first-boot NVRAM-setup script + its systemd unit
+# under the chroot target. Idempotent (re-staging overwrites). Called from
+# phase6_efi_boot_entry when IS_CHROOT is set; the script + unit re-run on
+# each boot until the UEFI Boot entry is confirmed, then disable themselves.
+# Spec: SPEC-LAMBOOT-INSTALLER-PROTOCOL-V1.md §10.
+stage_first_boot_script() {
+    local root_prefix="$OPT_ROOT"
+    [[ -z "$root_prefix" ]] && root_prefix=""  # in-chroot but no --root: paths are already /
+
+    local script_dir="${root_prefix}/etc/lamboot"
+    local script_path="${script_dir}/first-boot-nvram.sh"
+    local unit_dir="${root_prefix}/usr/lib/systemd/system"
+    local unit_path="${unit_dir}/lamboot-first-boot.service"
+    local wants_dir="${root_prefix}/etc/systemd/system/multi-user.target.wants"
+
+    if (( OPT_DRY_RUN )); then
+        detail "[dry-run] would stage first-boot script at ${script_path}"
+        detail "[dry-run] would stage systemd unit at ${unit_path}"
+        return 0
+    fi
+
+    mkdir -p "$script_dir" "$unit_dir" "$wants_dir"
+
+    cat > "$script_path" <<'FIRSTBOOT_EOF'
+#!/bin/bash
+# lamboot first-boot NVRAM setup
+# Auto-generated by lamboot-install --root at install time.
+# Re-runs on each boot until the UEFI Boot entry is confirmed, then disables
+# itself. Spec: SPEC-LAMBOOT-INSTALLER-PROTOCOL-V1.md §10.
+
+set -u
+
+ONETIME_MARKER="/var/lib/lamboot/first-boot-done"
+LOG="/var/log/lamboot-first-boot.log"
+mkdir -p /var/lib/lamboot /var/log
+# Create the log 0600 before redirecting into it — it may carry operational
+# detail and must never be world-readable (the MOK one-time password is NOT
+# written here; see the enrollment block, which emits it to the console only).
+touch "$LOG"; chmod 0600 "$LOG"
+exec >>"$LOG" 2>&1
+echo "=== lamboot first-boot $(date -Iseconds) ==="
+
+# At first boot the in-target toolkit (lamboot-install / efibootmgr) may not be
+# present yet; giving up permanently would strand the system on the fallback
+# path. entry_ok gates the self-disable so we retry until the entry exists.
+entry_ok=0
+
+# Exact-description boot-entry matcher: the entry's description must be exactly
+# "LamBoot", terminated by a TAB (efibootmgr's field separator before the device
+# path) or end-of-line. Without this, a foreign/stale entry described "LamBoot
+# Recovery" or "LamBoot (old)" would satisfy the idempotency gate below, the
+# real LamBoot entry would never be created, and the host would strand on the
+# fallback path. `[* ]` matches both the active (*) and inactive (space) flag.
+_TAB=$(printf '\t')
+
+# Signing mode, injected at stage time to MATCH the original install. An
+# unsigned --root install must re-invoke `--update` WITHOUT --signed: otherwise
+# `--update --signed` dies every boot (no signed binary present), the Boot####
+# entry is never created, entry_ok stays 0, and this service retries forever,
+# stranding the host on the fallback path. Empty = unsigned, "--signed" = signed.
+SIGNED_FLAG="@@LAMBOOT_SIGNED_FLAG@@"
+
+if [ ! -d /sys/firmware/efi ]; then
+    echo "BIOS mode (no /sys/firmware/efi); no UEFI entry to create - disabling service"
+    systemctl disable lamboot-first-boot.service 2>/dev/null || true
+    exit 0
+fi
+
+# Idempotency: skip Boot#### creation if LamBoot entry already exists
+if command -v efibootmgr >/dev/null 2>&1 \
+   && efibootmgr 2>/dev/null | grep -qE "^Boot[0-9A-Fa-f]{4}[* ] LamBoot(${_TAB}|$)"; then
+    echo "UEFI Boot entry 'LamBoot' already present; skipping create"
+    entry_ok=1
+else
+    # Resolve lamboot-install via PATH; distros differ on bin vs sbin layout
+    # (Arch: /usr/bin only; Debian/Fedora may use /usr/sbin via usrmerge).
+    LBI=$(command -v lamboot-install || true)
+    [[ -z "$LBI" ]] && for cand in /usr/bin/lamboot-install /usr/sbin/lamboot-install /usr/local/sbin/lamboot-install; do
+        [[ -x "$cand" ]] && { LBI="$cand"; break; }
+    done
+    if [[ -z "$LBI" ]]; then
+        echo "ERROR: lamboot-install not found on PATH or in standard locations; cannot create UEFI Boot entry"
+    elif ! command -v efibootmgr >/dev/null 2>&1; then
+        echo "ERROR: efibootmgr not installed; cannot create UEFI Boot entry"
+        echo "  Install it and rerun: $LBI --update $SIGNED_FLAG --no-mok"
+    else
+        echo "Creating UEFI Boot entry 'LamBoot' via $LBI --update"
+        # $SIGNED_FLAG is intentionally unquoted: empty must expand to no arg.
+        "$LBI" --update $SIGNED_FLAG --no-mok 2>&1 \
+            || echo "lamboot-install --update returned nonzero"
+        if command -v efibootmgr >/dev/null 2>&1 \
+           && efibootmgr 2>/dev/null | grep -qE "^Boot[0-9A-Fa-f]{4}[* ] LamBoot(${_TAB}|$)"; then
+            echo "UEFI Boot entry 'LamBoot' created"
+            entry_ok=1
+        else
+            echo "entry still absent after --update - will retry next boot"
+        fi
+    fi
+fi
+
+# --- One-time NVRAM setup (MOK enrollment + ShimRetainProtocol), runs once ---
+if [ ! -f "$ONETIME_MARKER" ]; then
+# MOK enrollment (if staged)
+if [[ -f /var/lib/lamboot/pending-mok.der ]]; then
+    if mokutil --test-key /var/lib/lamboot/pending-mok.der 2>/dev/null | grep -q 'already enrolled'; then
+        echo "MOK already enrolled; removing staged cert"
+        rm -f /var/lib/lamboot/pending-mok.der
+    else
+        PW=$(openssl rand -hex 8)
+        if printf '%s\n%s\n' "$PW" "$PW" | mokutil --import /var/lib/lamboot/pending-mok.der 2>&1; then
+            # The one-time MOK password is a secret: emit it to the physical
+            # console/tty ONLY, never into the (now 0600, but still persistent)
+            # log. stdout here is redirected to $LOG, so write to /dev/tty;
+            # fall back to wall(1) for a headless console if no tty is attached.
+            print_mok_pw() {
+                if [ -w /dev/tty ]; then
+                    printf '%s\n' "$1" > /dev/tty
+                elif command -v wall >/dev/null 2>&1; then
+                    printf '%s\n' "$1" | wall 2>/dev/null || true
+                fi
+            }
+            print_mok_pw "MOK staged for enrollment. ONE-TIME PASSWORD: $PW"
+            print_mok_pw "REBOOT NOW: complete enrollment via MokManager (blue screen):"
+            print_mok_pw "  1. Enroll MOK -> View key 0 -> Continue -> Yes"
+            print_mok_pw "  2. Enter the password shown above"
+            print_mok_pw "  3. Reboot"
+            echo "MOK staged for enrollment; one-time password emitted to console (not logged)"
+            echo "REBOOT NOW to complete enrollment via MokManager"
+            # Keep the staged cert on disk so the operator can re-import if MokManager is cancelled
+        else
+            echo "mokutil --import FAILED; cert left at /var/lib/lamboot/pending-mok.der for manual import"
+        fi
+    fi
+fi
+
+# ShimRetainProtocol NVRAM var (if not already set)
+SHIM_VAR_PREFIX="/sys/firmware/efi/efivars/ShimRetainProtocol-"
+if ! ls ${SHIM_VAR_PREFIX}* >/dev/null 2>&1; then
+    echo "Setting ShimRetainProtocol NVRAM variable"
+    # Attributes 0x07 (NV+BS+RT) + data 0x01
+    printf '\x07\x00\x00\x00\x01' > "${SHIM_VAR_PREFIX}605dab50-e046-4300-abb6-3dd810dd8b23" 2>&1 || \
+        echo "  (failed; non-fatal; LamBoot runtime sets this on next boot)"
+fi
+
+touch "$ONETIME_MARKER"
+echo "one-time NVRAM setup (MOK/ShimRetain) complete"
+fi
+
+# Disable only once the boot entry is confirmed; otherwise retry next boot.
+if [ "$entry_ok" -eq 1 ]; then
+    systemctl disable lamboot-first-boot.service 2>/dev/null || true
+    echo "boot entry confirmed; first-boot service disabled"
+else
+    echo "boot entry not yet confirmed; leaving service enabled to retry next boot"
+fi
+FIRSTBOOT_EOF
+    # Inject the signing flag (see SIGNED_FLAG in the staged script) so the
+    # first-boot --update matches THIS install's mode rather than hardcoding
+    # --signed. "--signed" contains no sed-special characters.
+    local signed_flag=""
+    (( OPT_SIGNED )) && signed_flag="--signed"
+    sed -i "s|@@LAMBOOT_SIGNED_FLAG@@|${signed_flag}|g" "$script_path"
+    # Fail loudly if the placeholder survived (e.g. a future heredoc edit moved
+    # or duplicated the token) rather than shipping it literally into the
+    # booted target's first-boot script.
+    if grep -q '@@LAMBOOT_SIGNED_FLAG@@' "$script_path"; then
+        die "first-boot script templating failed: @@LAMBOOT_SIGNED_FLAG@@ not substituted in ${script_path}"
+    fi
+    chmod 0755 "$script_path"
+
+    cat > "$unit_path" <<'UNIT_EOF'
+[Unit]
+Description=LamBoot first-boot NVRAM setup (UEFI boot entry, MOK, ShimRetain)
+After=local-fs.target
+ConditionPathExists=/etc/lamboot/first-boot-nvram.sh
+
+[Service]
+Type=oneshot
+ExecStart=/etc/lamboot/first-boot-nvram.sh
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+    chmod 0644 "$unit_path"
+
+    # Enable: create the .wants/ symlink directly (we can't call systemctl
+    # against the chroot reliably)
+    ln -sf "../../../usr/lib/systemd/system/lamboot-first-boot.service" \
+        "${wants_dir}/lamboot-first-boot.service" 2>/dev/null || true
+
+    emit_event first_boot_script_staged install \
+        "script=${script_path}" \
+        "unit=${unit_path}"
+    detail "first-boot script staged at ${script_path}"
+    detail "systemd unit at ${unit_path} (enabled via multi-user.target.wants symlink)"
 }
 
 # ============================================================================
@@ -1885,7 +3351,18 @@ install_mark_success_service() {
     src=$(find_dist_file "systemd/lamboot-mark-success.service")
     local dst="${SYSTEMD_UNIT_DIR}/lamboot-mark-success.service"
 
-    [ -n "$src" ] || { detail "lamboot-mark-success.service not found in dist, skipping"; return 0; }
+    # mark-success is MANDATORY: it clears LamBootCrashCount and writes
+    # LamBootState=BootedOK on every successful boot. Without it the crash
+    # counter climbs monotonically and LamBoot eventually triggers its
+    # anti-bootloop recovery on a perfectly healthy system. A missing source
+    # unit is a packaging defect, not a benign skip — surface it loudly.
+    if [ -z "$src" ]; then
+        warn "lamboot-mark-success.service not found in dist — the crash-counter reset service will NOT be installed. LamBootCrashCount will climb every boot. This is a packaging defect (systemd/lamboot-mark-success.service missing from the build)."
+        emit_event mark_success_unit_missing install \
+            "detail=source unit absent from dist; crash counter will not reset"
+        PARTIAL_FAILURE=1
+        return 1
+    fi
 
     if needs_update "$src" "$dst"; then
         run "install mark-success service" cp -- "$src" "$dst" \
@@ -1899,31 +3376,61 @@ install_mark_success_service() {
         run "reload systemd" systemctl daemon-reload 2>/dev/null || true
         run "enable mark-success service" systemctl enable lamboot-mark-success.service 2>/dev/null \
             || { warn "Failed to enable lamboot-mark-success.service"; PARTIAL_FAILURE=1; }
+    elif (( IS_CHROOT )); then
+        # v0.10.1: chroot mode — enable by symlink, since we can't talk to
+        # the target's systemd. The unit installs into the target's
+        # multi-user.target.wants/.
+        local wants="${OPT_ROOT}/etc/systemd/system/multi-user.target.wants"
+        mkdir -p "$wants"
+        ln -sf "../../../usr/lib/systemd/system/lamboot-mark-success.service" \
+            "${wants}/lamboot-mark-success.service" 2>/dev/null \
+            || warn "Failed to enable lamboot-mark-success.service via wants symlink"
+        detail "Enabled lamboot-mark-success.service via wants/ symlink (chroot mode)"
     fi
 }
 
 install_kernel_install_plugin() {
-    local src
-    src=$(find_dist_file "kernel-install/90-lamboot.install")
-    local dst="${KERNEL_INSTALL_DIR}/90-lamboot.install"
-
-    [ -n "$src" ] || { detail "90-lamboot.install not found in dist, skipping"; return 0; }
-
-    if [ -d "$KERNEL_INSTALL_DIR" ]; then
-        if needs_update "$src" "$dst"; then
-            run "install kernel-install plugin" cp -- "$src" "$dst" \
-                || { warn "Failed to install 90-lamboot.install"; PARTIAL_FAILURE=1; return 1; }
-            run "chmod +x ${dst}" chmod 755 "$dst" || true
-            ok "Installed 90-lamboot.install kernel-install plugin"
-        else
-            detail "90-lamboot.install unchanged"
-        fi
-    else
+    # Only relevant where systemd kernel-install drives kernel updates.
+    if [ ! -d "$KERNEL_INSTALL_DIR" ]; then
         detail "kernel-install not present on system, skipping plugin"
+        return 0
+    fi
+
+    local src dst="${KERNEL_INSTALL_DIR}/90-lamboot.install"
+    src=$(find_dist_file "kernel-install/90-lamboot.install")
+
+    # On a kernel-install host this plugin is the ONLY thing that keeps BLS
+    # entries in sync across kernel upgrades — a missing source is a packaging
+    # defect, not a benign skip (same failure class as the mark-success unit).
+    if [ -z "$src" ]; then
+        warn "90-lamboot.install not found in dist — kernel upgrades on this systemd-kernel-install host will NOT regenerate LamBoot BLS entries. This is a packaging defect (kernel-install/90-lamboot.install missing from the build)."
+        emit_event kernel_install_plugin_missing install \
+            "detail=source plugin absent from dist; kernel upgrades will not refresh entries"
+        PARTIAL_FAILURE=1
+        return 1
+    fi
+
+    if needs_update "$src" "$dst"; then
+        run "install kernel-install plugin" cp -- "$src" "$dst" \
+            || { warn "Failed to install 90-lamboot.install"; PARTIAL_FAILURE=1; return 1; }
+        run "chmod +x ${dst}" chmod 755 "$dst" || true
+        ok "Installed 90-lamboot.install kernel-install plugin"
+    else
+        detail "90-lamboot.install unchanged"
     fi
 }
 
 install_kernel_hook_tool() {
+    # lamboot-kernel-hook is the single BLS writer used by BOTH kernel-event
+    # mechanisms: the Debian /etc/kernel/postinst.d/zz-lamboot hooks AND the
+    # systemd kernel-install plugin (90-lamboot.install calls it). Install it
+    # whenever either mechanism is present. Only genuinely irrelevant when the
+    # host has neither — no automatic kernel-event integration at all.
+    if [ ! -d /etc/kernel/postinst.d ] && [ ! -d "$KERNEL_INSTALL_DIR" ]; then
+        detail "No kernel-event mechanism (postinst.d or kernel-install) — skipping lamboot-kernel-hook"
+        return 0
+    fi
+
     local src
     src=$(find_dist_file "../tools/lamboot-kernel-hook" 2>/dev/null) \
         || src=$(find_dist_file "lamboot-kernel-hook" 2>/dev/null) \
@@ -1960,13 +3467,55 @@ install_debian_kernel_hooks() {
     ok "Installed Debian/Ubuntu kernel hooks"
 }
 
+# v0.11.19 — On a plain systemd-kernel-install distro where `kernel-install
+# inspect` reports `Layout: other` (its auto-detect won't pick `bls` because
+# LamBoot isn't systemd-boot, so `bootctl is-installed` is false), pin
+# `layout=bls` in /etc/kernel/install.conf. This makes the distro's OWN
+# 90-loaderentry plugin keep entries fresh for FUTURE kernels alongside our
+# 90-lamboot.install — defence-in-depth. Both write the same
+# ${token}-${version}.conf path, so it is an idempotent overwrite, never a
+# duplicate. Skipped when a higher-level native manager already owns entries
+# (sdbootutil / proxmox-boot-tool / Debian hooks) so we never fight it.
+normalize_kernel_install_layout() {
+    [ "$NATIVE_ENTRY_MANAGER" = "systemd-kernel-install" ] || return 0
+    [ "$KERNEL_INSTALL_LAYOUT_DETECTED" = "other" ] || return 0
+
+    local conf="${OPT_ROOT}/etc/kernel/install.conf"
+    if [ -f "$conf" ] && grep -qE '^[[:space:]]*layout=' "$conf"; then
+        detail "install.conf already pins a layout; leaving as-is"
+        return 0
+    fi
+    if (( OPT_DRY_RUN )); then
+        msg "  [dry-run] set layout=bls in ${conf} (kernel-install was using 'other')"
+        return 0
+    fi
+    mkdir -p "$(dirname "$conf")" 2>/dev/null || true
+    if printf 'layout=bls\n' >> "$conf"; then
+        ok "Set layout=bls in ${conf} (native kernel-install was using 'other')"
+    else
+        warn "Failed to write ${conf}; native kernel-install may keep using layout=other"
+        PARTIAL_FAILURE=1
+    fi
+}
+
 phase7_systemd_integration() {
     msg "Phase 7: Systemd integration..."
 
     install_mark_success_service
-    install_kernel_install_plugin
-    install_kernel_hook_tool
-    install_debian_kernel_hooks
+
+    # PATH C coexist: GRUB chainloads us; we don't drive the kernel-load
+    # flow on this host, so the kernel-install plugin and Debian
+    # postinst hooks would generate BLS entries no one consumes.
+    # PATH A --replace-grub: we DO want them, since LamBoot reads
+    # /boot/loader/entries to find the kernel.
+    if (( OPT_PROXMOX_HOST )) && ! (( OPT_PROXMOX_HOST_REPLACE_GRUB )); then
+        detail "PATH C coexist: skipping kernel-install plugin + Debian kernel hooks (GRUB owns kernel boot)"
+    else
+        install_kernel_install_plugin
+        install_kernel_hook_tool
+        install_debian_kernel_hooks
+        normalize_kernel_install_layout
+    fi
 }
 
 # ============================================================================
@@ -1987,11 +3536,25 @@ verify_file() {
 
 verify_bls_entry() {
     local conf="$1"
-    local title linux_path initrd_path problems=0
+    local title linux_raw initrd_raw problems=0
 
     title=$(grep '^title ' "$conf" 2>/dev/null | sed 's/^title  *//')
-    linux_path=$(grep '^linux ' "$conf" 2>/dev/null | sed 's/^linux  *//')
-    initrd_path=$(grep '^initrd ' "$conf" 2>/dev/null | sed 's/^initrd  *//')
+    linux_raw=$(grep '^linux ' "$conf" 2>/dev/null | sed 's/^linux  *//')
+    initrd_raw=$(grep '^initrd ' "$conf" 2>/dev/null | sed 's/^initrd  *//')
+
+    # BLS-Type-1 + GRUB extensions allow multi-token initrd lines
+    # (multiple paths separated by spaces) and GRUB `$variable`
+    # substitutions like `initrd /initramfs-X.img $tuned_initrd`. The
+    # runtime BLS parser strips $vars and resolves each path; this
+    # verifier did not, treating the whole post-`initrd ` string as
+    # one path. Result: false-positive "initrd MISSING" on every
+    # Fedora install (every kernel BLS entry includes $tuned_initrd).
+    # Bug 14 — surfaced VM 133 Fedora 44 2026-05-25.
+    #
+    # Split on whitespace, skip $-prefixed tokens, verify each path.
+    local linux_path initrd_paths missing_initrd=""
+    linux_path=$(printf '%s' "$linux_raw" | awk '{for(i=1;i<=NF;i++) if($i !~ /^\$/) {print $i; exit}}')
+    initrd_paths=$(printf '%s' "$initrd_raw" | awk '{for(i=1;i<=NF;i++) if($i !~ /^\$/) print $i}')
 
     local prefix=""
     for base in "$ESP" /boot; do
@@ -2010,12 +3573,37 @@ verify_bls_entry() {
         problems=1
     fi
 
-    if [ -n "$initrd_path" ] && [ ! -f "${prefix}${initrd_path}" ]; then
-        i_status="\xe2\x9c\x97 initrd MISSING"
-        problems=1
+    if [ -n "$initrd_paths" ]; then
+        local ip
+        while IFS= read -r ip; do
+            [ -z "$ip" ] && continue
+            if [ ! -f "${prefix}${ip}" ]; then
+                missing_initrd="${missing_initrd:+$missing_initrd }${ip}"
+            fi
+        done <<< "$initrd_paths"
+        if [ -n "$missing_initrd" ]; then
+            i_status="\xe2\x9c\x97 initrd MISSING: ${missing_initrd}"
+            problems=1
+        fi
     fi
 
-    printf '    %-55s %b  %b\n' "${title:-$(basename "$conf")}" "$k_status" "$i_status"
+    # v0.10.1: emit structured event in --json mode (consumers parse this);
+    # human-readable table line otherwise.
+    if (( OPT_JSON )); then
+        local entry_id
+        entry_id="bls-$(basename "$conf" .conf)"
+        local kernel_ok="true" initrd_ok="true"
+        [[ "$k_status" == *MISSING* ]] && kernel_ok="false"
+        [[ "$i_status" == *MISSING* ]] && initrd_ok="false"
+        emit_event bls_entry_verified verify \
+            "entry_id=${entry_id}" \
+            "title=${title:-$(basename "$conf")}" \
+            "kernel_ok=${kernel_ok}" \
+            "initrd_ok=${initrd_ok}" \
+            "linux_path=${linux_path}"
+    else
+        printf '    %-55s %b  %b\n' "${title:-$(basename "$conf")}" "$k_status" "$i_status"
+    fi
     return $problems
 }
 
@@ -2069,10 +3657,62 @@ phase8_verify() {
     done
     if (( bls_count > 0 )); then
         ok "${bls_count} BLS entries (${bls_problems} with problems)"
+    elif (( OPT_PROXMOX_HOST )) && ! (( OPT_PROXMOX_HOST_REPLACE_GRUB )); then
+        # PATH C coexist: by design, no BLS entries — GRUB chainloads
+        # us only for testing/diagnostics. Don't warn.
+        detail "no BLS entries (PATH C coexist — by design)"
     else
         if (( ${#EXISTING_UKI[@]} == 0 )); then
             warn "No BLS entries or UKIs found. LamBoot will show an empty menu."
             errors=$((errors+1))
+        fi
+    fi
+
+    # v0.11.19 — coverage invariant. The per-entry checks above confirm each
+    # entry's files exist; this is the INVERSE — every installed kernel must
+    # have a consumable entry. Catches the "new kernel installed, no entry
+    # generated" class head-on. Re-derive coverage fresh from disk (phase5 may
+    # have just gap-filled). Skipped on PATH C coexist (no entries by design).
+    if (( ${#KERNEL_VERSIONS[@]} > 0 )) \
+       && ! { (( OPT_PROXMOX_HOST )) && ! (( OPT_PROXMOX_HOST_REPLACE_GRUB )); }; then
+        local -A _covered=()
+        local _d _c _v
+        for _d in "${ESP}/${BLS_DIR}" "/boot/loader/entries"; do
+            [ -d "$_d" ] || continue
+            for _c in "$_d"/*.conf; do
+                [ -f "$_c" ] || continue
+                _v=$(awk '/^version[[:space:]]/{print $2; exit}' "$_c")
+                [ -n "$_v" ] && _covered["$_v"]=1
+            done
+        done
+        local _kv _uncovered=""
+        for _kv in "${KERNEL_VERSIONS[@]}"; do
+            [ -n "${_covered[$_kv]+x}" ] || _uncovered="${_uncovered:+$_uncovered }${_kv}"
+        done
+        if [ -n "$_uncovered" ]; then
+            fail "Installed kernel(s) with NO boot entry: ${_uncovered}"
+            emit_event kernel_uncovered verify \
+                "uncovered=${_uncovered}" \
+                "remedy=re-run lamboot-install --update (gap-fills) or check the kernel-install plugin"
+            errors=$((errors+1))
+            PARTIAL_FAILURE=1
+        else
+            ok "Boot-entry coverage: all ${#KERNEL_VERSIONS[@]} installed kernel(s) have an entry"
+        fi
+
+        # FUTURE coverage: an ongoing kernel-event hook must be present so
+        # newly-installed kernels get entries automatically (not just the
+        # ones backfilled today).
+        if [ -f "${KERNEL_INSTALL_DIR}/90-lamboot.install" ] \
+           || [ -f "/etc/kernel/postinst.d/zz-lamboot" ] \
+           || [ "$NATIVE_ENTRY_MANAGER" = "proxmox-boot-tool" ]; then
+            ok "Future kernels covered (kernel-event hook installed: ${NATIVE_ENTRY_MANAGER})"
+        else
+            warn "No kernel-event hook installed — FUTURE kernel installs may not get boot entries."
+            emit_event kernel_hook_missing verify \
+                "manager=${NATIVE_ENTRY_MANAGER}" \
+                "remedy=ensure kernel-install or /etc/kernel/postinst.d is present, then re-run --update"
+            PARTIAL_FAILURE=1
         fi
     fi
 
@@ -2105,7 +3745,21 @@ phase8_verify() {
             msg "To make LamBoot the default later: lamboot-install --update (without --no-make-default)"
         fi
     fi
-    msg "To test: reboot and select LamBoot from the UEFI boot menu."
+    if (( OPT_PROXMOX_HOST )) && ! (( OPT_PROXMOX_HOST_REPLACE_GRUB )); then
+        msg "To test (one-shot, UEFI BootNext — reverts automatically):"
+        msg "    lamboot-reboot-once --reboot"
+        msg "  (or manually: efibootmgr --bootnext <LamBoot bootnum> && reboot)"
+        msg "Fallback (GRUB menu pick): reboot and select 'LamBoot (chainload)'"
+        msg "NOTE: 'grub-reboot' on LVM-backed root may not auto-clear next_entry;"
+        msg "      lamboot-reboot-once uses BootNext which firmware always clears."
+    elif (( OPT_PROXMOX_HOST_REPLACE_GRUB )); then
+        msg "To test (one-shot): lamboot-reboot-once --reboot"
+        msg "BLS entries under /boot/loader/entries/lamboot-*.conf will be"
+        msg "kept in sync with /boot/vmlinuz-* by the cmdline-sync hook."
+    else
+        msg "To test (one-shot): lamboot-reboot-once --reboot"
+        msg "Fallback: reboot and select LamBoot from the UEFI boot menu."
+    fi
 }
 
 # ============================================================================
@@ -2118,11 +3772,17 @@ phase9_toolkit_prompt() {
     #   - Update path (existing install already prompted at first install)
     #   - Partial failure — don't add noise on top of an error
     #   - --no-install-toolkit passed explicitly
+    #   - v0.10.1: --no-prompt or --json (machine-driven installer plugin)
+    #   - v0.10.1: --root (chroot install; toolkit recommendation belongs
+    #     on the running system, not in install-time output)
     (( OPT_DRY_RUN )) && return 0
     (( OPT_QUIET )) && return 0
     (( OPT_UPDATE )) && return 0
     (( PARTIAL_FAILURE )) && return 0
     (( OPT_INSTALL_TOOLKIT == 0 )) && return 0
+    (( OPT_NO_PROMPT )) && return 0
+    (( OPT_JSON )) && return 0
+    [[ -n "$OPT_ROOT" ]] && return 0
 
     # Auto mode: only prompt when stdin is a TTY. Scripts get silent skip.
     if (( OPT_INSTALL_TOOLKIT == -1 )); then
@@ -2244,8 +3904,11 @@ do_remove() {
     phase1_detect_environment
 
     if ! read_manifest; then
-        # Check if LamBoot looks entirely absent (idempotent-remove friendly path).
-        if [ ! -d "${ESP}/${EFI_DIR}" ] && ! efibootmgr 2>/dev/null | grep -qi 'LamBoot'; then
+        # Check if LamBoot looks entirely absent (idempotent-remove friendly
+        # path). Use the exact-label entry match, not a substring grep, so a
+        # foreign entry whose loader path merely contains \EFI\LamBoot\ does
+        # not make us think LamBoot is installed when it isn't.
+        if [ ! -d "${ESP}/${EFI_DIR}" ] && [ -z "$(find_lamboot_entry)" ]; then
             ok "LamBoot is not installed; nothing to remove."
             return 0
         fi
@@ -2268,15 +3931,45 @@ do_remove() {
                 || warn "Failed to remove UEFI boot entry Boot${bootnum}"
             ok "Removed UEFI boot entry Boot${bootnum}"
         fi
+
+        # Two-phase rollback: if install recorded the pre-LamBoot BootOrder,
+        # restore it so removal returns NVRAM to its exact prior state. The
+        # marker was captured BEFORE LamBoot mutated BootOrder (and strips our
+        # own bootnum), so it names only entries that predate us — safe to
+        # restore verbatim. The marker file itself is deleted unconditionally in
+        # the directory cleanup below, so it is removed even under --no-efi-entry.
+        local bo_marker="${ESP}/${EFI_DIR}/.bootorder-backup"
+        if [ -f "$bo_marker" ] && [ -d /sys/firmware/efi/efivars ]; then
+            local prior
+            prior=$(tr -d ' \n' < "$bo_marker" 2>/dev/null)
+            if [ -n "$prior" ]; then
+                run "restore prior BootOrder ${prior}" \
+                    efibootmgr --bootorder "$prior" --quiet \
+                    && ok "Restored pre-install BootOrder: ${prior}" \
+                    || warn "Could not restore prior BootOrder (entries may have changed since install)"
+            fi
+        fi
     fi
 
     # Remove manifest-tracked files
     local path
     for path in "${!MANIFEST_HASHES[@]}"; do
-        local full="${ESP}/${path}"
+        # Resolve the on-disk location. Read-in-place BLS entries are tracked
+        # with a `boot:` prefix (manifest_add_bls) because they live on the
+        # separate /boot partition, not the ESP — strip it and resolve against
+        # /boot. Everything else is ESP-relative. `rel` (the prefix-stripped
+        # path) is what the --keep-entries BLS test keys on, so it matches
+        # whether the entry was ESP-staged or read-in-place.
+        local full rel="$path"
+        if [[ "$path" == boot:* ]]; then
+            rel="${path#boot:}"
+            full="${OPT_ROOT:-}/boot/${rel}"
+        else
+            full="${ESP}/${path}"
+        fi
         [ -f "$full" ] || continue
 
-        if (( OPT_KEEP_ENTRIES )) && [[ "$path" == "${BLS_DIR}/"* ]]; then
+        if (( OPT_KEEP_ENTRIES )) && [[ "$rel" == "${BLS_DIR}/"* ]]; then
             detail "Keeping BLS entry: ${path}"
             continue
         fi
@@ -2340,20 +4033,26 @@ do_remove() {
             rm -f "$legacy_lic" || warn "Failed to remove legacy license file"
     fi
 
-    # Remove empty directories
-    local dir
-    for dir in reports modules drivers ""; do
-        rmdir "${ESP}/${EFI_DIR}/${dir}" 2>/dev/null || true
-    done
+    # Remove the BootOrder restore marker unconditionally (it is not manifest-
+    # tracked). Done here, outside the --no-efi-entry-gated rollback block above,
+    # so a `--remove --no-efi-entry` still clears it and does not strand a
+    # non-empty EFI/LamBoot directory.
+    local bo_marker_cleanup="${ESP}/${EFI_DIR}/.bootorder-backup"
+    if [ -f "$bo_marker_cleanup" ]; then
+        run "remove BootOrder restore marker" \
+            rm -f "$bo_marker_cleanup" || warn "Failed to remove .bootorder-backup"
+    fi
 
-    rm -f "${ESP}/${MANIFEST_PATH}" 2>/dev/null
+    # Remove the install manifest. Routed through run() so `--remove --dry-run`
+    # is non-destructive — this used to be a bare `rm` that deleted the manifest
+    # even in a preview run, leaving the install unremovable on a real re-run.
+    run "remove install manifest" rm -f "${ESP}/${MANIFEST_PATH}" || true
 
-    # Clean up empty LamBoot subdirectories that held only manifest-tracked
-    # files. Run rmdir on each in bottom-up order; rmdir fails harmlessly on
-    # non-empty directories. Keeps the ESP tidy after --remove.
-    local lb_dir="${ESP}/${EFI_DIR}"
-    if [ -d "$lb_dir" ]; then
-        local d
+    # Clean up the now-empty LamBoot subdirectories (bottom-up; rmdir no-ops on
+    # non-empty dirs). Skipped entirely under --dry-run so a preview never
+    # mutates the ESP tree.
+    if ! (( OPT_DRY_RUN )); then
+        local lb_dir="${ESP}/${EFI_DIR}" d
         for d in drivers modules reports; do
             [ -d "${lb_dir}/${d}" ] && rmdir "${lb_dir}/${d}" 2>/dev/null || true
         done
@@ -2366,6 +4065,774 @@ do_remove() {
 # ============================================================================
 # CLI Parsing and Main
 # ============================================================================
+
+# ============================================================================
+# v0.11.0 — Proxmox VE host install helpers
+# ============================================================================
+#
+# These helpers implement the PATH C (coexist) and PATH A (replace-grub)
+# install paths from docs/proxmox-host-install/research/INDEX.md. They are
+# invoked from new phases that run only when OPT_PROXMOX_HOST is set.
+#
+# Constants for the install layout. Kept here so the install + refresh +
+# uninstall paths agree on file locations.
+readonly PROXMOX_GRUB_CUSTOM_FILE="/etc/grub.d/40_custom"
+readonly PROXMOX_GRUB_BEGIN_MARK="### BEGIN lamboot-install --proxmox-host ###"
+readonly PROXMOX_GRUB_END_MARK="### END lamboot-install --proxmox-host ###"
+# Reserved for the v0.12+ dpkg-divert step that swaps /EFI/PROXMOX/grubx64.efi
+# with lambootx64.efi so Proxmox's shim chainloads LamBoot directly. v0.11.0
+# stops short of that — `--replace-grub` ships the BLS-generation + cmdline-sync
+# pieces but keeps the 40_custom chainload menuentry as the entry point.
+# shellcheck disable=SC2034  # planned use in v0.12
+readonly PROXMOX_GRUB_DIVERT_PATH="/usr/share/grub/x86_64-efi/lamboot-divert-installed"
+readonly PROXMOX_KERNEL_CMDLINE="/etc/kernel/cmdline"
+readonly PROXMOX_CMDLINE_SYNC_SCRIPT="/etc/kernel/install.d/00-lamboot-cmdline-sync"
+readonly PROXMOX_DEFAULT_GRUB="/etc/default/grub"
+readonly PROXMOX_BLS_ENTRY_PREFIX="lamboot-"
+
+# Detect a Proxmox VE host. Used for autodetection-warning when the user
+# runs plain `lamboot-install` on Proxmox without --proxmox-host (warn,
+# don't refuse — operator may have a reason).
+is_proxmox_host() {
+    local root="${OPT_ROOT:-}"
+    [[ -z "$root" || "$root" == "/" ]] && root=""
+    # The cheapest reliable signal: /etc/pve/ directory or
+    # /usr/sbin/proxmox-boot-tool.
+    [[ -d "${root}/etc/pve" ]] && return 0
+    [[ -x "${root}/usr/sbin/proxmox-boot-tool" ]] && return 0
+    return 1
+}
+
+# Resolve the `lamboot-grub-inspect` binary path (preferring an explicit
+# override, then PATH lookup, then a known package install path). Echoes
+# the path on stdout; returns 0 if found, 1 if not.
+proxmox_resolve_grub_inspect() {
+    if [[ -n "${LAMBOOT_GRUB_INSPECT_BIN:-}" ]]; then
+        if [[ -x "$LAMBOOT_GRUB_INSPECT_BIN" ]]; then
+            printf '%s\n' "$LAMBOOT_GRUB_INSPECT_BIN"
+            return 0
+        fi
+    fi
+    if command -v lamboot-grub-inspect >/dev/null 2>&1; then
+        command -v lamboot-grub-inspect
+        return 0
+    fi
+    return 1
+}
+
+# Compose the cmdline LamBoot's BLS entries should bake in. For PATH A
+# we want it from /etc/default/grub via lamboot-grub-inspect so it
+# tracks operator intent rather than the currently-booted kernel's
+# /proc/cmdline. Falls back to /proc/cmdline (filtered) if
+# lamboot-grub-inspect isn't installed, so the install doesn't hard-fail
+# in a partial-toolchain environment.
+proxmox_compose_cmdline() {
+    local inspect
+    if inspect=$(proxmox_resolve_grub_inspect 2>/dev/null); then
+        local out
+        if out=$("$inspect" \
+                    --grub-cfg "/boot/grub/grub.cfg" \
+                    --default-grub "$PROXMOX_DEFAULT_GRUB" \
+                    --grubenv "/boot/grub/grubenv" \
+                    parse-default-grub 2>/dev/null \
+                | awk -F= '/^full_cmdline=/ { sub(/^full_cmdline=/, ""); print; exit }'); then
+            if [[ -n "$out" ]]; then
+                printf '%s\n' "$out"
+                return 0
+            fi
+        fi
+        warn "lamboot-grub-inspect failed; falling back to /proc/cmdline"
+    else
+        detail "lamboot-grub-inspect not installed; using /proc/cmdline filter"
+    fi
+    # Fallback: strip boot-specific knobs the kernel itself added.
+    sed -e 's/\bBOOT_IMAGE=[^ ]*//g' \
+        -e 's/\binitrd=[^ ]*//g' \
+        -e 's/\broot=[^ ]*//g' \
+        -e 's/\bro\b//g' \
+        -e 's/\brw\b//g' \
+        -e 's/  */ /g' \
+        -e 's/^ //; s/ $//' \
+        /proc/cmdline
+}
+
+# Resolve the ESP UUID for the chainload menuentry's `search --fs-uuid`.
+# Uses blkid against the device backing the ESP mount.
+proxmox_esp_uuid() {
+    local esp="$1"
+    local dev
+    dev=$(findmnt -no SOURCE "$esp" 2>/dev/null) || return 1
+    blkid -s UUID -o value "$dev" 2>/dev/null
+}
+
+# Compose the GRUB chainload menuentry block. Idempotent markers wrap
+# the block so re-install can replace cleanly.
+proxmox_menuentry_block() {
+    local esp_uuid="$1"
+    local efi_subdir="EFI/LamBoot"
+    local binary
+    binary="$(efi_binary)"
+    cat <<EOF
+
+${PROXMOX_GRUB_BEGIN_MARK}
+menuentry "LamBoot (chainload)" --class lamboot --class os {
+    insmod part_gpt
+    insmod fat
+    insmod chain
+    search --no-floppy --fs-uuid --set=root ${esp_uuid}
+    chainloader /${efi_subdir}/${binary}
+}
+${PROXMOX_GRUB_END_MARK}
+EOF
+}
+
+# Install (or replace) the menuentry in /etc/grub.d/40_custom. Idempotent.
+proxmox_install_menuentry() {
+    local esp_uuid="$1"
+    local target="${OPT_ROOT:-}${PROXMOX_GRUB_CUSTOM_FILE}"
+
+    if [[ ! -f "$target" ]]; then
+        warn "$target not present — Proxmox-host install requires GRUB; skipping menuentry"
+        return 1
+    fi
+
+    if grep -q "^${PROXMOX_GRUB_BEGIN_MARK}\$" "$target" 2>/dev/null; then
+        if (( OPT_DRY_RUN )); then
+            detail "(dry-run) would replace LamBoot block in $target"
+            return 0
+        fi
+        # Strip previous block, then append fresh.
+        sed -i "/^${PROXMOX_GRUB_BEGIN_MARK}\$/,/^${PROXMOX_GRUB_END_MARK}\$/d" "$target"
+        proxmox_menuentry_block "$esp_uuid" >> "$target"
+        ok "Replaced LamBoot menuentry in $target"
+    else
+        if (( OPT_DRY_RUN )); then
+            detail "(dry-run) would append LamBoot menuentry to $target"
+            return 0
+        fi
+        proxmox_menuentry_block "$esp_uuid" >> "$target"
+        ok "Appended LamBoot menuentry to $target"
+    fi
+    return 0
+}
+
+# Remove the menuentry. Used by --remove path on a Proxmox-host install.
+proxmox_remove_menuentry() {
+    local target="${OPT_ROOT:-}${PROXMOX_GRUB_CUSTOM_FILE}"
+    [[ -f "$target" ]] || return 0
+    if ! grep -q "^${PROXMOX_GRUB_BEGIN_MARK}\$" "$target"; then
+        detail "no LamBoot menuentry in $target"
+        return 0
+    fi
+    if (( OPT_DRY_RUN )); then
+        detail "(dry-run) would remove LamBoot block from $target"
+        return 0
+    fi
+    sed -i "/^${PROXMOX_GRUB_BEGIN_MARK}\$/,/^${PROXMOX_GRUB_END_MARK}\$/d" "$target"
+    ok "Removed LamBoot menuentry from $target"
+}
+
+# Run update-grub to regenerate /boot/grub/grub.cfg. Idempotent.
+proxmox_update_grub() {
+    if (( IS_CHROOT )); then
+        detail "(chroot) skipping update-grub; downstream installer should run it"
+        return 0
+    fi
+    if ! command -v update-grub >/dev/null 2>&1; then
+        warn "update-grub not on PATH; cannot regenerate grub.cfg"
+        PARTIAL_FAILURE=1
+        return 1
+    fi
+    run "regenerate grub.cfg" update-grub
+}
+
+# PATH A only: write /etc/kernel/cmdline so the existing
+# lamboot-kernel-hook + Proxmox's own /etc/kernel/install.d/ hooks
+# resolve a stable cmdline. Sourced from lamboot-grub-inspect on
+# install; refreshed by cmdline-sync on subsequent update-grub runs.
+proxmox_write_kernel_cmdline() {
+    local cmdline="$1"
+    local target="${OPT_ROOT:-}${PROXMOX_KERNEL_CMDLINE}"
+    if (( OPT_DRY_RUN )); then
+        detail "(dry-run) would write $target ← '$cmdline'"
+        return 0
+    fi
+    mkdir -p "$(dirname "$target")"
+    printf '%s\n' "$cmdline" > "$target"
+    ok "Wrote $target"
+}
+
+# Resolve the lamboot-kernel-hook binary — the single ESP BLS writer that
+# both the per-kernel dpkg hook and our bulk refresh delegate to, so install,
+# kernel-install, and refresh all emit byte-identical entries.
+proxmox_kernel_hook_bin() {
+    if command -v lamboot-kernel-hook >/dev/null 2>&1; then
+        command -v lamboot-kernel-hook
+        return 0
+    fi
+    [[ -x "${OPT_ROOT:-}/usr/local/bin/lamboot-kernel-hook" ]] \
+        && { printf '%s\n' "${OPT_ROOT:-}/usr/local/bin/lamboot-kernel-hook"; return 0; }
+    return 1
+}
+
+# Locate the ESP's loader/entries dir independently of phase1 (the refresh
+# short-circuit skips environment detection). Mirrors the hook's find_esp.
+proxmox_esp_entries_dir() {
+    local esp
+    for esp in "${OPT_ROOT:-}/boot/efi" "${OPT_ROOT:-}/efi"; do
+        if [[ -d "$esp/loader/entries" ]] || mountpoint -q "$esp" 2>/dev/null; then
+            printf '%s\n' "$esp/loader/entries"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# The pre-v0.11.21 PATH-A scheme wrote lamboot-*.conf to the root-filesystem
+# /boot/loader/entries. LamBoot scans /loader/entries per *volume root*, so on
+# a host with no separate /boot partition (Proxmox LVM/ZFS) those entries are
+# never read. Purge them so the ESP entries are the sole, consumed source.
+proxmox_purge_legacy_root_entries() {
+    local dir="${OPT_ROOT:-}/boot/loader/entries"
+    [[ -d "$dir" ]] || return 0
+    local f n=0
+    for f in "${dir}/${PROXMOX_BLS_ENTRY_PREFIX}"*.conf; do
+        [[ -e "$f" ]] || continue
+        if (( OPT_DRY_RUN )); then detail "(dry-run) would rm legacy $f"; else rm -f "$f"; fi
+        n=$((n + 1))
+    done
+    (( n > 0 )) && detail "purged $n legacy /boot/loader/entries/lamboot-*.conf"
+    return 0
+}
+
+# Remove ESP entries whose kernel no longer exists in /boot. Repair-only:
+# plain --refresh is additive and must never delete operator-managed entries.
+proxmox_prune_removed_esp_entries() {
+    local dir
+    dir=$(proxmox_esp_entries_dir) || return 0
+    [[ -d "$dir" ]] || return 0
+    local f ver n=0
+    for f in "$dir"/*.conf; do
+        [[ -e "$f" ]] || continue
+        ver=$(awk '/^version[ \t]/ { print $2; exit }' "$f" 2>/dev/null)
+        [[ -n "$ver" ]] || continue
+        if [[ ! -e "${OPT_ROOT:-}/boot/vmlinuz-${ver}" ]]; then
+            if (( OPT_DRY_RUN )); then detail "(dry-run) would rm orphaned $f"; else rm -f "$f"; fi
+            n=$((n + 1))
+        fi
+    done
+    (( n > 0 )) && detail "pruned $n ESP entr(ies) for removed kernels"
+    return 0
+}
+
+# Enumerate Proxmox kernels (newest first by version sort). Output:
+# `X.Y.Z-DISTRO` per line.
+proxmox_list_kernels() {
+    local boot_root="${OPT_ROOT:-}/boot"
+    find "$boot_root" -maxdepth 1 -type f -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null \
+        | sed -e 's/^vmlinuz-//' \
+        | sort -V -r
+}
+
+# Sync ESP BLS entries for every installed Proxmox kernel by delegating to
+# lamboot-kernel-hook (the single writer). Default is additive — the hook skips
+# any entry that already exists, preserving operator edits. --repair-bls sets
+# LAMBOOT_BLS_FORCE=1 to overwrite all and prunes entries for removed kernels.
+proxmox_refresh_bls_entries() {
+    local hook
+    if ! hook=$(proxmox_kernel_hook_bin); then
+        warn "lamboot-kernel-hook not found — cannot sync ESP BLS entries."
+        warn "  Re-run 'lamboot-install --replace-grub' to (re)install the hook."
+        PARTIAL_FAILURE=1
+        return 1
+    fi
+
+    # Retire the legacy root-fs scheme (inert on a no-separate-/boot host).
+    proxmox_purge_legacy_root_entries
+
+    local force=0
+    (( OPT_REPAIR_BLS )) && force=1
+    (( force )) && proxmox_prune_removed_esp_entries
+
+    local n=0 version
+    while read -r version; do
+        [[ -n "$version" ]] || continue
+        if (( OPT_DRY_RUN )); then
+            detail "(dry-run) would run lamboot-kernel-hook add ${version} (force=${force})"
+        else
+            LAMBOOT_BLS_FORCE="$force" "$hook" add "$version" >/dev/null 2>&1 \
+                || warn "lamboot-kernel-hook add ${version} failed"
+        fi
+        n=$((n + 1))
+    done < <(proxmox_list_kernels)
+
+    if (( force )); then
+        ok "Repaired ${n} ESP BLS entr(ies) under loader/entries/"
+    else
+        ok "Synced ${n} ESP BLS entr(ies) under loader/entries/ (additive)"
+    fi
+}
+
+# Install the kernel-install.d coverage hook. Fires from systemd's
+# kernel-install pipeline on distros that use it, ensuring every kernel has an
+# ESP BLS entry. ADDITIVE: it never overwrites existing entries (preserve
+# operator edits). To propagate an /etc/default/grub cmdline change into
+# existing entries, the operator runs `lamboot-install --repair-bls`.
+proxmox_install_cmdline_sync() {
+    local target="${OPT_ROOT:-}${PROXMOX_CMDLINE_SYNC_SCRIPT}"
+    if (( OPT_DRY_RUN )); then
+        detail "(dry-run) would install $target"
+        return 0
+    fi
+    mkdir -p "$(dirname "$target")"
+    cat > "$target" <<'EOF'
+#!/bin/sh
+# /etc/kernel/install.d/00-lamboot-cmdline-sync
+# Installed by `lamboot-install --replace-grub` on Proxmox VE hosts.
+# Ensures every installed kernel has an ESP BLS entry (loader/entries on the
+# ESP, where LamBoot reads them). ADDITIVE — existing entries are preserved.
+# To push an /etc/default/grub cmdline change into existing entries, run:
+#     lamboot-install --repair-bls
+#
+# DO NOT EDIT. Re-run `lamboot-install --replace-grub` to regenerate.
+set -eu
+command -v lamboot-install >/dev/null 2>&1 || exit 0
+exec lamboot-install --proxmox-host --refresh
+EOF
+    chmod 0755 "$target"
+    ok "Installed $target"
+}
+
+# Remove the cmdline-sync hook. Used on --remove of a PATH A install.
+proxmox_remove_cmdline_sync() {
+    local target="${OPT_ROOT:-}${PROXMOX_CMDLINE_SYNC_SCRIPT}"
+    [[ -f "$target" ]] || return 0
+    if (( OPT_DRY_RUN )); then
+        detail "(dry-run) would rm $target"
+        return 0
+    fi
+    rm -f "$target"
+    ok "Removed $target"
+}
+
+# ============================================================================
+# Phase 4c: Chroot initramfs hook fixup (v0.11.12)
+# ============================================================================
+#
+# Under --root, detect the chroot's root layout via the live mount tree
+# and ensure the chroot's initramfs has the hooks needed to activate
+# that layout on first boot.
+#
+# Why this is needed: archinstall doesn't auto-add `lvm2` to mkinitcpio
+# HOOKS when the operator picks LVM, and doesn't auto-add `sd-encrypt`
+# when LUKS is picked. Without these hooks, the kernel cmdline's
+# `root=UUID=...` is correct, but the initramfs can't activate the
+# LVM PV or unlock the LUKS volume, so the UUID never appears at
+# /dev/disk/by-uuid/ and systemd waits ~90s before dropping to
+# emergency. Confirmed on VM 362 (manual fix) and VM 363 (auto-trigger
+# for this v0.11.12 work). Same archinstall ordering gap that v0.11.11
+# worked around for the cmdline.
+
+phase4c_chroot_initramfs_fixup() {
+    msg "Phase 4c: Chroot initramfs hook fixup..."
+
+    if [[ -z "$OPT_ROOT" || "$OPT_ROOT" == "/" ]]; then
+        detail "Not in chroot mode; skipping initramfs fixup"
+        return 0
+    fi
+
+    if ! command -v findmnt >/dev/null 2>&1 || ! command -v lsblk >/dev/null 2>&1; then
+        detail "findmnt/lsblk unavailable; cannot detect root layout for initramfs fixup"
+        return 0
+    fi
+
+    local root_info
+    root_info=$(findmnt -no SOURCE,FSTYPE --target "$OPT_ROOT" 2>/dev/null)
+    [ -n "$root_info" ] || { detail "Cannot determine root mount; skipping initramfs fixup"; return 0; }
+
+    local root_src root_type
+    read -r root_src root_type <<<"$root_info"
+
+    # Bug #97 (v0.11.17) — findmnt's SOURCE column appends [/subvol] for
+    # btrfs subvolume mounts, e.g. /dev/mapper/ArchinstallVg-root[/@].
+    # lsblk treats that as a nonexistent path and exits 32 with empty
+    # stdout — phase4c then sees zero types, concludes "plain partition
+    # root", and silently skips the lvm2/sd-encrypt HOOK addition.
+    # Caught on VM 365 v0.11.16 archinstall test: btrfs-on-LVM root
+    # boots into 90s systemd timeout because initramfs has no lvm2 hook.
+    # Strip everything from '[' onwards before handing to lsblk. Safe
+    # for non-btrfs source values; the suffix is btrfs-specific.
+    root_src="${root_src%%[\[]*}"
+
+    # Walk the device chain via lsblk to detect LVM + LUKS layers.
+    # lsblk -snr -o TYPE <node> lists the device + all its ancestors.
+    local needs_lvm=0 needs_encrypt=0
+    local types
+    types=$(lsblk -snro TYPE "$root_src" 2>/dev/null | sort -u | tr '\n' ' ')
+    case " $types " in
+        *" lvm "*)    needs_lvm=1     ;;
+    esac
+    case " $types " in
+        *" crypt "*)  needs_encrypt=1 ;;
+    esac
+
+    if ! (( needs_lvm )) && ! (( needs_encrypt )); then
+        detail "Plain partition root (types: ${types}); no initramfs fixup needed"
+        return 0
+    fi
+
+    detail "Root layout: lvm=${needs_lvm} encrypt=${needs_encrypt} (types: ${types})"
+
+    local mkinitcpio_conf="${OPT_ROOT}/etc/mkinitcpio.conf"
+    if [ -f "$mkinitcpio_conf" ] && [ -x "${OPT_ROOT}/usr/bin/mkinitcpio" ]; then
+        ensure_mkinitcpio_hooks "$mkinitcpio_conf" "$needs_lvm" "$needs_encrypt"
+        return $?
+    fi
+
+    # v0.11.12 ships mkinitcpio-only. dracut (Fedora/openSUSE) and
+    # initramfs-tools (Debian/Ubuntu) are future work; warn loudly so
+    # the operator knows to fix manually if hitting one of those.
+    warn "Chroot uses a non-mkinitcpio initramfs tool (or mkinitcpio.conf missing)."
+    warn "  Root layout needs lvm2=${needs_lvm} sd-encrypt=${needs_encrypt} support."
+    warn "  Verify the chroot's initramfs activates LVM/LUKS or root won't mount."
+    return 0
+}
+
+ensure_mkinitcpio_hooks() {
+    local conf="$1" needs_lvm="$2" needs_encrypt="$3"
+    local hooks_line
+    hooks_line=$(grep -E '^HOOKS=\(' "$conf" | tail -1)
+    if [ -z "$hooks_line" ]; then
+        warn "No HOOKS=(...) line in ${conf}; skipping hook addition"
+        return 0
+    fi
+
+    local changed=0 backup_made=0
+
+    backup_mkinitcpio_conf() {
+        (( backup_made )) && return
+        cp "$conf" "${conf}.lamboot-${LAMBOOT_VERSION}.bak"
+        backup_made=1
+        detail "Backed up mkinitcpio.conf to ${conf}.lamboot-${LAMBOOT_VERSION}.bak"
+    }
+
+    # IMPORTANT: every sed below is line-addressed to `^HOOKS=(...)` so
+    # we only modify the ACTIVE HOOKS line, never the commented-out
+    # example lines that mkinitcpio.conf ships with. v0.11.12 initial
+    # release shipped without the line address; sed found `sd-encrypt`
+    # / `block` on the comment example first and silently added lvm2
+    # to the COMMENT, leaving the active HOOKS line untouched and the
+    # initramfs without LVM tooling. Caught on VM 363 test.
+
+    # v0.11.18 (Bug #98): archinstall sometimes emits an internally
+    # inconsistent config — HOOKS uses the legacy `udev`/`encrypt`
+    # hooks, but the BLS entries lamboot-install writes use systemd-
+    # cryptsetup-generator cmdline format (rd.luks.uuid + rd.luks.name).
+    # The legacy `encrypt` hook doesn't recognize rd.luks.*, so the
+    # kernel waits 90s on /dev/disk/by-uuid then drops to emergency.
+    # Caught on VM 366 ext4+LUKS+LVM archinstall test. Also: archinstall
+    # left `block` AFTER `encrypt lvm2`, which would be wrong even if
+    # the legacy/systemd mismatch was resolved.
+    #
+    # Fix scope: only when LUKS is in the stack AND legacy `encrypt` is
+    # present AND `sd-encrypt` is NOT. Replace the whole HOOKS line
+    # with the canonical systemd-style equivalent. Operator hooks
+    # outside the archinstall stock set (mdadm_udev, dropbear, custom
+    # decryption) get dropped — operators with such layouts don't rely
+    # on archinstall defaults anyway. Backup is preserved.
+    if (( needs_encrypt )) \
+       && echo "$hooks_line" | grep -qE '\bencrypt\b' \
+       && ! echo "$hooks_line" | grep -qE '\bsd-encrypt\b'; then
+        backup_mkinitcpio_conf
+        local new_hooks
+        if (( needs_lvm )); then
+            new_hooks='HOOKS=(base systemd autodetect microcode modconf kms keyboard sd-vconsole block sd-encrypt lvm2 filesystems fsck)'
+        else
+            new_hooks='HOOKS=(base systemd autodetect microcode modconf kms keyboard sd-vconsole block sd-encrypt filesystems fsck)'
+        fi
+        # awk for safe full-line replacement — sed with line-address +
+        # replacement-containing-parens needs heavy escaping.
+        local tmp="${conf}.lamboot-tmp.$$"
+        awk -v new="$new_hooks" '
+            /^HOOKS=\(/ && !replaced { print new; replaced=1; next }
+            { print }
+        ' "$conf" > "$tmp" && mv "$tmp" "$conf"
+        detail "Rewrote HOOKS to systemd-style (Bug #98: encrypt -> sd-encrypt, udev -> systemd)"
+        changed=1
+        # Re-read so the dedup guards below see the new line state and
+        # correctly short-circuit (sd-encrypt + lvm2 now both present).
+        hooks_line=$(grep -E '^HOOKS=\(' "$conf" | tail -1)
+    fi
+
+    if (( needs_encrypt )) && ! echo "$hooks_line" | grep -qE '\b(sd-encrypt|encrypt)\b'; then
+        backup_mkinitcpio_conf
+        # sd-encrypt must come BEFORE lvm2 (LUKS unlock precedes LVM
+        # activation). Insert after `block`, which is the canonical
+        # placement per ArchWiki.
+        sed -i '/^HOOKS=(/ s/\bblock\b/block sd-encrypt/' "$conf"
+        detail "Added sd-encrypt hook"
+        changed=1
+    fi
+
+    # Re-read the active HOOKS line to reflect the sd-encrypt insertion
+    # (if it happened) before deciding lvm2 placement.
+    hooks_line=$(grep -E '^HOOKS=\(' "$conf" | tail -1)
+
+    if (( needs_lvm )) && ! echo "$hooks_line" | grep -qE '\b(lvm2|sd-lvm2)\b'; then
+        backup_mkinitcpio_conf
+        # Place lvm2 AFTER sd-encrypt (if present on the active line)
+        # or after block.
+        if echo "$hooks_line" | grep -qE '\bsd-encrypt\b'; then
+            sed -i '/^HOOKS=(/ s/\bsd-encrypt\b/sd-encrypt lvm2/' "$conf"
+        else
+            sed -i '/^HOOKS=(/ s/\bblock\b/block lvm2/' "$conf"
+        fi
+        detail "Added lvm2 hook"
+        changed=1
+    fi
+
+    if ! (( changed )); then
+        detail "mkinitcpio HOOKS already includes required hooks; nothing to regenerate"
+        return 0
+    fi
+
+    msg "Regenerating initramfs in chroot with updated HOOKS..."
+    detail "new line: $(grep -E '^HOOKS=\(' "$conf" | tail -1)"
+
+    # Bind-mount kernel filesystems into chroot for mkinitcpio's needs.
+    # Track each so we can unmount only what we added.
+    local mounted_proc=0 mounted_sys=0 mounted_dev=0 mounted_run=0
+    mountpoint -q "${OPT_ROOT}/proc" || { mount --bind /proc "${OPT_ROOT}/proc" 2>/dev/null && mounted_proc=1; }
+    mountpoint -q "${OPT_ROOT}/sys"  || { mount --bind /sys  "${OPT_ROOT}/sys"  2>/dev/null && mounted_sys=1; }
+    mountpoint -q "${OPT_ROOT}/dev"  || { mount --bind /dev  "${OPT_ROOT}/dev"  2>/dev/null && mounted_dev=1; }
+    mountpoint -q "${OPT_ROOT}/run"  || { mount --bind /run  "${OPT_ROOT}/run"  2>/dev/null && mounted_run=1; }
+
+    local rc=0
+    if (( OPT_DRY_RUN )); then
+        msg "  [dry-run] would run: chroot ${OPT_ROOT} mkinitcpio -P"
+    else
+        if chroot "$OPT_ROOT" mkinitcpio -P >/dev/null 2>&1; then
+            ok "Initramfs regenerated with updated hooks"
+        else
+            warn "mkinitcpio -P failed in chroot; check ${conf} manually"
+            PARTIAL_FAILURE=1
+            rc=1
+        fi
+    fi
+
+    (( mounted_run  )) && umount "${OPT_ROOT}/run"  2>/dev/null
+    (( mounted_dev  )) && umount "${OPT_ROOT}/dev"  2>/dev/null
+    (( mounted_sys  )) && umount "${OPT_ROOT}/sys"  2>/dev/null
+    (( mounted_proc )) && umount "${OPT_ROOT}/proc" 2>/dev/null
+
+    return $rc
+}
+
+# ============================================================================
+# Phase 4b: Proxmox GRUB integration (menuentry / divert)
+# ============================================================================
+
+phase4b_proxmox_grub_integration() {
+    msg "Phase 4b: Proxmox GRUB integration..."
+
+    local esp_uuid
+    esp_uuid=$(proxmox_esp_uuid "$ESP") || die "could not read ESP UUID for chainload menuentry"
+
+    proxmox_install_menuentry "$esp_uuid" || PARTIAL_FAILURE=1
+
+    if (( OPT_PROXMOX_HOST_REPLACE_GRUB )); then
+        # PATH A: also write /etc/kernel/cmdline up-front so kernels
+        # installed before the cmdline-sync hook fires already pick
+        # up the GRUB-sourced cmdline.
+        local cmdline
+        cmdline="$(proxmox_compose_cmdline)"
+        proxmox_write_kernel_cmdline "$cmdline"
+    fi
+}
+
+# ============================================================================
+# Phase 5b: Proxmox BLS backfill (PATH A only)
+# ============================================================================
+
+phase5b_proxmox_bls_backfill() {
+    (( OPT_PROXMOX_HOST_REPLACE_GRUB )) || return 0
+    # The generic coverage gap-fill (phase5_generate_bls, run just before this)
+    # already wrote correct ESP entries for every kernel — including root= via
+    # get_kernel_cmdline. All that remains here is retiring the legacy
+    # /boot/loader/entries scheme a pre-v0.11.21 install may have left behind.
+    msg "Phase 5b: Retiring legacy /boot/loader/entries scheme (ESP is canonical)..."
+    proxmox_purge_legacy_root_entries
+}
+
+# ============================================================================
+# Phase 7b: Proxmox hooks (cmdline-sync, bls-amend, sampler, dpkg trigger)
+# ============================================================================
+
+# v0.11.13: install marker file consumed by the zzzz-lamboot-proxmox dpkg
+# trigger to gate "this is a Proxmox-host LamBoot install" detection.
+proxmox_install_marker() {
+    local path_label="C"
+    (( OPT_PROXMOX_HOST_REPLACE_GRUB )) && path_label="A"
+    # PATH B isn't yet operator-selectable; --refresh discovers it
+    # at runtime via /etc/kernel/proxmox-boot-uuids presence.
+    run "create /etc/lamboot" mkdir -p "${OPT_ROOT}/etc/lamboot"
+    local conf="${OPT_ROOT}/etc/lamboot/proxmox-host.conf"
+    if (( OPT_DRY_RUN )); then
+        detail "[dry-run] would write ${conf}"
+        return 0
+    fi
+    cat > "$conf" <<EOF
+# LamBoot Proxmox-host installation marker.
+# Created by lamboot-install v${LAMBOOT_VERSION} at $(date -u +%FT%TZ).
+# Existence gates /etc/kernel/postinst.d/zzzz-lamboot-proxmox so the
+# trigger is a no-op on non-Proxmox systems even when the package is
+# installed.
+PATH=${path_label}
+LAMBOOT_VERSION=${LAMBOOT_VERSION}
+INSTALLED_AT=$(date -u +%s)
+EOF
+    detail "wrote Proxmox-host marker: ${conf}"
+}
+
+# v0.11.13: install the lamboot-host-sampler binary + systemd units +
+# Proxmox-specific dpkg trigger. Idempotent — re-running is safe.
+proxmox_install_observability() {
+    # Sampler binary
+    local sampler_src
+    sampler_src=$(find_dist_file "../tools/lamboot-host-sampler" 2>/dev/null) || \
+    sampler_src=$(find_dist_file "tools/lamboot-host-sampler" 2>/dev/null) || \
+    sampler_src=$(find_dist_file "lamboot-host-sampler" 2>/dev/null) || sampler_src=""
+    if [ -f "$sampler_src" ]; then
+        run "install lamboot-host-sampler" \
+            install -Dm0755 "$sampler_src" "${OPT_ROOT}/usr/bin/lamboot-host-sampler"
+    else
+        warn "lamboot-host-sampler not found in dist tree; sampler.timer will fail until package is installed"
+    fi
+
+    # systemd units (bls-amend.service, host-sampler.service, host-sampler.timer)
+    local unit unit_src
+    for unit in lamboot-bls-amend.service lamboot-host-sampler.service lamboot-host-sampler.timer; do
+        unit_src=""
+        # Prefer dist/systemd/, fall back to source systemd/
+        unit_src=$(find_dist_file "systemd/${unit}" 2>/dev/null) || \
+        unit_src=$(find_dist_file "../systemd/${unit}" 2>/dev/null) || unit_src=""
+        if [ -f "$unit_src" ]; then
+            run "install ${unit}" \
+                install -Dm0644 "$unit_src" "${OPT_ROOT}/usr/lib/systemd/system/${unit}"
+        else
+            warn "systemd unit not found: ${unit} (skipping)"
+        fi
+    done
+
+    # Proxmox-specific dpkg trigger (zzzz- prefix sorts strictly after
+    # zz-proxmox-boot so we run after proxmox-boot-tool's writes complete).
+    local trigger_src
+    trigger_src=$(find_dist_file "kernel-hooks/zzzz-lamboot-proxmox" 2>/dev/null) || \
+    trigger_src=$(find_dist_file "../kernel-hooks/zzzz-lamboot-proxmox" 2>/dev/null) || trigger_src=""
+    if [ -f "$trigger_src" ]; then
+        run "install zzzz-lamboot-proxmox" \
+            install -Dm0755 "$trigger_src" \
+            "${OPT_ROOT}/etc/kernel/postinst.d/zzzz-lamboot-proxmox"
+    else
+        warn "Proxmox dpkg trigger source missing (kernel upgrades will not auto-amend BLS)"
+    fi
+
+    # Enable units. Under --root we can't call systemctl against a
+    # chroot; instead create the [Install] symlinks manually. Outside
+    # --root we use systemctl enable.
+    proxmox_enable_units
+}
+
+proxmox_enable_units() {
+    if [[ -z "$OPT_ROOT" || "$OPT_ROOT" == "/" ]]; then
+        # Direct host install — use systemctl
+        if command -v systemctl >/dev/null 2>&1; then
+            run "enable lamboot-host-sampler.timer" systemctl enable --now lamboot-host-sampler.timer 2>/dev/null || true
+            run "enable lamboot-bls-amend.service" systemctl enable lamboot-bls-amend.service 2>/dev/null || true
+        fi
+        return 0
+    fi
+
+    # Under --root: create the [Install] symlinks manually so they
+    # activate at the chroot's first boot.
+    local wants_dir="${OPT_ROOT}/etc/systemd/system/timers.target.wants"
+    local mu_wants="${OPT_ROOT}/etc/systemd/system/multi-user.target.wants"
+    if (( OPT_DRY_RUN )); then
+        detail "[dry-run] would create enable-symlinks in ${wants_dir} and ${mu_wants}"
+        return 0
+    fi
+    mkdir -p "$wants_dir" "$mu_wants"
+    # timers.target.wants/lamboot-host-sampler.timer
+    if [ -f "${OPT_ROOT}/usr/lib/systemd/system/lamboot-host-sampler.timer" ]; then
+        ln -sf "/usr/lib/systemd/system/lamboot-host-sampler.timer" \
+            "${wants_dir}/lamboot-host-sampler.timer"
+        detail "enabled (chroot): lamboot-host-sampler.timer"
+    fi
+    # multi-user.target.wants/lamboot-bls-amend.service
+    if [ -f "${OPT_ROOT}/usr/lib/systemd/system/lamboot-bls-amend.service" ]; then
+        ln -sf "/usr/lib/systemd/system/lamboot-bls-amend.service" \
+            "${mu_wants}/lamboot-bls-amend.service"
+        detail "enabled (chroot): lamboot-bls-amend.service"
+    fi
+}
+
+phase7b_proxmox_hooks() {
+    # v0.11.13: PATH C and PATH A both get the observability stack + marker.
+    # cmdline-sync stays PATH-A-only because GRUB-cmdline parsing only
+    # matters when LamBoot is the kernel-cmdline source-of-truth.
+    msg "Phase 7b: Installing Proxmox hooks + observability..."
+    proxmox_install_marker
+    proxmox_install_observability
+    if (( OPT_PROXMOX_HOST_REPLACE_GRUB )); then
+        proxmox_install_cmdline_sync
+    fi
+}
+
+# ============================================================================
+# Phase 8b: Proxmox drift check (post-install verification)
+# ============================================================================
+
+phase8b_proxmox_drift_check() {
+    local inspect
+    if ! inspect=$(proxmox_resolve_grub_inspect 2>/dev/null); then
+        detail "lamboot-grub-inspect not installed; skipping drift check"
+        return 0
+    fi
+    if "$inspect" \
+            --grub-cfg "/boot/grub/grub.cfg" \
+            --default-grub "$PROXMOX_DEFAULT_GRUB" \
+            --grubenv "/boot/grub/grubenv" \
+            compare-cmdline >/dev/null 2>&1; then
+        ok "cmdline matches /etc/default/grub (no drift)"
+    else
+        warn "cmdline drift detected — see 'lamboot-grub-inspect compare-cmdline'"
+        PARTIAL_FAILURE=1
+    fi
+}
+
+# ============================================================================
+# Proxmox refresh-only path (postinst-hook callback)
+# ============================================================================
+
+proxmox_do_refresh() {
+    # The postinst hook calls us in this mode after every kernel
+    # install/remove. We skip every phase except the BLS regen.
+    if (( OPT_REPAIR_BLS )); then
+        msg "Repair: rebuild ESP BLS entries from /boot kernel list + /etc/default/grub"
+        # Re-derive /etc/kernel/cmdline from GRUB so a changed cmdline
+        # propagates into the regenerated entries (the additive path keeps
+        # whatever cmdline existing entries already carry).
+        if [[ -f "${OPT_ROOT:-}${PROXMOX_DEFAULT_GRUB}" ]]; then
+            local cmdline
+            cmdline="$(proxmox_compose_cmdline)"
+            [[ -n "$cmdline" ]] && proxmox_write_kernel_cmdline "$cmdline"
+        fi
+    else
+        msg "Refresh: re-sync ESP BLS entries from /boot kernel list (additive)"
+    fi
+    proxmox_refresh_bls_entries
+    phase8b_proxmox_drift_check
+}
 
 usage() {
     cat <<'USAGE'
@@ -2382,7 +4849,25 @@ Options:
   --set-default     Explicitly make LamBoot default (now the install default;
                     retained for backward compatibility and scripts).
   --replace         Replace existing bootloader (backup + make-default)
-  --fallback        Also install as \EFI\BOOT\BOOTX64.EFI
+  --fallback        Also install as \EFI\BOOT\BOOT{X64,AA64}.EFI.
+                    Under --root this is auto-enabled (the fallback path
+                    is the only first-boot discovery mechanism when NVRAM
+                    writes are deferred to first boot). Pass --no-fallback
+                    to opt out of auto-enable when you have an external
+                    first-boot path (custom NVRAM injection, chain-loading
+                    from another bootloader, etc.).
+  --no-fallback     Do NOT install \EFI\BOOT\BOOTX64.EFI. Suppresses the
+                    --root auto-enable. The resulting install will have
+                    no firmware-visible boot path on first boot unless
+                    you arrange one externally.
+  --replace-fallback
+                    Permit --fallback to overwrite an existing FOREIGN
+                    bootloader (shim/GRUB/systemd-boot/rEFInd/Windows) at
+                    the firmware fallback path, backing it up first. Plain
+                    --force does NOT authorize this — it is decoupled so a
+                    --force added for an unrelated check can't bury another
+                    OS's default loader as a side effect. Intended for
+                    removable media or single-OS disks you own.
   --signed          Use pre-signed binary (required for Secure Boot)
   --no-shim         Skip shim chain setup even if Secure Boot is on.
                     REQUIRES the kernel to be firmware-DB-signed. For stock
@@ -2424,7 +4909,15 @@ Options:
   --remove          Remove LamBoot installation (reads install manifest)
   --update          Update existing installation (preserve config)
   --dry-run         Show what would happen without doing it
-  --force           Skip safety checks
+  --force           Skip safety checks (ESP free-space, fallback prompts).
+                    Does NOT authorize writing to a non-ESP-typed partition,
+                    overwriting a foreign fallback loader, or following a
+                    symlink off the ESP — those need their dedicated flags.
+  --force-foreign-esp
+                    Permit writing to a vfat partition that is not GPT-typed
+                    as an EFI System Partition (deliberate removable-media /
+                    foreign-disk preparation). Decoupled from --force so an
+                    unrelated --force can't target the wrong partition.
   --no-bls          Don't generate BLS entries
   --keep-entries    With --remove: keep generated BLS entries
   --keep-logs       With --remove: keep boot.log/boot.json/audit.log/
@@ -2434,11 +4927,86 @@ Options:
   --version         Print version and exit
   --help            Print this help
 
-Exit codes:
-  0  Success
-  1  Fatal error
-  2  Partial success (non-critical step failed)
-  3  Nothing to do (already up to date)
+Proxmox VE host modes (v0.11.0+ — see
+docs/proxmox-host-install/research/INDEX.md for the path framework):
+  --proxmox-host    Install in coexist mode (PATH C). LamBoot deploys to
+                    a separate ESP path and is reachable via a new GRUB
+                    chainload menuentry in /etc/grub.d/40_custom. GRUB
+                    stays the default bootloader; you pick LamBoot at the
+                    GRUB menu, or use `grub-reboot "LamBoot (chainload)"`
+                    for a one-shot test boot. No BLS generation, no
+                    kernel hooks installed. Safe first deployment on any
+                    Proxmox host; rollback is just removing the
+                    menuentry.
+  --replace-grub    Escalate to PATH A subset — generates BLS entries
+                    for every Proxmox kernel under /boot/loader/entries/
+                    (named lamboot-VERSION.conf), writes
+                    /etc/kernel/cmdline from /etc/default/grub via
+                    lamboot-grub-inspect, and installs the
+                    /etc/kernel/install.d/00-lamboot-cmdline-sync hook
+                    so BLS entries track GRUB_CMDLINE_LINUX* across
+                    kernel installs and /etc/default/grub edits. GRUB
+                    still chainloads LamBoot via the 40_custom
+                    menuentry — the dpkg-divert of grubx64.efi is
+                    v0.12+ work. Implies --proxmox-host. Run ONLY
+                    after --proxmox-host has validated.
+  --refresh         Postinst-hook callback mode (not for direct operator
+                    use). ADDITIVE: ensures every /boot/vmlinuz-* has an
+                    ESP BLS entry (loader/entries on the ESP, where LamBoot
+                    reads them) by delegating to lamboot-kernel-hook. Existing
+                    entries are left untouched, so operator customizations are
+                    preserved. Skips binary install, NVRAM ops, and
+                    verification. Called by the kernel hooks after each
+                    kernel install.
+  --repair-bls      Force-rebuild the ESP BLS entries: re-derive
+                    /etc/kernel/cmdline from /etc/default/grub, OVERWRITE every
+                    entry, and prune entries for removed kernels. This is the
+                    explicit "fix my BLS entries" switch — use it when entries
+                    are stale or missing. Implies --proxmox-host. Default
+                    operations never modify existing entries; this one does.
+
+  --capcheck-json PATH
+                    Consume a lamboot-capcheck audit JSON (schema v1)
+                    and apply install hints. No subprocess call;
+                    lamboot-capcheck is NOT a runtime dependency. The
+                    operator (or upstream tooling) generates the JSON
+                    separately (e.g. \`lamboot-capcheck --json audit\`).
+
+                    Effects:
+                    1. Abort (unless --force) if any matched quirk has
+                       severity=critical.
+                    2. Imply --signed if Secure Boot is in deployed
+                       mode (PK + KEK + db populated, SetupMode=0).
+                    3. Surface non-critical quirks for operator
+                       visibility.
+                    4. Warn (but don't gate) on FAIL-status checks.
+
+                    Degrades silently when the file is missing,
+                    unreadable, or malformed.
+
+lamboot-installer-protocol v1 (for downstream installers — archinstall,
+calamares, openSUSE update-bootloader, etc.; see
+docs/specs/SPEC-LAMBOOT-INSTALLER-PROTOCOL-V1.md):
+  --protocol-version  Print "1" and exit (negotiation handshake)
+  --capabilities      Print machine-readable capabilities JSON and exit
+  --json              Emit structured JSON events instead of prose
+  --no-prompt         Non-interactive; defer prompts where possible
+                      (MOK enrollment, toolkit install, etc.)
+  --root PATH         Install into PATH instead of "/"; defers NVRAM/MOK
+                      writes to a first-boot systemd unit. For use by
+                      installers running from a live ISO targeting a
+                      chrooted/mounted rootfs.
+
+Exit codes (v1):
+  0  ok                     - success
+  1  error                  - fatal error
+  2  partial                - some non-critical step failed OR --root
+                              successfully deferred NVRAM/MOK to first boot
+  3  noop                   - nothing to do (already up to date)
+  4  unsafe                 - install would brick the system; refused
+  5  abort                  - operator aborted (Ctrl-C, --no-prompt declined)
+  6  not_applicable         - target doesn't support the requested operation
+  7  prerequisite_missing   - shim, mokutil, sbsigntools, etc. missing
 USAGE
 }
 
@@ -2446,11 +5014,13 @@ parse_options() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --esp)          [ -n "${2:-}" ] || die "--esp requires a path argument"; OPT_ESP="$2"; shift ;;
-            --no-efi-entry) OPT_NO_EFI_ENTRY=1 ;;
+            --no-efi-entry) OPT_NO_EFI_ENTRY=1; OPT_NO_EFI_ENTRY_EXPLICIT=1 ;;
             --set-default)    OPT_SET_DEFAULT=1 ;;
             --no-make-default) OPT_SET_DEFAULT=0 ;;
             --make-default)   OPT_SET_DEFAULT=1 ;;
-            --fallback)     OPT_FALLBACK=1 ;;
+            --fallback)     OPT_FALLBACK=1; OPT_FALLBACK_EXPLICIT=1 ;;
+            --no-fallback)  OPT_FALLBACK=0; OPT_FALLBACK_EXPLICIT=1 ;;
+            --replace-fallback) OPT_REPLACE_FALLBACK=1 ;;
             --with-drivers) OPT_WITH_DRIVERS=1; OPT_WITH_DRIVERS_LEGACY="all" ;;
             --with-drivers-legacy=*)
                 OPT_WITH_DRIVERS_LEGACY="${1#--with-drivers-legacy=}"
@@ -2481,6 +5051,7 @@ parse_options() {
             --update)       OPT_UPDATE=1 ;;
             --dry-run)      OPT_DRY_RUN=1 ;;
             --force)        OPT_FORCE=1 ;;
+            --force-foreign-esp) OPT_FORCE_FOREIGN_ESP=1 ;;
             --no-bls)       OPT_NO_BLS=1 ;;
             --keep-entries) OPT_KEEP_ENTRIES=1 ;;
             --keep-logs)    OPT_KEEP_LOGS=1 ;;
@@ -2495,6 +5066,25 @@ parse_options() {
             --kernel-firmware-db-signed) OPT_KERNEL_DB_SIGNED=1 ;;
             --version)      echo "lamboot-install ${LAMBOOT_VERSION}"; exit 0 ;;
             --help|-h)      usage; exit 0 ;;
+            # v0.10.1 — lamboot-installer-protocol v1 short-circuit flags
+            --protocol-version) echo "${LAMBOOT_INSTALLER_PROTOCOL_VERSION}"; exit 0 ;;
+            --capabilities) emit_capabilities "$@"; exit 0 ;;
+            # v0.10.1 — lamboot-installer-protocol v1 modifier flags
+            --no-prompt)    OPT_NO_PROMPT=1 ;;
+            --json)         OPT_JSON=1 ;;
+            --root)         OPT_ROOT="${2:?--root requires a PATH}"; shift ;;
+            --root=*)       OPT_ROOT="${1#*=}" ;;
+            # v0.11.0 — Proxmox-host modes
+            --proxmox-host)            OPT_PROXMOX_HOST=1 ;;
+            --replace-grub)            OPT_PROXMOX_HOST=1; OPT_PROXMOX_HOST_REPLACE_GRUB=1 ;;
+            --refresh)                 OPT_REFRESH=1 ;;
+            # Force-rebuild ESP BLS entries (re-derive cmdline, overwrite all,
+            # prune removed). Routes through the refresh short-circuit.
+            --repair-bls)              OPT_REPAIR_BLS=1; OPT_REFRESH=1; OPT_PROXMOX_HOST=1 ;;
+            --capcheck-json)
+                [ -n "${2:-}" ] || die "--capcheck-json requires a path argument"
+                OPT_CAPCHECK_JSON="$2"; shift ;;
+            --capcheck-json=*) OPT_CAPCHECK_JSON="${1#*=}" ;;
             *)              die "Unknown option: $1" ;;
         esac
         shift
@@ -2509,6 +5099,74 @@ parse_options() {
         (( OPT_UPDATE ))      && die "--remove and --update are mutually exclusive."
     fi
     (( OPT_QUIET && OPT_VERBOSE )) && die "--quiet and --verbose are mutually exclusive."
+
+    # v0.11.0 — Proxmox-host mode behavior modifiers.
+    #
+    # PATH C (coexist): we install LamBoot alongside GRUB. GRUB stays
+    # default; LamBoot is opt-in via the menu or `grub-reboot`. So we
+    # force off the NVRAM-default-promotion and skip BLS generation
+    # (Proxmox owns the kernel boot path; LamBoot is just chainloaded
+    # for testing). The GRUB menuentry is added in a new phase.
+    if (( OPT_PROXMOX_HOST )) && ! (( OPT_PROXMOX_HOST_REPLACE_GRUB )) && ! (( OPT_REFRESH )); then
+        OPT_SET_DEFAULT=0
+        OPT_NO_BLS=1
+        OPT_NO_EFI_ENTRY=1   # don't displace Proxmox's Boot#### entry; GRUB chainloads us
+    fi
+
+    # PATH A (replace-grub): we DO want BLS entries (LamBoot reads them
+    # from the LVM root) and we DO want the kernel hooks (cmdline-sync
+    # + zz-lamboot). NVRAM default still stays as Proxmox's shim entry
+    # so the firmware path is unchanged; LamBoot reaches the kernel by
+    # being the binary GRUB chainloads or that lives at the Proxmox
+    # bootloader path (depending on dpkg-divert).
+    if (( OPT_PROXMOX_HOST_REPLACE_GRUB )) && ! (( OPT_REFRESH )); then
+        OPT_SET_DEFAULT=0
+        OPT_NO_BLS=0
+        # --refresh wants nothing else; the install path wants everything.
+    fi
+
+    # --refresh is incompatible with --remove, --update, --replace.
+    if (( OPT_REFRESH )); then
+        (( OPT_REMOVE ))  && die "--refresh and --remove are mutually exclusive."
+        (( OPT_UPDATE ))  && die "--refresh and --update are mutually exclusive."
+        (( OPT_REPLACE )) && die "--refresh and --replace are mutually exclusive."
+    fi
+
+    # v0.11.9 — auto-enable --fallback under --root.
+    #
+    # Under --root, lamboot-install cannot run efibootmgr (no NVRAM access
+    # from a chroot), so it defers NVRAM Boot#### writes to first boot
+    # via a service that runs after Linux boots. But that service can
+    # only run if Linux boots, and Linux can only boot via LamBoot,
+    # and the firmware can only find LamBoot via EITHER a NVRAM entry
+    # (deferred — doesn't exist yet) OR the removable-media fallback
+    # path \EFI\BOOT\BOOT{X64,AA64}.EFI.
+    #
+    # Without auto-enabling --fallback, distro-installer flows
+    # (archinstall, calamares, image-builders) silently produce an
+    # install the firmware cannot discover. v0.11.8 shipped this gap:
+    # VM 362 archinstall test 2026-05-28 17:14:37 reproduced it as
+    # "No bootable option or device was found" post-install.
+    #
+    # The auto-enable does NOT fire if the operator was explicit about
+    # any of: --fallback (already on), --no-fallback (operator opt-out),
+    # --no-efi-entry (operator declared they have their own first-boot
+    # path). The existing install_fallback() self-loop guard still
+    # refuses to overwrite a non-LamBoot fallback bootloader without
+    # --force, so dual-boot scenarios still fail loudly rather than
+    # silently breaking the existing distro.
+    if [[ -n "$OPT_ROOT" && "$OPT_ROOT" != "/" ]] \
+       && ! (( OPT_FALLBACK_EXPLICIT )) \
+       && ! (( OPT_NO_EFI_ENTRY_EXPLICIT )) \
+       && ! (( OPT_REMOVE )) \
+       && ! (( OPT_PROXMOX_HOST )); then
+        OPT_FALLBACK=1
+        OPT_FALLBACK_AUTO=1
+    fi
+
+    # --fallback / --no-fallback: last flag wins (standard bash CLI
+    # semantics; both set OPT_FALLBACK_EXPLICIT so the auto-enable
+    # rule respects either as an explicit operator choice).
 
     # Config-4 / --no-shim trust-chain guardrail.
     # Under Secure Boot, if the user asks to skip shim, the kernel must be
@@ -2534,42 +5192,197 @@ See docs/SECURE-BOOT-DEPLOYMENT.md."
     fi
 }
 
+# v0.10.1 — wrap a phase with phase_start/phase_end events under --json.
+# In text mode this is a no-op (phase headers already printed by the phase
+# functions themselves). Phase functions are called normally; this helper
+# only adds the structured envelope.
+run_phase() {
+    local phase_id="$1"; shift
+    emit_event phase_start "$phase_id"
+    if "$@"; then
+        emit_event phase_end "$phase_id" "status=ok"
+    else
+        local rc=$?
+        emit_event phase_end "$phase_id" "status=error" "exit_code=$rc"
+        return $rc
+    fi
+}
+
 main() {
     parse_options "$@"
+    resolve_target_paths
+
+    # v0.11.2 — Consult capcheck JSON if provided. May imply --signed and
+    # may abort on critical quirks. Runs BEFORE the protocol event so the
+    # JSON event stream reflects any abort decisions.
+    if [ -n "$OPT_CAPCHECK_JSON" ]; then
+        consume_capcheck_json "$OPT_CAPCHECK_JSON"
+    fi
+
+    # v0.10.1 protocol — opening event identifies the tool + protocol version + invocation args
+    if (( OPT_JSON )); then
+        local quoted_args=""
+        for a in "$@"; do
+            quoted_args+="\"$(printf '%s' "$a" | sed 's/\\/\\\\/g; s/"/\\"/g')\","
+        done
+        quoted_args="${quoted_args%,}"
+        printf '{"event":"protocol","protocol_version":%d,"tool":"lamboot-install","tool_version":"%s","invoked_args":[%s],"ts":%d}\n' \
+            "$LAMBOOT_INSTALLER_PROTOCOL_VERSION" "$LAMBOOT_VERSION" "$quoted_args" "$(date +%s)"
+    fi
+
+    local _start_ts
+    _start_ts=$(date +%s)
 
     if (( OPT_REMOVE )); then
-        do_remove
+        run_phase remove do_remove
+        # On a Proxmox-host install, also strip the GRUB menuentry +
+        # cmdline-sync hook + regenerate grub.cfg. is_proxmox_host()
+        # is the cheap detection; the menuentry remove is itself
+        # idempotent so a false positive here is harmless.
+        if is_proxmox_host; then
+            run_phase proxmox_grub_remove proxmox_remove_menuentry
+            run_phase proxmox_cmdline_sync_remove proxmox_remove_cmdline_sync
+            run_phase proxmox_update_grub proxmox_update_grub
+        fi
+        _emit_done
         exit $(( PARTIAL_FAILURE ? EXIT_PARTIAL : EXIT_OK ))
     fi
 
-    phase1_detect_environment
-    phase2_assess_drivers
-    phase3_discover_entries
-
-    if (( OPT_REPLACE )); then
-        phase3b_backup_and_migrate
+    # v0.11.0 — --refresh short-circuits to the BLS regen path. The
+    # /etc/kernel/install.d/00-lamboot-cmdline-sync hook calls us this
+    # way after every Proxmox kernel install/remove.
+    if (( OPT_REFRESH )); then
+        run_phase refresh proxmox_do_refresh
+        _emit_done
+        exit $(( PARTIAL_FAILURE ? EXIT_PARTIAL : EXIT_OK ))
     fi
 
-    phase4_install_files
-    phase5_generate_bls
-    phase6_efi_boot_entry
-    phase7_systemd_integration
+    # v0.11.0 — soft warning: running plain install on a Proxmox host
+    # without --proxmox-host means LamBoot would try to displace
+    # Proxmox's shim Boot#### entry, which is almost never what the
+    # operator wants. Warn loudly but don't refuse — they may know.
+    # Proxmox-host detection gate. Surface what we detected and the mode we
+    # will install in, so the operator can abort if it is wrong. Proxmox-host
+    # is a supported-but-unusual path, so we are explicit about entering it.
+    if is_proxmox_host; then
+        if (( OPT_PROXMOX_HOST )); then
+            local _pmode="C (coexist — GRUB stays default, LamBoot is chainloaded)"
+            (( OPT_PROXMOX_HOST_REPLACE_GRUB )) && _pmode="A (LamBoot manages kernel BLS entries on the ESP)"
+            msg "Detected Proxmox VE host — installing in Proxmox-host mode, PATH ${_pmode}."
+        else
+            warn "This host looks like Proxmox VE but --proxmox-host was not specified."
+            warn "  A plain install promotes LamBoot to the default boot entry, displacing"
+            warn "  Proxmox's shim entry, AND skips the Proxmox kernel-update integration —"
+            warn "  new kernels would NOT receive LamBoot BLS entries. For supported"
+            warn "  Proxmox-host behavior, re-run with --proxmox-host (coexist) or"
+            warn "  --replace-grub (LamBoot manages BLS entries)."
+        fi
+    elif (( OPT_PROXMOX_HOST )); then
+        warn "--proxmox-host specified but this host does not look like Proxmox VE"
+        warn "  (no /etc/pve, no proxmox-boot-tool). Proceeding as requested."
+    fi
+
+    run_phase detect      phase1_detect_environment
+    run_phase drivers     phase2_assess_drivers
+    run_phase discover    phase3_discover_entries
+
+    if (( OPT_REPLACE )); then
+        run_phase backup  phase3b_backup_and_migrate
+    fi
+
+    run_phase install     phase4_install_files
+
+    # v0.11.0 — Proxmox-host GRUB integration runs between the binary
+    # install and the BLS phase: we want the binary on the ESP before
+    # we point GRUB at it via 40_custom, but we may still write BLS
+    # entries (PATH A) below.
+    if (( OPT_PROXMOX_HOST )); then
+        run_phase proxmox_grub phase4b_proxmox_grub_integration
+    fi
+
+    # v0.11.12 — under --root, ensure the chroot's initramfs has the
+    # hooks needed for its root layout (lvm2 for LVM; sd-encrypt for
+    # LUKS). archinstall doesn't auto-add these even when the
+    # operator picks LVM/LUKS, which leaves a correct kernel cmdline
+    # paired with an initramfs that can't activate the device
+    # backing the UUID. Run BEFORE bls so the regenerated initramfs
+    # is on the ESP by the time BLS entries are written.
+    if [[ -n "$OPT_ROOT" && "$OPT_ROOT" != "/" ]] && ! (( OPT_PROXMOX_HOST )); then
+        run_phase initramfs_fixup phase4c_chroot_initramfs_fixup
+    fi
+
+    run_phase bls         phase5_generate_bls
+
+    # PATH A: bulk-backfill BLS entries for every existing
+    # /boot/vmlinuz-* (Proxmox's stock install doesn't generate BLS,
+    # so we own the entire set under our lamboot-*.conf prefix).
+    if (( OPT_PROXMOX_HOST_REPLACE_GRUB )); then
+        run_phase proxmox_bls phase5b_proxmox_bls_backfill
+    fi
+
+    run_phase uefi_entry  phase6_efi_boot_entry
+    run_phase systemd     phase7_systemd_integration
+
+    # PATH A: install the cmdline-sync hook that re-runs us in
+    # --refresh mode after every kernel install.
+    # v0.11.13 — phase7b runs for any --proxmox-host (PATH C or PATH A).
+    # The marker file + observability stack are PATH-agnostic; only
+    # cmdline-sync is gated to PATH A inside the phase function.
+    if (( OPT_PROXMOX_HOST )); then
+        run_phase proxmox_hooks phase7b_proxmox_hooks
+    fi
+
+    # v0.11.0 — Proxmox-host: rebuild grub.cfg AFTER everything else is
+    # in place so the new menuentry shows up on next boot.
+    if (( OPT_PROXMOX_HOST )); then
+        run_phase proxmox_update_grub proxmox_update_grub
+    fi
 
     write_manifest
-    phase8_verify
+    run_phase verify      phase8_verify
+
+    # PATH A: surface cmdline drift as a final check.
+    if (( OPT_PROXMOX_HOST_REPLACE_GRUB )); then
+        run_phase proxmox_drift phase8b_proxmox_drift_check
+    fi
+
     phase9_toolkit_prompt
 
+    _emit_done
     exit $(( PARTIAL_FAILURE ? EXIT_PARTIAL : EXIT_OK ))
 }
 
-# Allow --help and --version without root
-for arg in "$@"; do
-    case "$arg" in
-        --help|-h) usage; exit 0 ;;
-        --version) echo "lamboot-install ${LAMBOOT_VERSION}"; exit 0 ;;
-    esac
-done
+# Internal: emit the closing `done` event with summary.
+_emit_done() {
+    if (( OPT_JSON )); then
+        local exit_code=$(( PARTIAL_FAILURE ? EXIT_PARTIAL : EXIT_OK ))
+        local exit_name="ok"
+        (( exit_code == EXIT_PARTIAL )) && exit_name="partial"
+        local end_ts; end_ts=$(date +%s)
+        local duration_ms=$(( (end_ts - _start_ts) * 1000 ))
+        printf '{"event":"done","exit_code":%d,"exit_name":"%s","duration_ms":%d,"ts":%d}\n' \
+            "$exit_code" "$exit_name" "$duration_ms" "$end_ts"
+    fi
+}
 
-(( EUID == 0 )) || die "This script must be run as root."
+# Run the CLI only when EXECUTED directly. When this file is SOURCED (e.g. by the
+# bats unit suite in tools/tests/installer/, which loads the functions to test
+# them in isolation), skip the arg dispatch, the root check, and main entirely —
+# sourcing must not run a privileged operation or exit the caller.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    # Allow --help, --version, and v0.10.1 protocol-introspection flags without
+    # root. --protocol-version, --capabilities, and --capabilities --json are
+    # pure reads of build-time constants; no privileged operation needed.
+    for arg in "$@"; do
+        case "$arg" in
+            --help|-h) usage; exit 0 ;;
+            --version) echo "lamboot-install ${LAMBOOT_VERSION}"; exit 0 ;;
+            --protocol-version) echo "${LAMBOOT_INSTALLER_PROTOCOL_VERSION}"; exit 0 ;;
+            --capabilities) emit_capabilities "$@"; exit 0 ;;
+        esac
+    done
 
-main "$@"
+    (( EUID == 0 )) || die "This script must be run as root."
+
+    main "$@"
+fi

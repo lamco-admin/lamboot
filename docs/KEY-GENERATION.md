@@ -2,7 +2,7 @@
 
 **Audience:** release engineer preparing LamBoot for public distribution.
 **Prerequisites:** OpenSSL 3.x, a Linux workstation with an encrypted home or full-disk encryption, a password manager for passphrase storage, and a secure offline medium (encrypted USB in a safe, or an encrypted archive with a documented custodian) for PK/KEK key material.
-**Status:** authoritative procedure for v0.8.3 production keys.
+**Status:** authoritative procedure for LamBoot production keys.
 
 ---
 
@@ -214,7 +214,7 @@ If `sbsign` or `sbverify` are missing: `sudo apt install sbsigntool` (Debian/Ubu
 - Offline storage options (pick one, document which):
   - Encrypted USB stick in a physical safe (practical)
   - LUKS-encrypted archive on detachable storage (practical)
-  - HSM-backed keys (ideal long-term, out of scope for v0.8.3)
+  - HSM-backed keys (ideal long-term, out of scope for now)
 - After transfer, shred local copies:
   ```
   shred -u PK.key KEK.key   # passphrase-protected, but shred anyway
@@ -280,7 +280,7 @@ If `KEK.key` or `PK.key` is compromised: requires firmware-level remediation. Sa
 
 ## 7. CI / automated signing considerations
 
-For future CI signing (out of scope for v0.8.3 initial release, but plan):
+For future CI signing (out of scope for now, but planned):
 
 - `db.key` passphrase injected via CI secret store (GitHub Actions encrypted secrets, HashiCorp Vault, etc.).
 - Signing happens in an isolated CI runner; key decrypted into tmpfs, never touches persistent disk.

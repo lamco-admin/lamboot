@@ -1,3 +1,5 @@
+//! Layer: 0 — Platform Introspection.
+//!
 //! QEMU fw_cfg device access for host→guest data injection.
 //!
 //! The fw_cfg device provides a key-value store accessible from the guest

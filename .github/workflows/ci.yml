@@ -1,0 +1,155 @@
+name: CI
+
+# Mechanical enforcement of the checks the pre-commit hook runs locally, plus
+# the layer contract. Closes the audit finding "no CI gates; every release-
+# integrity check is manual." Actions are pinned to commit SHAs (supply-chain
+# hardening per the security audit) — update deliberately, never to a moving tag.
+#
+# The cargo jobs (rust, host-tests) need lamboot-core's sibling path-deps —
+# lamco-admin/lambutter-dev (../../lambutter-dev) and lamco-admin/lamlvm-dev
+# (../../lamlvm-dev) — which live outside this repo. They are checked out
+# side-by-side under the workspace so the relative paths resolve, exactly as
+# they do on a developer box. Both siblings are PRIVATE, so the default
+# GITHUB_TOKEN cannot read them: this requires a repo secret `SIBLING_REPOS_TOKEN`
+# (a PAT / fine-grained token with read access to both sibling repos). Without
+# the secret, the `gate` job below evaluates to has_token=false and the two
+# cargo jobs SKIP (reported green/neutral) rather than failing at checkout; the
+# non-cargo jobs (layer-contract, installer-tests, placeholder-scan) always run.
+# Interim: lambutter-dev/lamlvm-dev publish soon — once public, drop the token
+# inputs + the gate and check them out (or switch to crates.io deps) tokenlessly.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Sibling token gate
+    runs-on: ubuntu-latest
+    outputs:
+      has_token: ${{ steps.check.outputs.has_token }}
+    steps:
+      - id: check
+        env:
+          SIBLING_REPOS_TOKEN: ${{ secrets.SIBLING_REPOS_TOKEN }}
+        run: |
+          if [ -n "$SIBLING_REPOS_TOKEN" ]; then
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::SIBLING_REPOS_TOKEN not set — skipping cargo jobs (private sibling path-deps unavailable). Set the secret, or switch to tokenless checkout once the siblings are public."
+          fi
+
+  layer-contract:
+    name: Layer contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.x'
+      - name: Check layer declarations + dependency direction
+        run: python3 tools/check-layers.py
+      - name: Check module dependency graph is acyclic
+        run: python3 tools/check-layers.py --graph
+
+  rust:
+    name: Format, lint, build
+    needs: gate
+    if: ${{ needs.gate.outputs.has_token == 'true' }}
+    runs-on: ubuntu-latest
+    # All cargo steps run from the main checkout; the siblings sit alongside it
+    # under the workspace so lamboot-core's ../../lambutter-dev and
+    # ../../lamlvm-dev path-deps resolve.
+    defaults:
+      run:
+        working-directory: lamboot-dev
+    steps:
+      - name: Check out lamboot-dev
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: lamboot-dev
+      - name: Check out lambutter-dev (private sibling path-dep)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: lamco-admin/lambutter-dev
+          path: lambutter-dev
+          token: ${{ secrets.SIBLING_REPOS_TOKEN }}
+      - name: Check out lamlvm-dev (private sibling path-dep)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: lamco-admin/lamlvm-dev
+          path: lamlvm-dev
+          token: ${{ secrets.SIBLING_REPOS_TOKEN }}
+      - name: Install Rust (nightly for fmt + build-std, stable for the rest)
+        run: |
+          rustup toolchain install nightly --component rustfmt
+          rustup component add clippy
+          rustup target add x86_64-unknown-uefi aarch64-unknown-uefi
+          rustup component add rust-src --toolchain nightly
+      - name: Format check
+        run: rustup run nightly cargo fmt --check
+      - name: Clippy
+        run: cargo clippy
+      - name: Build x86_64-unknown-uefi
+        run: cargo check --target x86_64-unknown-uefi
+      - name: Build aarch64-unknown-uefi
+        run: cargo check --target aarch64-unknown-uefi
+
+  host-tests:
+    name: Host tests (pure modules)
+    needs: gate
+    if: ${{ needs.gate.outputs.has_token == 'true' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lamboot-dev
+    steps:
+      - name: Check out lamboot-dev
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: lamboot-dev
+      - name: Check out lambutter-dev (private sibling path-dep)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: lamco-admin/lambutter-dev
+          path: lambutter-dev
+          token: ${{ secrets.SIBLING_REPOS_TOKEN }}
+      - name: Check out lamlvm-dev (private sibling path-dep)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: lamco-admin/lamlvm-dev
+          path: lamlvm-dev
+          token: ${{ secrets.SIBLING_REPOS_TOKEN }}
+      - name: Install Rust stable
+        run: rustup toolchain install stable
+      - name: Run lamboot-fs-tests
+        run: cd lamboot-fs-tests && cargo test
+
+  installer-tests:
+    name: Installer unit tests (bats)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+      - name: Run installer dual-contract suite
+        run: bats tools/tests/installer/
+
+  placeholder-scan:
+    name: Placeholder scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Scan tracked sources for unresolved placeholders
+        run: |
+          if git grep -nE '\bXX\b|FIXME|PLACEHOLDER|YYYY' -- 'lamboot-core/**' 'lamboot-modules/**' 'tools/**' 'build.sh' 'package-release.sh'; then
+            echo "::error::unresolved placeholder markers found"; exit 1
+          fi
+          echo "no placeholder markers"

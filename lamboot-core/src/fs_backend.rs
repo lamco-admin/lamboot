@@ -1,3 +1,5 @@
+//! Layer: 2 — Storage & Filesystems.
+//!
 //! Layer 2 — Filesystem abstraction.
 //!
 //! Defines the `FsBackend` trait that every filesystem backend in LamBoot
@@ -36,6 +38,27 @@ pub(crate) use crate::fs_types::{
 };
 
 // ---------------------------------------------------------------------------
+// Read-contract chokepoint (the FsBackend hardening boundary)
+// ---------------------------------------------------------------------------
+
+/// Validate a metadata-reported file size for a full-file read allocation.
+///
+/// The single chokepoint every backend `read()` uses before `vec![0u8; n]`, so
+/// a hostile inode/dir-entry size field can never drive an unbounded up-front
+/// allocation (a denial-of-boot) and a 32-bit build fails loudly instead of
+/// truncating an `as usize` cast. The cap value (`MAX_BOOT_FILE_BYTES`) and the
+/// bounds math live in `read_limit_pure` so they are host-tested; this wrapper
+/// only maps the pure `TooLarge` into the backend's `FsError::FileTooLarge`.
+/// New backends inherit the contract by calling this rather than allocating
+/// from a raw size field — see `docs/specs/SPEC-FS-BACKEND-TRAIT.md`.
+pub(crate) fn checked_full_read_len(size: u64) -> Result<usize, FsError> {
+    crate::read_limit_pure::checked_read_len(size).map_err(|e| FsError::FileTooLarge {
+        size: e.size,
+        max: e.max,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // FsError
 // ---------------------------------------------------------------------------
 
@@ -52,6 +75,14 @@ pub(crate) enum FsError {
         backend: BackendTag,
     },
     Corrupt(&'static str),
+    /// A metadata-reported file size exceeded the read cap
+    /// (`read_limit_pure::MAX_BOOT_FILE_BYTES`) or did not fit `usize`. Rejected
+    /// before allocation so a hostile size field cannot trigger an OOM-abort
+    /// denial-of-boot.
+    FileTooLarge {
+        size: u64,
+        max: u64,
+    },
     Io {
         source: uefi::Error,
     },
@@ -72,6 +103,7 @@ impl FsError {
             FsError::Unsupported(_) => "unsupported",
             FsError::UnsupportedFeature { .. } => "unsupported_feature",
             FsError::Corrupt(_) => "fs_corrupt",
+            FsError::FileTooLarge { .. } => "file_too_large",
             FsError::Io { .. } => "io_error",
             FsError::BackendOther(_) => "backend_other",
         }
@@ -96,6 +128,7 @@ impl FsError {
             }
             FsError::Unsupported(_) | FsError::UnsupportedFeature { .. } => Status::UNSUPPORTED,
             FsError::Corrupt(_) => Status::VOLUME_CORRUPTED,
+            FsError::FileTooLarge { .. } => Status::OUT_OF_RESOURCES,
             FsError::Io { source } => source.status(),
             FsError::BackendOther(_) => Status::DEVICE_ERROR,
         }
@@ -115,6 +148,9 @@ impl fmt::Display for FsError {
                 write!(f, "unsupported feature {feature} on backend {backend}")
             }
             FsError::Corrupt(what) => write!(f, "filesystem corrupt: {what}"),
+            FsError::FileTooLarge { size, max } => {
+                write!(f, "file too large: {size} bytes exceeds cap {max}")
+            }
             FsError::Io { source } => write!(f, "I/O error: {source}"),
             FsError::BackendOther(err) => write!(f, "backend error: {err}"),
         }
@@ -186,6 +222,16 @@ pub(crate) trait FsBackend {
     )]
     fn open_stream(&mut self, path: &Path) -> Result<Box<dyn FsStream>, FsError> {
         Err(FsError::Unsupported("open_stream"))
+    }
+
+    /// FAT-only: return a mutable reference to the cached
+    /// `SimpleFileSystem` open held by this backend. Default is `None`
+    /// — only `FatBackend` returns Some. Used by `EspWriter` to share
+    /// a single SFS open across the whole boot path, avoiding the
+    /// firmware FAT-driver hang that triggers after ~14 cumulative
+    /// SFS exclusive opens on real Proxmox hosts.
+    fn fat_sfs_mut(&mut self) -> Option<&mut uefi::proto::media::fs::SimpleFileSystem> {
+        None
     }
 }
 

@@ -1,3 +1,5 @@
+//! Layer: 4 — Policy & State.
+//!
 //! Autodiscovery enhancements for the boot entry pipeline.
 //!
 //! Provides initrd auto-discovery, kernel path cross-referencing,

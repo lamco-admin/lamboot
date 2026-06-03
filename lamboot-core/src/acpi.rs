@@ -1,3 +1,5 @@
+//! Layer: 0 — Platform Introspection.
+//!
 //! ACPI DMAR/IVRS parser for IOMMU group detection.
 //!
 //! Walks ACPI tables (RSDP → XSDT → DMAR/IVRS) to identify IOMMU
@@ -13,6 +15,12 @@ use alloc::{string::String, vec::Vec};
 use core::ffi::c_void;
 
 use uefi::table::cfg::ConfigTableEntry;
+
+/// Defensive upper bound on any ACPI table `Length` field before it is used to
+/// map the table via `from_raw_parts`. Real ACPI tables are well under this;
+/// a header-supplied length larger than this is treated as corrupt/hostile
+/// (mirrors the `MAX_IMAGE_SIZE` style in `pe_loader_pure`).
+const MAX_ACPI_TABLE_LEN: usize = 1024 * 1024;
 
 /// Aggregate IOMMU information from ACPI tables
 #[derive(Debug, Clone, Default)]
@@ -166,7 +174,7 @@ fn parse_xsdt(xsdt_ptr: *const u8) -> Option<Vec<*const u8>> {
     }
 
     let table_length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-    if table_length < 36 {
+    if table_length < 36 || table_length > MAX_ACPI_TABLE_LEN {
         return None;
     }
 
@@ -209,7 +217,7 @@ fn parse_rsdt(rsdt_ptr: *const u8) -> Option<Vec<*const u8>> {
     }
 
     let table_length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-    if table_length < 36 {
+    if table_length < 36 || table_length > MAX_ACPI_TABLE_LEN {
         return None;
     }
 
@@ -247,15 +255,18 @@ const DMAR_TYPE_RMRR: u16 = 1;
 
 /// Parse Intel DMAR (DMA Remapping) table.
 fn parse_dmar(table_ptr: *const u8, info: &mut IommuInfo) {
-    // SAFETY: table_ptr points to a valid ACPI table (firmware-provided).
-    let header = unsafe { core::slice::from_raw_parts(table_ptr, 48) };
-
-    let table_length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-    if table_length < 48 {
+    // Read the minimal ACPI SDT prefix (the Length field lives at offset 4)
+    // BEFORE mapping the full 48-byte header, so a table shorter than 48 bytes
+    // (or sitting at a page boundary) is not over-read.
+    // SAFETY: table_ptr points to a valid ACPI table (firmware-provided); the
+    // 8-byte prefix is the minimum any SDT carries.
+    let prefix = unsafe { core::slice::from_raw_parts(table_ptr, 8) };
+    let table_length = u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]) as usize;
+    if table_length < 48 || table_length > MAX_ACPI_TABLE_LEN {
         return;
     }
 
-    // SAFETY: Full table length from header.
+    // SAFETY: length validated >= 48 and bounded above by MAX_ACPI_TABLE_LEN.
     let table = unsafe { core::slice::from_raw_parts(table_ptr, table_length) };
 
     info.intel_vt_d = true;
@@ -390,14 +401,17 @@ fn parse_device_scopes(data: &[u8]) -> Vec<DeviceScope> {
 
 /// Parse AMD IVRS (I/O Virtualization Reporting Structure) table.
 fn parse_ivrs(table_ptr: *const u8, info: &mut IommuInfo) {
-    // SAFETY: table_ptr points to a valid ACPI table (firmware-provided).
-    let header = unsafe { core::slice::from_raw_parts(table_ptr, 48) };
-
-    let table_length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-    if table_length < 48 {
+    // Read the minimal SDT prefix for the Length field before mapping the full
+    // 48-byte header (see parse_dmar).
+    // SAFETY: table_ptr points to a valid ACPI table (firmware-provided); the
+    // 8-byte prefix is the minimum any SDT carries.
+    let prefix = unsafe { core::slice::from_raw_parts(table_ptr, 8) };
+    let table_length = u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]) as usize;
+    if table_length < 48 || table_length > MAX_ACPI_TABLE_LEN {
         return;
     }
 
+    // SAFETY: length validated >= 48 and bounded above by MAX_ACPI_TABLE_LEN.
     let table = unsafe { core::slice::from_raw_parts(table_ptr, table_length) };
 
     info.amd_vi = true;

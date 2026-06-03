@@ -2,7 +2,7 @@
 
 **Audience:** system operators installing LamBoot on systems that may have UEFI Secure Boot enabled.
 **Scope:** every trust path LamBoot supports, end-to-end, with recovery procedures.
-**Version:** 0.8.3
+**Version:** 0.12.0
 
 ---
 
@@ -154,7 +154,7 @@ This optimization composes with Config 3, doesn't replace it. Skipping MokManage
 
 **Trust path:** LamBoot's cert is enrolled directly into the firmware's `db`. Firmware validates LamBoot; shim **is still deployed in the chain** and remains in memory to provide the `ShimLock` protocol that LamBoot uses to verify MOK-signed Linux kernels.
 
-**Critical note (v0.8.3):** even in Config 2, do **not** pass `--no-shim` if your kernel is a stock distro kernel (Ubuntu, Debian, Fedora, …) — those are signed against MOK, not firmware DB. Without shim in the chain, LamBoot cannot verify them and the kernel will fail to boot.
+**Critical note:** even in Config 2, do **not** pass `--no-shim` if your kernel is a stock distro kernel (Ubuntu, Debian, Fedora, …) — those are signed against MOK, not firmware DB. Without shim in the chain, LamBoot cannot verify them and the kernel will fail to boot.
 
 `--no-shim` is appropriate **only** when the kernel you want to boot is signed by a cert that is itself in firmware DB — typically a self-signed UKI or a kernel from a custom build shop. If that's your scenario, pair `--no-shim` with `--kernel-firmware-db-signed` to acknowledge the constraint.
 
@@ -187,7 +187,7 @@ sudo efi-readvar -v db 2>&1 | grep -A5 'LamBoot'
 
 **Trust path:** the VM's OVMF firmware ships with LamBoot's cert pre-enrolled in `db`. Firmware validates LamBoot; shim is deployed in the chain by `lamboot-install`, and the guest's own MOK (populated when the distro was installed) provides the kernel trust chain. "Zero-touch" means **no MokManager interaction is required** — it does **not** mean "no shim in the chain."
 
-**Critical v0.8.3 clarification.** Earlier drafts of this section described Config 4 as "no shim, no MOK, no user interaction, Linux kernel just boots." That was wrong for stock Linux distro kernels and users who followed that path hit a hard kernel-load failure inside LamBoot. The corrected model:
+**Critical clarification.** Earlier drafts of this section described Config 4 as "no shim, no MOK, no user interaction, Linux kernel just boots." That was wrong for stock Linux distro kernels and users who followed that path hit a hard kernel-load failure inside LamBoot. The corrected model:
 
 - **`db` (firmware):** pre-enrolled with Lamco's LamBoot cert via the shipped `OVMF_VARS_lamboot.fd`. Lets firmware trust LamBoot without setup-mode enrollment.
 - **Shim:** deployed by `lamboot-install` into `\EFI\LamBoot\shimx64.efi`, used as the boot entry target; shim chainloads LamBoot as `grubx64.efi`. Shim's presence in the running process is what provides the `ShimLock` protocol LamBoot needs to validate the distro kernel.
@@ -338,7 +338,7 @@ Procedure for generating production keys is in `docs/KEY-GENERATION.md` (TBD). U
 
 ## 9. Testing matrix (per release)
 
-Before v0.8.3 ships, each row must pass end-to-end on a fresh VM:
+Each row must pass end-to-end on a fresh VM:
 
 | VM | Config | Signed? | What it proves |
 |---|---|---|---|

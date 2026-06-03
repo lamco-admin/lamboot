@@ -1,67 +1,22 @@
+//! Layer: 7 — Orchestration.
+
 use alloc::{
     format,
     string::{String, ToString},
     vec::Vec,
 };
+use core::cmp::Ordering;
 
 use crate::{
     bls,
     bls_parse::BlsEntry,
+    boot_types::{BootEntry, EntryKind, Icon},
     fs::Volume,
-    fs_types::{BackendTag, FileKind},
+    fs_types::FileKind,
     policy::Policy,
     trust_log::{TrustEvent, TrustLog},
     uki,
 };
-
-#[derive(Debug, Clone)]
-pub(crate) struct BootEntry {
-    pub id: String,
-    pub name: String,
-    pub kind: EntryKind,
-    pub icon: Icon,
-    /// BLS source info for boot counting (None for non-BLS entries)
-    pub bls_filename: Option<String>,
-    /// Preflight validation results (None if not yet run)
-    pub preflight: Option<crate::preflight::PreflightResult>,
-    /// SDS-5: back-reference into the `volumes` slice passed to
-    /// `discover_all_entries`. Consumed by the boot layer (SDS-3+) to
-    /// pick the correct `Volume` as byte source for the kernel read.
-    /// For pre-SDS-3 boot paths that still read from ESP, a non-zero
-    /// value surfaces as a "kernel not on ESP" preflight warning.
-    pub source_volume_index: usize,
-    /// SDS-5: backend identifier of the volume this entry came from,
-    /// used for trust-log annotation + menu UI grouping.
-    pub source_backend_tag: BackendTag,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum EntryKind {
-    Chainload {
-        path: String,
-    },
-    Uki {
-        path: String,
-        options: String,
-    },
-    LinuxLegacy {
-        kernel_path: String,
-        initrd_paths: Vec<String>,
-        options: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Icon {
-    Windows,
-    Linux,
-    Efi,
-    #[expect(dead_code, reason = "used when recovery partition discovery is added")]
-    Recovery,
-    #[expect(dead_code, reason = "used when network boot support is added")]
-    Network,
-    Tools,
-}
 
 /// Discover all bootable entries across all mounted volumes.
 ///
@@ -80,12 +35,25 @@ pub(crate) enum Icon {
 /// (`\EFI\fedora\vmlinuz*` and friends) — superseded by proper BLS
 /// discovery on every volume. Tightens trust story (fewer ambiguous
 /// paths) per spec §8.1.
+/// Composite return from `discover_all_entries`. `entries` is the
+/// scanned + ranked boot-entry vec (the original return value, kept
+/// in a named field so callers don't have to update destructuring
+/// patterns); `cohort_split` is `Some` when the v0.10 Bug 22
+/// cohort-split heuristic fires during the discovery pass and is
+/// `None` otherwise. The GUI / console menu render code reads
+/// `cohort_split.notice` to surface a footer line; the trust log
+/// also records the event, so headless fleet monitoring can see it.
+pub(crate) struct DiscoveryResult {
+    pub entries: Vec<BootEntry>,
+    pub cohort_split: Option<CohortSplit>,
+}
+
 pub(crate) fn discover_all_entries(
     volumes: &mut [Volume],
     policy: &Policy,
     trust_log: &mut TrustLog,
     self_image_sha256: Option<[u8; 32]>,
-) -> Vec<BootEntry> {
+) -> DiscoveryResult {
     let mut entries = Vec::new();
 
     // Phase 1: scan every volume for BLS entries at /loader/entries/.
@@ -114,6 +82,26 @@ pub(crate) fn discover_all_entries(
     let bls_count = all_bls.len();
     if bls_count > 0 {
         log::info!("Found {bls_count} BLS entries across all volumes");
+    }
+
+    // v0.10 Bug 22 / Option I: cohort-split detection. Catches the
+    // VM 100-class failure where a distro's kernel-install plugin
+    // flipped sort-key emission mid-fleet (e.g. Debian forky/sid
+    // ~1000-package upgrade leaves cohort A with sort-key debian +
+    // /boot/-prefixed paths alongside cohort B without sort-key +
+    // unprefixed paths). Emit a trust-log event so headless fleet
+    // monitoring sees the anomaly; the menu render code reads
+    // `DiscoveryResult.cohort_split` and surfaces a footer notice
+    // with the policy.toml escape hatch hint.
+    let cohort_split = detect_cohort_split(&all_bls);
+    if let Some(ref split) = cohort_split {
+        trust_log.record(TrustEvent::new("cohort_split_detected").with_note(&format!(
+            "with_sort_key={} without_sort_key={} highest_in_without={}",
+            split.with_sort_key,
+            split.without_sort_key,
+            split.highest_version_without.as_deref().unwrap_or("?"),
+        )));
+        log::info!("BLS cohort split detected — {}", split.notice);
     }
     for bls_entry in all_bls {
         entries.push(bls_entry.to_boot_entry());
@@ -144,7 +132,10 @@ pub(crate) fn discover_all_entries(
     // §5 (amendment: parsed-entry equality, not SHA-256 content).
     dedup_entries(&mut entries);
 
-    entries
+    DiscoveryResult {
+        entries,
+        cohort_split,
+    }
 }
 
 /// SDS-5 §5 dedup for BLS entries before they become `BootEntry`s.
@@ -223,6 +214,106 @@ fn dedup_entries(entries: &mut Vec<BootEntry>) {
 
 fn extract_filename_lower(path: &str) -> String {
     path.rsplit('\\').next().unwrap_or(path).to_lowercase()
+}
+
+/// v0.10 — Bug 22 Option I: detect the BLS sort-key cohort split
+/// failure mode. Returns `Some(notice)` if entries sharing a
+/// `machine-id` mix sort-key presence (i.e., the user has a Cohort A
+/// with sort-key alongside a Cohort B without, both from the same OS
+/// install). Returns `None` otherwise.
+///
+/// The returned notice is a single human-readable line, ready to render
+/// in the menu footer or write to the trust log. Callers can also
+/// inspect the returned cohort counts to surface more detail if
+/// desired (current callers just emit the one-liner).
+///
+/// Walks the parsed BLS entries from the discovery pass; pulls
+/// `machine_id`, `sort_key.is_some()`, and `version` directly off the
+/// `BlsEntry` source (via `bls_filename` lookup is too expensive at
+/// menu-render time, so callers pass the pre-parsed `BlsEntry` slice).
+pub(crate) fn detect_cohort_split(bls_entries: &[BlsEntry]) -> Option<CohortSplit> {
+    // Group by machine-id. Within each group, count sort-key-having
+    // vs sort-key-less entries and find the highest version in each.
+    // If any group has BOTH sort-key-having AND sort-key-less entries,
+    // surface that as a cohort split.
+    let mut groups: alloc::collections::BTreeMap<&str, CohortGroup<'_>> =
+        alloc::collections::BTreeMap::new();
+
+    for entry in bls_entries {
+        let mid = entry.machine_id.as_deref().unwrap_or("");
+        if mid.is_empty() {
+            continue;
+        }
+        let g = groups.entry(mid).or_insert(CohortGroup {
+            with_sort_key: 0,
+            without_sort_key: 0,
+            highest_version_in_without: None,
+            highest_version_in_with: None,
+        });
+        if entry.sort_key.is_some() {
+            g.with_sort_key += 1;
+            if let Some(v) = entry.version.as_deref() {
+                let take = match g.highest_version_in_with {
+                    None => true,
+                    Some(cur) => crate::bls::version_compare(v, cur) == Ordering::Greater,
+                };
+                if take {
+                    g.highest_version_in_with = Some(v);
+                }
+            }
+        } else {
+            g.without_sort_key += 1;
+            if let Some(v) = entry.version.as_deref() {
+                let take = match g.highest_version_in_without {
+                    None => true,
+                    Some(cur) => crate::bls::version_compare(v, cur) == Ordering::Greater,
+                };
+                if take {
+                    g.highest_version_in_without = Some(v);
+                }
+            }
+        }
+    }
+
+    for g in groups.values() {
+        if g.with_sort_key > 0 && g.without_sort_key > 0 {
+            let highest_in_without = g.highest_version_in_without.unwrap_or("?");
+            let notice = alloc::format!(
+                "cohort split: {} entries with sort-key, {} without; newest in sort-key-less is {} \
+                 — set bls_ignore_sort_key=true or default_pattern in policy.toml to override",
+                g.with_sort_key,
+                g.without_sort_key,
+                highest_in_without,
+            );
+            return Some(CohortSplit {
+                notice,
+                with_sort_key: g.with_sort_key,
+                without_sort_key: g.without_sort_key,
+                highest_version_without: g
+                    .highest_version_in_without
+                    .map(alloc::string::ToString::to_string),
+            });
+        }
+    }
+
+    None
+}
+
+/// Result of `detect_cohort_split`. The `notice` is a single human-
+/// readable line suitable for the menu footer; the rest carries
+/// structured data for trust-log emission or future heuristics.
+pub(crate) struct CohortSplit {
+    pub notice: String,
+    pub with_sort_key: usize,
+    pub without_sort_key: usize,
+    pub highest_version_without: Option<String>,
+}
+
+struct CohortGroup<'a> {
+    with_sort_key: usize,
+    without_sort_key: usize,
+    highest_version_in_without: Option<&'a str>,
+    highest_version_in_with: Option<&'a str>,
 }
 
 /// Discover Windows Boot Manager
@@ -431,7 +522,14 @@ fn discover_systemd_boot_dir_style(esp: &mut Volume, policy: &Policy) -> Vec<Boo
     };
 
     for entry in dirs {
-        if entry.kind != FileKind::Directory {
+        // A directory whose per-entry metadata read failed is reported as
+        // FileKind::Other (read_dir's metadata fetch is advisory/non-fatal since
+        // the FS-backend hardening). Dropping every non-Directory here would
+        // then silently skip a real distro boot directory and lose its entries.
+        // Skip only KNOWN non-directories; for Other ("unknown"), proceed and
+        // let the name check + sibling-file probes below reject it if it isn't
+        // actually a directory.
+        if matches!(entry.kind, FileKind::Regular | FileKind::Symlink) {
             continue;
         }
         if !crate::discovery_pure::looks_like_distro_uuid_dir(&entry.name) {
@@ -472,6 +570,23 @@ fn discover_systemd_boot_dir_style(esp: &mut Volume, policy: &Policy) -> Vec<Boo
         } else {
             Vec::new()
         };
+
+        // Bug 24 — skip directories that have vmlinuz.efi but neither a
+        // cmdline file nor an initrd.img sibling. The canonical case is
+        // Pop!_OS recovery (`/EFI/Recovery-<short>/`) which ships only
+        // vmlinuz.efi + initrd.gz; emitting an entry for it produces a
+        // boot with empty cmdline (no `root=`) which panics on
+        // `unable to mount root fs on unknown-block(0,0)`. A genuine
+        // discoverable-EFI install (Pop!_OS regular kernel, Garuda, etc.)
+        // always carries at least one of these two sibling files.
+        // See docs/lamboot-install/TROUBLESHOOTING.md §1.5 (Bug 24).
+        if cmdline.is_empty() && initrd_paths.is_empty() {
+            log::info!(
+                "Skipping incomplete dir-style entry: {kernel_efi} \
+                 (no cmdline + no initrd.img siblings)"
+            );
+            continue;
+        }
 
         let display_name = crate::discovery_pure::pretty_name_from_distro_uuid_dir(&entry.name);
         let id = format!("sdboot-{}", entry.name);
@@ -517,6 +632,16 @@ fn discover_systemd_boot_dir_style(esp: &mut Volume, policy: &Policy) -> Vec<Boo
             });
         }
     }
+
+    // Bug 25 — sort discovered dir-style entries by id so menu order is
+    // deterministic regardless of FAT directory-traversal order (which
+    // returns entries in on-disk creation order). Without this, a
+    // freshly-created Recovery- dir can appear before a Pop_OS- dir
+    // simply because it was created first. Sorting by id also keeps the
+    // current/previous pair adjacent (the `-previous` suffix sorts
+    // immediately after the parent id).
+    // See docs/lamboot-install/TROUBLESHOOTING.md §1.6 (Bug 25).
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
 
     entries
 }

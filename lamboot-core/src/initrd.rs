@@ -1,3 +1,5 @@
+//! Layer: 2 — Storage & Filesystems.
+//!
 //! Linux initrd loading via EFI LoadFile2 protocol.
 //!
 //! Implements the LINUX_EFI_INITRD_MEDIA_GUID mechanism used by the Linux
@@ -70,14 +72,29 @@ impl InitrdHandle {
     ///
     /// The initrd data must remain valid until this handle is dropped.
     /// Uses Box::leak() internally to ensure stable memory addresses.
-    pub(crate) fn register(initrd_data: Vec<u8>) -> Result<Self> {
-        // Leak the data so it stays at a stable address
+    pub(crate) fn register(
+        initrd_data: Vec<u8>,
+        diag_esp: Option<&mut crate::fs::Volume>,
+    ) -> Result<Self> {
+        // v0.11.0: pve2 diagnostic — bracket each step. esp is optional
+        // so existing call sites in tests don't need to pass it.
+        let mut diag = diag_esp;
+        macro_rules! diag {
+            ($msg:expr) => {
+                if let Some(ref mut e) = diag {
+                    crate::diag::append(e, $msg);
+                }
+            };
+        }
+        diag!("IR1 enter_register\n");
+
         let data_boxed: Box<[u8]> = initrd_data.into_boxed_slice();
         let data_len = data_boxed.len();
+        diag!("IR2 after_into_boxed_slice\n");
         let data_ptr = Box::into_raw(data_boxed);
+        diag!("IR3 after_box_into_raw\n");
         let data_slice_ptr = unsafe { (*data_ptr).as_ptr() };
 
-        // Build the device path
         let guid_bytes = LINUX_INITRD_MEDIA_GUID.to_bytes();
         let devpath = Box::new(InitrdDevicePath {
             media_type: 0x04,
@@ -89,8 +106,8 @@ impl InitrdHandle {
             end_length: 4u16.to_le_bytes(),
         });
         let devpath_ptr = Box::into_raw(devpath);
+        diag!("IR4 after_devpath_alloc\n");
 
-        // Build the protocol provider
         let provider = Box::new(InitrdProvider {
             proto: LoadFile2Proto {
                 load_file: initrd_load_file_callback,
@@ -99,8 +116,9 @@ impl InitrdHandle {
             data_len,
         });
         let provider_ptr = Box::into_raw(provider);
+        diag!("IR5 after_provider_alloc\n");
 
-        // Install DevicePathProtocol on a new handle
+        diag!("IR6 before_install_devpath_protocol\n");
         let uefi_handle = unsafe {
             uefi::boot::install_protocol_interface(
                 None,
@@ -108,8 +126,9 @@ impl InitrdHandle {
                 devpath_ptr as *const c_void,
             )?
         };
+        diag!("IR7 after_install_devpath_protocol\n");
 
-        // Install LoadFile2Protocol on the same handle
+        diag!("IR8 before_install_loadfile2_protocol\n");
         unsafe {
             uefi::boot::install_protocol_interface(
                 Some(uefi_handle),
@@ -117,8 +136,7 @@ impl InitrdHandle {
                 provider_ptr as *const c_void,
             )?;
         }
-
-        log::info!("Registered initrd LoadFile2 provider ({data_len} bytes)");
+        diag!("IR9 after_install_loadfile2_protocol\n");
 
         Ok(Self {
             uefi_handle,
@@ -149,7 +167,6 @@ impl Drop for InitrdHandle {
             drop(Box::from_raw(self.devpath_ptr));
             drop(Box::from_raw(self.data_ptr));
         }
-        log::info!("Unregistered initrd LoadFile2 provider");
     }
 }
 

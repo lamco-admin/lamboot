@@ -1,3 +1,5 @@
+//! Layer: 7 — Orchestration.
+
 use alloc::{boxed::Box, string::String, vec::Vec};
 
 use uefi::{
@@ -5,7 +7,7 @@ use uefi::{
 };
 
 use crate::{
-    discovery::{BootEntry, EntryKind},
+    boot_types::{BootEntry, EntryKind},
     fs::Volume,
     initrd::InitrdHandle,
     pe_loader, pe_loader_pure,
@@ -31,11 +33,59 @@ struct VerifiedBytes<'b> {
     bytes: &'b [u8],
     sha256: [u8; 32],
     verified_via: &'static str,
+    /// Secure Boot posture observed at verify time. Carried (rather than
+    /// re-detected) so `choose_load_path` can route on the same reading
+    /// `verify_kernel_bytes` made — under `ActiveDirect` the native loader
+    /// performs no cryptographic check, so those bytes must take the
+    /// firmware path where the `db` signature is actually verified.
+    sb_state: SecureBootState,
+}
+
+/// Measure the kernel into PCR 4 and record an HONEST trust event: only emit
+/// `kernel_measured` when the PCR was actually extended; otherwise emit
+/// `kernel_measurement_skipped` so the trust log never claims a measurement
+/// that did not happen (TPM absent / TCG2 error). Keeps measured-boot evidence
+/// truthful in the no-TPM case.
+fn measure_kernel_logged(tpm: &TpmContext, trust_log: &mut TrustLog, data: &[u8], path: &str) {
+    if tpm.measure_kernel(data) {
+        trust_log.record(
+            TrustEvent::new("kernel_measured")
+                .with_path(path)
+                .with_note("pcr=4"),
+        );
+    } else {
+        trust_log.record(
+            TrustEvent::new("kernel_measurement_skipped")
+                .with_path(path)
+                .with_note("pcr=4 reason=no_tpm_or_tcg2_error"),
+        );
+    }
+}
+
+/// Measure the cmdline into PCR 12 and record the matching honest event.
+fn measure_cmdline_logged(tpm: &TpmContext, trust_log: &mut TrustLog, options: &str, path: &str) {
+    if tpm.measure_cmdline(options) {
+        trust_log.record(
+            TrustEvent::new("cmdline_measured")
+                .with_path(path)
+                .with_note("pcr=12"),
+        );
+    } else {
+        trust_log.record(
+            TrustEvent::new("cmdline_measurement_skipped")
+                .with_path(path)
+                .with_note("pcr=12 reason=no_tpm_or_tcg2_error"),
+        );
+    }
 }
 
 /// Boot the selected entry.
 /// `volumes` includes the ESP as the first element, followed by any extra volumes
 /// exposed by filesystem drivers (ext4, btrfs, etc.).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "boot dispatch; sb_state is threaded from run_bootloader so the verify path shares the one Secure Boot detection"
+)]
 pub(crate) fn boot_entry(
     current_image: Handle,
     volumes: &mut [Volume],
@@ -43,18 +93,29 @@ pub(crate) fn boot_entry(
     tpm: &TpmContext,
     policy: &Policy,
     trust_log: &mut TrustLog,
+    quirks: crate::firmware_quirks::FirmwareQuirks,
+    sb_state: SecureBootState,
 ) -> Result<Status> {
-    log::info!("Booting entry: {} ({})", entry.name, entry.id);
+    // v0.11.0 diagnostics: trail audit.log breadcrumbs through boot_entry
+    // so a freeze inside can be located by reading audit.log post-mortem.
+    // v0.11.0: log::info! at post-selection depth kills next FAT op
+    // on ASUS G10AJ. Replaced with audit-log emission, which is
+    // unbounded in this depth band. log::info! re-enabled would
+    // freeze the boot before reaching kernel handoff.
+    if let Some(esp) = volumes.first_mut() {
+        crate::diag::append_fmt(
+            esp,
+            format_args!("boot_entry: name={} id={}\n", entry.name, entry.id),
+        );
+    }
 
-    // Split the ESP off the front so the UKI/Linux paths can flush
-    // trust-log events (image_verified, image_loaded_native) to it
-    // AFTER they're recorded but BEFORE start_image transfers
-    // control. Without this second flush, SDS-4 §6.4's load-bearing
-    // image_verified event never makes it to \loader\boot-trust.log.
     let (esp_slot, rest) = volumes.split_first_mut().ok_or(Status::ABORTED)?;
+    crate::diag::append(esp_slot, "BOOTENTRY3 after_split\n");
 
     match entry.kind {
-        EntryKind::Chainload { path } => chainload_efi(current_image, esp_slot, &path),
+        EntryKind::Chainload { path } => {
+            chainload_efi(current_image, esp_slot, &path, tpm, trust_log, quirks)
+        }
         EntryKind::Uki { path, options } => boot_uki(
             current_image,
             esp_slot,
@@ -63,6 +124,8 @@ pub(crate) fn boot_entry(
             tpm,
             policy,
             trust_log,
+            quirks,
+            sb_state,
         ),
         EntryKind::LinuxLegacy {
             kernel_path,
@@ -78,19 +141,76 @@ pub(crate) fn boot_entry(
             tpm,
             policy,
             trust_log,
+            quirks,
+            sb_state,
         ),
     }
 }
 
-/// Chainload another EFI application
-fn chainload_efi(current_image: Handle, esp: &mut Volume, path: &str) -> Result<Status> {
+/// Chainload another EFI application (Windows Boot Manager, GRUB, EFI fallback,
+/// a diagnostic module, …).
+///
+/// The image is measured into PCR 4 and a trust event is recorded before
+/// `start_image`, so a chainloaded binary does not silently break the
+/// measured-boot chain or leave a hole in the audit log. Authenticity is still
+/// enforced by `BS->LoadImage` (firmware `db`/Security2, plus ShimLock via the
+/// SecurityOverride when shim is present) inside `load_efi_image_from_buffer`;
+/// this adds the missing measurement + audit record that the kernel/UKI paths
+/// already emit.
+fn chainload_efi(
+    current_image: Handle,
+    esp: &mut Volume,
+    path: &str,
+    tpm: &TpmContext,
+    trust_log: &mut TrustLog,
+    quirks: crate::firmware_quirks::FirmwareQuirks,
+) -> Result<Status> {
     log::info!("Chainloading: {path}");
     let image_data = esp.read_str(path)?;
     log::info!("Read {} bytes", image_data.len());
+
+    // Measure into PCR 4 (boot-code) before load, mirroring the kernel path so
+    // the measured-boot chain stays unbroken across a chainload. Record the
+    // event honestly: only claim a measurement if the PCR was actually
+    // extended.
+    let sha256 = pe_loader_pure::sha256_of(&image_data);
+    if tpm.measure_kernel(&image_data) {
+        trust_log.record(
+            TrustEvent::new("chainload_measured")
+                .with_path(path)
+                .with_note("pcr=4"),
+        );
+    } else {
+        trust_log.record(
+            TrustEvent::new("chainload_measurement_skipped")
+                .with_path(path)
+                .with_note("pcr=4 reason=no_tpm_or_tcg2_error"),
+        );
+    }
+
     let image_handle = load_efi_image_from_buffer(current_image, &image_data, None)?;
+
+    // The binary passed firmware authentication (LoadImage above would have
+    // failed otherwise). Record it for audit before handing off control.
+    trust_log.record(
+        TrustEvent::new("image_chainloaded")
+            .with_path(path)
+            .with_sha256(&pe_loader_pure::hex_encode_32(&sha256))
+            .with_verified_via(V_FIRMWARE_LOADIMAGE)
+            .with_status(Status::SUCCESS),
+    );
+    // Gate the FAT flush on the conout_fat_coupling quirk like every other
+    // pre-handoff flush: on ASUS G10AJ-class firmware an ungated write here can
+    // hang the FAT driver during a chainload (a recovery/diagnostic path). The
+    // event is still recorded in-memory; it flushes on the next gated boundary
+    // or, for a chainloaded tool that returns, when the menu loop flushes.
+    if !quirks.conout_fat_coupling {
+        trust_log.flush(esp);
+    }
 
     reconnect_console_drivers();
     log::info!("Starting chainloaded image...");
+    crate::diag::flush(esp);
     uefi::boot::start_image(image_handle)?;
 
     // Child image returned — caller should re-enter the menu
@@ -99,6 +219,10 @@ fn chainload_efi(current_image: Handle, esp: &mut Volume, path: &str) -> Result<
 }
 
 /// Boot a Unified Kernel Image (UKI)
+#[expect(
+    clippy::too_many_arguments,
+    reason = "orchestration; passing FirmwareQuirks alongside policy is intentional"
+)]
 fn boot_uki(
     current_image: Handle,
     esp: &mut Volume,
@@ -107,39 +231,32 @@ fn boot_uki(
     tpm: &TpmContext,
     policy: &Policy,
     trust_log: &mut TrustLog,
+    quirks: crate::firmware_quirks::FirmwareQuirks,
+    sb_state: SecureBootState,
 ) -> Result<Status> {
     log::info!("Booting UKI: {path} with options: {options}");
     let backend_tag = esp.backend_tag();
     let image_data = esp.read_str(path)?;
 
     // Measure into TPM before any load decision — same PCR/semantics
-    // whether we take the native or firmware path.
-    tpm.measure_kernel(&image_data);
-    // SDS-4 §6.1 Step 11: kernel_measured event records the PCR 4 extend.
-    trust_log.record(
-        TrustEvent::new("kernel_measured")
-            .with_path(path)
-            .with_note("pcr=4"),
-    );
+    // whether we take the native or firmware path. SDS-4 §6.1 Step 11:
+    // kernel_measured records the PCR 4 extend (or measurement_skipped if
+    // no TPM, so the log stays honest).
+    measure_kernel_logged(tpm, trust_log, &image_data, path);
     // Step 12: measure cmdline (UKI cmdline comes from the binary's
     // .cmdline section; we still measure it since it's what the
     // kernel will see).
     if !options.is_empty() {
-        tpm.measure_cmdline(options);
-        trust_log.record(
-            TrustEvent::new("cmdline_measured")
-                .with_path(path)
-                .with_note("pcr=12"),
-        );
+        measure_cmdline_logged(tpm, trust_log, options, path);
     }
 
     // SDS-4 Step 10: verify + capture SHA-256 + verified_via.
-    let Ok(verified) = verify_kernel_bytes(&image_data, path, trust_log) else {
+    let Ok(verified) = verify_kernel_bytes(&image_data, path, trust_log, esp, sb_state) else {
         log::error!("UKI verification failed, returning to menu: {path}");
         return Err(Status::SECURITY_VIOLATION.into());
     };
 
-    match choose_load_path(policy.loader_native_pe, /*verify_ok=*/ true) {
+    match choose_load_path(policy.loader_native_pe, verified.sb_state) {
         LoadPath::Native => native_load_and_start(
             &verified,
             options,
@@ -148,6 +265,7 @@ fn boot_uki(
             current_image,
             trust_log,
             esp,
+            quirks,
         ),
         LoadPath::Firmware => firmware_load_and_start(
             current_image,
@@ -186,13 +304,29 @@ fn boot_linux(
     tpm: &TpmContext,
     policy: &Policy,
     trust_log: &mut TrustLog,
+    quirks: crate::firmware_quirks::FirmwareQuirks,
+    sb_state: SecureBootState,
 ) -> Result<Status> {
-    log::info!(
-        "Booting Linux: kernel={}, initrds={}, options={}",
-        kernel_path,
-        initrd_paths.len(),
-        options
+    crate::diag::append_fmt(
+        esp,
+        format_args!(
+            "boot_linux: kernel={} initrds={} options={}\n",
+            kernel_path,
+            initrd_paths.len(),
+            options
+        ),
     );
+
+    trust_log.record(
+        TrustEvent::new("kernel_load_phase")
+            .with_path(kernel_path)
+            .with_note("phase=resolve_volume"),
+    );
+    crate::diag::append(esp, "BOOTLINUX3 after_first_record\n");
+    if !quirks.conout_fat_coupling {
+        trust_log.flush(esp);
+    }
+    crate::diag::append(esp, "BOOTLINUX4 after_first_flush\n");
 
     // Find which volume has the kernel — check ESP first, then extras.
     // BLS entries on the ESP may reference paths on ext4 partitions
@@ -205,13 +339,39 @@ fn boot_linux(
     // VM 100 for the 6.19.11+deb14 entry). Trying as-written first
     // covers the XBOOTLDR separate-/boot layout; the `\boot\` fallback
     // covers the single-root mis-prefixed case.
+    crate::diag::append(esp, "BL5 check_esp_for_kernel\n");
     let (kernel_bytes, backend_tag) = if let Some(resolved) =
         crate::preflight::exists_with_boot_fallback(esp, kernel_path)
     {
-        log::info!("Kernel found on ESP (volume 0) at {resolved}");
+        crate::diag::append_fmt(
+            esp,
+            format_args!("BL5_esp kernel_found_on_esp: {resolved}\n"),
+        );
         let tag = esp.backend_tag();
-        (esp.read_str(&resolved)?, tag)
+        trust_log.record(
+            TrustEvent::new("kernel_load_phase")
+                .with_path(&resolved)
+                .with_note(&alloc::format!(
+                    "phase=read_bytes_start volume_index=0 backend={tag}"
+                )),
+        );
+        crate::diag::append(esp, "BL6_esp before_esp_read\n");
+        let bytes = esp.read_str(&resolved)?;
+        crate::diag::append_fmt(
+            esp,
+            format_args!("BL7_esp after_esp_read size={}\n", bytes.len()),
+        );
+        trust_log.record(
+            TrustEvent::new("kernel_load_phase")
+                .with_path(&resolved)
+                .with_note(&alloc::format!(
+                    "phase=read_bytes_done size={}",
+                    bytes.len()
+                )),
+        );
+        (bytes, tag)
     } else {
+        crate::diag::append(esp, "BL5_extras not_on_esp_scanning_extras\n");
         let mut found: Option<(usize, String)> = None;
         for (i, v) in extras.iter_mut().enumerate() {
             if let Some(resolved) = crate::preflight::exists_with_boot_fallback(v, kernel_path) {
@@ -219,70 +379,98 @@ fn boot_linux(
                 break;
             }
         }
+        crate::diag::append(esp, "BL5b after_extras_scan\n");
         let Some((extra_idx, resolved)) = found else {
-            log::error!(
-                "Kernel not found on any mounted volume: {kernel_path}. \
-                 This usually means the filesystem driver for the kernel's \
-                 partition failed to load, or the kernel path is wrong for \
-                 this BLS entry."
+            crate::diag::append(esp, "BL5_err kernel_not_found\n");
+            trust_log.record(
+                TrustEvent::new("kernel_load_phase")
+                    .with_path(kernel_path)
+                    .with_note("phase=resolve_failed"),
             );
+            if !quirks.conout_fat_coupling {
+                trust_log.flush(esp);
+            }
             return Err(Status::NOT_FOUND.into());
         };
-        log::info!(
-            "Kernel found on extras[{extra_idx}] (volume {}) at {resolved}",
-            extra_idx + 1
+        crate::diag::append_fmt(
+            esp,
+            format_args!("BL5c resolved extras[{extra_idx}]: {resolved}\n"),
         );
         let vol = &mut extras[extra_idx];
         let tag = vol.backend_tag();
-        (vol.read_str(&resolved)?, tag)
+        let volume_index = extra_idx + 1;
+        trust_log.record(
+            TrustEvent::new("kernel_load_phase")
+                .with_path(&resolved)
+                .with_note(&alloc::format!(
+                    "phase=read_bytes_start volume_index={volume_index} backend={tag}"
+                )),
+        );
+        crate::diag::append(esp, "BL6 before_extras_read\n");
+        let bytes = vol.read_str(&resolved)?;
+        crate::diag::append_fmt(
+            esp,
+            format_args!("BL7 after_extras_read size={}\n", bytes.len()),
+        );
+        trust_log.record(
+            TrustEvent::new("kernel_load_phase")
+                .with_path(&resolved)
+                .with_note(&alloc::format!(
+                    "phase=read_bytes_done size={}",
+                    bytes.len()
+                )),
+        );
+        (bytes, tag)
     };
 
-    // Measure into TPM unconditionally — same PCR semantics on both
-    // native and firmware paths.
-    tpm.measure_kernel(&kernel_bytes);
-    // SDS-4 §6.1 Step 11: kernel_measured records the PCR 4 extend.
+    crate::diag::append(esp, "BL8 bytes_acquired\n");
     trust_log.record(
-        TrustEvent::new("kernel_measured")
+        TrustEvent::new("kernel_load_phase")
             .with_path(kernel_path)
-            .with_note("pcr=4"),
+            .with_note(&alloc::format!(
+                "phase=bytes_acquired total_size={} backend={backend_tag}",
+                kernel_bytes.len()
+            )),
     );
-    // Step 12: cmdline measurement (PCR 12).
-    if !options.is_empty() {
-        tpm.measure_cmdline(options);
-        trust_log.record(
-            TrustEvent::new("cmdline_measured")
-                .with_path(kernel_path)
-                .with_note("pcr=12"),
-        );
+    if !quirks.conout_fat_coupling {
+        trust_log.flush(esp);
     }
+    crate::diag::append(esp, "BL9 before_tpm_measure_kernel\n");
 
-    // SDS-4 Step 10: verify + capture SHA-256 + verified_via.
-    // The native loader does NOT verify bytes itself; this is THE
-    // verification point per §3.1 of SPEC-NATIVE-TRUST-CHAIN.md.
-    let Ok(verified) = verify_kernel_bytes(&kernel_bytes, kernel_path, trust_log) else {
-        log::error!("Kernel verification failed, returning to menu: {kernel_path}");
+    measure_kernel_logged(tpm, trust_log, &kernel_bytes, kernel_path);
+    crate::diag::append(esp, "BL10 after_tpm_measure_kernel\n");
+
+    if !options.is_empty() {
+        measure_cmdline_logged(tpm, trust_log, options, kernel_path);
+        crate::diag::append(esp, "BL11 after_tpm_measure_cmdline\n");
+    }
+    crate::diag::append(esp, "BL12 before_verify_kernel_bytes\n");
+
+    let Ok(verified) = verify_kernel_bytes(&kernel_bytes, kernel_path, trust_log, esp, sb_state)
+    else {
+        crate::diag::append(esp, "BL13_err verify_failed\n");
         return Err(Status::SECURITY_VIOLATION.into());
     };
+    crate::diag::append(esp, "BL13 after_verify_kernel_bytes\n");
 
-    // Load and concatenate all initrd files, register via LoadFile2.
-    // Happens before load_pe so the LoadFile2 protocol is installed
-    // by the time the kernel's EFI stub queries it. Initrds live on
-    // the SAME volume as the kernel — check ESP first, then extras.
     let _initrd_handle = if initrd_paths.is_empty() {
+        crate::diag::append(esp, "BL14 no_initrds\n");
         None
     } else {
+        crate::diag::append_fmt(
+            esp,
+            format_args!("BL14 initrds_count={}\n", initrd_paths.len()),
+        );
         let mut combined = Vec::new();
-        for path in initrd_paths {
-            log::info!("Loading initrd: {path}");
-            // Same `\boot\`-fallback dance as the kernel lookup above;
-            // Debian's 6.19.11+deb14 entry had both linux and initrd
-            // mis-prefixed (linux /vmlinuz-X + initrd /initrd.img-X
-            // instead of /boot/vmlinuz-X + /boot/initrd.img-X).
+        for (idx, path) in initrd_paths.iter().enumerate() {
+            crate::diag::append_fmt(esp, format_args!("BL14_initrd[{idx}] start: {path}\n"));
             let data = if let Some(resolved) =
                 crate::preflight::exists_with_boot_fallback(esp, path)
             {
+                crate::diag::append(esp, "BL14_initrd_on_esp\n");
                 esp.read_str(&resolved)?
             } else {
+                crate::diag::append(esp, "BL14_initrd_scan_extras\n");
                 let mut found_idx: Option<(usize, String)> = None;
                 for (i, v) in extras.iter_mut().enumerate() {
                     if let Some(resolved) = crate::preflight::exists_with_boot_fallback(v, path) {
@@ -290,48 +478,73 @@ fn boot_linux(
                         break;
                     }
                 }
-                if let Some((idx, resolved)) = found_idx {
-                    extras[idx].read_str(&resolved)?
+                if let Some((i, resolved)) = found_idx {
+                    crate::diag::append_fmt(
+                        esp,
+                        format_args!("BL14_initrd_extras[{i}]: {resolved} before_read\n"),
+                    );
+                    let d = extras[i].read_str(&resolved)?;
+                    crate::diag::append_fmt(
+                        esp,
+                        format_args!("BL14_initrd_after_read size={}\n", d.len()),
+                    );
+                    d
                 } else {
-                    log::warn!("Initrd not found on any volume: {path} — skipping");
+                    crate::diag::append_fmt(esp, format_args!("BL14_initrd_NOT_FOUND: {path}\n"));
                     continue;
                 }
             };
-            log::info!("  {} bytes", data.len());
+            crate::diag::append_fmt(
+                esp,
+                format_args!("BL14_initrd[{idx}] {} bytes\n", data.len()),
+            );
             combined.extend_from_slice(&data);
         }
-        log::info!("Total initrd size: {} bytes", combined.len());
-        match InitrdHandle::register(combined) {
-            Ok(handle) => Some(handle),
-            Err(e) => {
-                log::warn!("Failed to register initrd via LoadFile2: {e:?}");
-                None
-            }
-        }
+        crate::diag::append_fmt(
+            esp,
+            format_args!(
+                "BL15 total_initrd={} bytes before_register\n",
+                combined.len()
+            ),
+        );
+        let r = InitrdHandle::register(combined, Some(esp));
+        crate::diag::append_fmt(
+            esp,
+            format_args!("BL16 after_initrd_register ok={}\n", r.is_ok()),
+        );
+        r.ok()
     };
 
-    match choose_load_path(policy.loader_native_pe, /*verify_ok=*/ true) {
-        LoadPath::Native => native_load_and_start(
-            &verified,
-            options,
-            backend_tag,
-            kernel_path,
-            current_image,
-            trust_log,
-            esp,
-        ),
-        LoadPath::Firmware => firmware_load_and_start(
-            current_image,
-            &kernel_bytes,
-            options,
-            policy.loader_native_pe,
-            trust_log,
-            kernel_path,
-            esp,
-        ),
+    crate::diag::append(esp, "BL17 before_choose_load_path\n");
+    let path = choose_load_path(policy.loader_native_pe, verified.sb_state);
+    crate::diag::append_fmt(esp, format_args!("BL18 load_path={path:?}\n"));
+    match path {
+        LoadPath::Native => {
+            crate::diag::append(esp, "BL19 calling_native_load_and_start\n");
+            native_load_and_start(
+                &verified,
+                options,
+                backend_tag,
+                kernel_path,
+                current_image,
+                trust_log,
+                esp,
+                quirks,
+            )
+        }
+        LoadPath::Firmware => {
+            crate::diag::append(esp, "BL19 calling_firmware_load_and_start\n");
+            firmware_load_and_start(
+                current_image,
+                &kernel_bytes,
+                options,
+                policy.loader_native_pe,
+                trust_log,
+                kernel_path,
+                esp,
+            )
+        }
     }
-    // _initrd_handle drops here if we got back (normally we don't —
-    // ExitBootServices makes return impossible).
 }
 
 /// Search all volumes for a file path. Returns the index of the volume
@@ -357,8 +570,9 @@ fn load_efi_image(
 ) -> Result<Handle> {
     let image_data = esp.read_str(path)?;
 
-    // Measure kernel image into TPM PCR 4
-    tpm.measure_kernel(&image_data);
+    // Measure kernel image into TPM PCR 4 (best-effort; this helper records no
+    // trust event of its own, so the measure outcome is intentionally ignored).
+    let _ = tpm.measure_kernel(&image_data);
 
     load_efi_image_from_buffer(parent_image, &image_data, Some(path))
 }
@@ -433,35 +647,41 @@ enum LoadPath {
     Firmware,
 }
 
-/// Decide the load path from policy + pre-load verify outcome.
-/// In Always mode we require verify_ok; if verification didn't
-/// happen we refuse to route to the native loader (because its
-/// trust contract is that the caller has already verified bytes).
-fn choose_load_path(mode: LoaderNativePeMode, verify_ok: bool) -> LoadPath {
-    match mode {
-        LoaderNativePeMode::Never => LoadPath::Firmware,
-        LoaderNativePeMode::Always => {
-            if verify_ok {
-                LoadPath::Native
-            } else {
-                // Operator explicitly asked for native but we couldn't
-                // verify. Still go native — the operator's assertion
-                // is "use my loader even if there's no shim to ask."
-                // Under SB-off this is fine; under SB-on + no shim the
-                // firmware load would have rejected us too.
-                LoadPath::Native
-            }
-        }
-        LoaderNativePeMode::Auto => {
-            if verify_ok {
-                LoadPath::Native
-            } else {
-                // SB-disabled or ShimLock unavailable. The firmware
-                // path is still safe (SB-off = no check, or firmware
-                // would reject via native SB anyway).
-                LoadPath::Firmware
-            }
-        }
+/// Decide the load path from policy + the Secure Boot posture the bytes
+/// were verified under.
+///
+/// The native loader performs no cryptographic check of its own — its trust
+/// contract is "the caller already verified these bytes." That contract holds
+/// only when verification actually happened:
+///   - `ActiveWithShim`: ShimLock::Verify ran and accepted (callers reach here
+///     only on the accepted branch), so native is safe.
+///   - `Disabled`: Secure Boot is off — there is nothing to verify and no
+///     security guarantee to uphold, so native is fine.
+///   - `ActiveDirect`: SB on, no shim. Nothing verified the kernel against
+///     firmware `db` yet. The native loader would execute it unauthenticated,
+///     so we MUST take the firmware path, where `BS->LoadImage` runs the real
+///     `db` check (the SecurityOverride hook delegates to firmware when no shim
+///     is present). `Always` cannot override this — there is no shim to ask and
+///     skipping `db` would be a silent Secure Boot bypass.
+fn choose_load_path(mode: LoaderNativePeMode, sb_state: SecureBootState) -> LoadPath {
+    use crate::boot_route_pure::{decide_load_route, LoadRoute, NativePeMode, SbPosture};
+
+    // Adapt the real enums into the pure mirror and delegate; the 9-row truth
+    // table (incl. the Auto+ActiveDirect C1 must-reject) lives in
+    // boot_route_pure and is host-tested there.
+    let mode = match mode {
+        LoaderNativePeMode::Auto => NativePeMode::Auto,
+        LoaderNativePeMode::Always => NativePeMode::Always,
+        LoaderNativePeMode::Never => NativePeMode::Never,
+    };
+    let posture = match sb_state {
+        SecureBootState::Disabled => SbPosture::Disabled,
+        SecureBootState::ActiveWithShim => SbPosture::ActiveWithShim,
+        SecureBootState::ActiveDirect => SbPosture::ActiveDirect,
+    };
+    match decide_load_route(mode, posture) {
+        LoadRoute::Native => LoadPath::Native,
+        LoadRoute::Firmware => LoadPath::Firmware,
     }
 }
 
@@ -480,32 +700,56 @@ fn verify_kernel_bytes<'b>(
     bytes: &'b [u8],
     path_for_log: &str,
     trust_log: &mut TrustLog,
+    esp_for_diag: &mut Volume,
+    sb_state: SecureBootState,
 ) -> core::result::Result<VerifiedBytes<'b>, ()> {
+    crate::diag::append(esp_for_diag, "VK1 enter\n");
     let sha256 = pe_loader_pure::sha256_of(bytes);
+    crate::diag::append(esp_for_diag, "VK2 after_sha256\n");
     let sha_hex = pe_loader_pure::hex_encode_32(&sha256);
+    crate::diag::append(esp_for_diag, "VK3 after_hex_encode\n");
 
-    let (verified_via, status_str, accepted) = match secure::detect_secure_boot() {
-        // SB-off: no crypto verification attempted. Accepted for
-        // homelab/dev; loud in the trust log so an auditor can see
-        // that no cryptographic check backed this boot.
-        SecureBootState::Disabled => (V_DEGRADED_TRUST_SB_OFF, "SUCCESS", true),
-
-        // SB on, loaded directly by firmware db without shim in the
-        // chain. Same trust model as SB-off from LamBoot's point of
-        // view — the administrator's db-enrolled key covers the
-        // tree; we don't re-verify. Distinct token so audit logs
-        // distinguish the two states.
-        SecureBootState::ActiveDirect => (V_DEGRADED_TRUST_SB_DIRECT, "SUCCESS", true),
-
-        // SB on + shim in chain: delegate to ShimLock::Verify.
-        SecureBootState::ActiveWithShim => match secure::verify_image(bytes) {
-            Ok(()) => (V_SHIM_MOK, "SUCCESS", true),
-            Err(e) => {
-                log::warn!("ShimLock::Verify rejected {path_for_log}: {e:?}");
-                (V_SHIM_REJECTED, "REJECTED", false)
-            }
-        },
+    // sb_state was detected once at the top of run_bootloader (so the report and
+    // trust log share one posture), BUT it was captured BEFORE load_drivers. On
+    // shim < 15.8 the ShimLock protocol is uninstalled after first use, so a
+    // legacy FS driver (XFS/ZFS/NTFS /boot) loaded since then can have consumed
+    // it. Re-probe here and degrade ActiveWithShim -> ActiveDirect if shim has
+    // vanished: verifying against a ShimLock that is no longer present would
+    // hard-reject a kernel that should fall through to the firmware-db path
+    // (v0.12.0 detected fresh at this site; this restores that resilience).
+    let sb_state = if sb_state == SecureBootState::ActiveWithShim && !secure::shim_lock_present() {
+        SecureBootState::ActiveDirect
+    } else {
+        sb_state
     };
+    crate::diag::append_fmt(esp_for_diag, format_args!("VK4 secure_boot={sb_state:?}\n"));
+
+    // Honest status: only a path where a signature was actually validated
+    // records "SUCCESS". The two accepted-but-unverified postures carry a
+    // distinct status so a SIEM keying on status=SUCCESS cannot mistake a
+    // degraded boot for a verified one (the verified_via token already encodes
+    // the degraded posture; this keeps the status field consistent with it).
+    //   - Disabled: SB off, nothing to verify -> SKIPPED.
+    //   - ActiveDirect: no shim to ask; LamBoot performs no check here, the
+    //     firmware db check runs later on the forced firmware LoadImage path
+    //     (see choose_load_path) -> DEFERRED.
+    let (verified_via, status_str, accepted) = match sb_state {
+        SecureBootState::Disabled => (V_DEGRADED_TRUST_SB_OFF, "SKIPPED", true),
+        SecureBootState::ActiveDirect => (V_DEGRADED_TRUST_SB_DIRECT, "DEFERRED", true),
+        SecureBootState::ActiveWithShim => {
+            crate::diag::append(esp_for_diag, "VK5 before_shim_verify\n");
+            let r = secure::verify_image(bytes, sb_state);
+            crate::diag::append(esp_for_diag, "VK6 after_shim_verify\n");
+            match r {
+                Ok(()) => (V_SHIM_MOK, "SUCCESS", true),
+                Err(_) => (V_SHIM_REJECTED, "REJECTED", false),
+            }
+        }
+    };
+    crate::diag::append_fmt(
+        esp_for_diag,
+        format_args!("VK7 verified_via={verified_via} status={status_str} accepted={accepted}\n"),
+    );
 
     trust_log.record(
         TrustEvent::new("image_verified")
@@ -514,12 +758,14 @@ fn verify_kernel_bytes<'b>(
             .with_verified_via(verified_via)
             .with_status(status_str),
     );
+    crate::diag::append(esp_for_diag, "VK8 after_record_image_verified\n");
 
     if accepted {
         Ok(VerifiedBytes {
             bytes,
             sha256,
             verified_via,
+            sb_state,
         })
     } else {
         Err(())
@@ -533,12 +779,15 @@ fn verify_kernel_bytes<'b>(
 /// SDS-4 §6.4 invariant: the SHA-256 recorded in `image_loaded_native`
 /// MUST match the SHA-256 computed at `verify_kernel_bytes`. A
 /// mismatch indicates a TOCTOU bug between verify and load (bytes
-/// changed under us) and is treated as a security-critical failure
-/// via `assert_eq!` — a release build will panic on violation rather
-/// than silently proceed.
+/// changed under us) and is treated as a security-critical failure:
+/// the load is refused (fail-closed) and the boot returns to the menu
+/// with a recorded trust event, rather than panicking/bricking — a
+/// brick is an unnecessarily harsh way to fail closed.
+// Orchestration function — ESP pass-through is how we persist
+// image_verified + image_loaded_native to disk before ExitBootServices.
 #[expect(
     clippy::too_many_arguments,
-    reason = "orchestration function; ESP pass-through is how we persist image_verified + image_loaded_native to disk before ExitBootServices"
+    reason = "orchestration; FirmwareQuirks routes the conout-coupling flush gate"
 )]
 fn native_load_and_start(
     verified: &VerifiedBytes<'_>,
@@ -548,15 +797,11 @@ fn native_load_and_start(
     _current_image: Handle,
     trust_log: &mut TrustLog,
     esp_for_flush: &mut Volume,
+    quirks: crate::firmware_quirks::FirmwareQuirks,
 ) -> Result<Status> {
+    crate::diag::append(esp_for_flush, "N1 enter\n");
     let bytes = verified.bytes;
-    log::info!(
-        "Native PE load: {path_for_log} ({} bytes from {backend_tag}, verified_via={})",
-        bytes.len(),
-        verified.verified_via,
-    );
 
-    // Encode options as UTF-16 + NUL (what LoadedImageProtocol expects).
     let options_box: Option<alloc::boxed::Box<[u16]>> = if options.is_empty() {
         None
     } else {
@@ -568,15 +813,19 @@ fn native_load_and_start(
             .collect();
         Some(vec.into_boxed_slice())
     };
+    crate::diag::append(esp_for_flush, "N2 after_options_encode\n");
 
-    let loaded = match pe_loader::load_pe(bytes, options_box, backend_tag) {
-        Ok(l) => l,
+    crate::diag::append(esp_for_flush, "N3 before_pe_loader_load_pe\n");
+    let loaded = match pe_loader::load_pe(bytes, options_box, backend_tag, Some(esp_for_flush)) {
+        Ok(l) => {
+            crate::diag::append(esp_for_flush, "N4 after_pe_loader_load_pe_ok\n");
+            l
+        }
         Err(e) => {
-            log::error!("pe_loader::load_pe failed: {e:?}");
-            // Include the Debug repr in the trust-log note so the
-            // specific RelocationMalformed(detail) string or similar
-            // payload reaches the operator, not just the generic
-            // token. Helps triage SDS-3 PR-4-era correctness issues.
+            crate::diag::append_fmt(
+                esp_for_flush,
+                format_args!("N4_err pe_loader_failed: {}\n", e.as_log_token()),
+            );
             let debug_repr = alloc::format!("{e:?}");
             trust_log.record(
                 TrustEvent::new("image_load_failed")
@@ -592,20 +841,23 @@ fn native_load_and_start(
         }
     };
 
-    // SDS-4 §6.4 invariant: SHA-256 at Step 10 (verify) MUST equal
-    // SHA-256 at Step 13 (load). A mismatch is a TOCTOU security bug
-    // — the bytes we verified are not the bytes we're about to run.
-    // Release build panics rather than silently proceed.
-    assert_eq!(
-        *loaded.sha256(),
-        verified.sha256,
-        "SDS-4 §6.4 invariant violation: verify SHA-256 != load SHA-256 for {path_for_log}"
-    );
+    // SDS-4 §6.4: fail closed on a verify/load SHA-256 mismatch (a TOCTOU
+    // signal), but return to the menu rather than panic-bricking the boot.
+    if *loaded.sha256() != verified.sha256 {
+        crate::diag::append(esp_for_flush, "N5_err sha256_invariant_violation\n");
+        trust_log.record(
+            TrustEvent::new("image_load_failed")
+                .with_path(path_for_log)
+                .with_verified_via("native_pe_loader")
+                .with_note("reason=sds4_6.4_verify_load_sha256_mismatch"),
+        );
+        if !quirks.conout_fat_coupling {
+            trust_log.flush(esp_for_flush);
+        }
+        return Err(Status::SECURITY_VIOLATION.into());
+    }
+    crate::diag::append(esp_for_flush, "N5 after_sha256_invariant\n");
 
-    // Emit the successful-load event per spec §12 BEFORE transferring
-    // control — the log flushes to ESP before the child runs. Carries
-    // the `verified_via` token from Step 10 so audit consumers can
-    // correlate the decision back through the chain.
     trust_log.record(
         TrustEvent::new("image_loaded_native")
             .with_path(path_for_log)
@@ -616,23 +868,30 @@ fn native_load_and_start(
                 "backend={backend_tag} loader={V_NATIVE_PE_LOADER}"
             )),
     );
+    crate::diag::append(esp_for_flush, "N6 after_record_image_loaded_native\n");
 
-    // SDS-4 Step 15: flush the trust log to \loader\boot-trust.log
-    // BEFORE transferring control. Without this, `image_verified`
-    // and `image_loaded_native` live only in memory and are lost
-    // when the kernel ExitBootServices-es. The log file is the only
-    // persistent audit evidence of the trust-chain decision.
-    trust_log.flush(esp_for_flush);
+    if !quirks.conout_fat_coupling {
+        trust_log.flush(esp_for_flush);
+    }
+    crate::diag::append(esp_for_flush, "N7 after_or_skipped_trust_log_flush\n");
 
     reconnect_console_drivers();
-    log::info!("Starting image via native loader (no BS->LoadImage)");
+    crate::diag::append(esp_for_flush, "N8 after_reconnect_console_drivers\n");
 
-    // SAFETY: `verify_pre_load` returned true on the Auto branch (we
-    // would not have chosen Native otherwise) OR the operator set
-    // policy to Always, asserting the load bytes are trusted. The
-    // loaded image came from our pe_loader which validated PE
-    // structure per §5.1.
+    // Single pre-handoff flush of coalesced breadcrumbs (no-op unless
+    // coalescing). This is the last point we control before the kernel
+    // ExitBootServices-es, so it captures the whole post-selection trail in
+    // one FAT write on coupling-prone firmware.
+    crate::diag::flush(esp_for_flush);
+
+    // SAFETY: pe_loader validated PE; verified.bytes came from the
+    // verify_kernel_bytes path above.
     let status = unsafe { pe_loader::start_image(loaded) };
+    // If we get here, the kernel returned (unusual — normally ExitBootServices makes this unreachable).
+    crate::diag::append_fmt(
+        esp_for_flush,
+        format_args!("N9 start_image_returned status={status:?}\n"),
+    );
     Ok(status)
 }
 
@@ -694,6 +953,7 @@ fn firmware_load_and_start(
     trust_log.flush(esp_for_flush);
 
     reconnect_console_drivers();
+    crate::diag::flush(esp_for_flush);
     uefi::boot::start_image(image_handle)?;
     Ok(Status::SUCCESS)
 }

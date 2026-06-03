@@ -21,9 +21,9 @@
 //! and is exercised by the QEMU harness in `run-qemu-ext4-backend-test.sh`.
 
 use lamboot_fs_tests::trust_log_pure::{
-    serialize_events, TrustEvent, TrustLog, ALL_VERIFIED_VIA, V_DEGRADED_TRUST_SB_DIRECT,
-    V_DEGRADED_TRUST_SB_OFF, V_FIRMWARE_DB_FALLBACK, V_FIRMWARE_LOADIMAGE, V_NATIVE_PE_LOADER,
-    V_SHIM_MOK, V_SHIM_REJECTED,
+    report_loader, report_verified_via, serialize_events, ReportSbState, TrustEvent, TrustLog,
+    ALL_VERIFIED_VIA, V_DEGRADED_TRUST_SB_DIRECT, V_DEGRADED_TRUST_SB_OFF, V_FIRMWARE_DB_FALLBACK,
+    V_FIRMWARE_LOADIMAGE, V_NATIVE_PE_LOADER, V_SHIM_MOK, V_SHIM_REJECTED,
 };
 
 // ---------------------------------------------------------------------------
@@ -43,6 +43,59 @@ fn vocabulary_tokens_are_exact_strings() {
     assert_eq!(V_SHIM_REJECTED, "shim_rejected");
     assert_eq!(V_NATIVE_PE_LOADER, "native_pe_loader");
     assert_eq!(V_FIRMWARE_LOADIMAGE, "firmware_loadimage");
+}
+
+// ---------------------------------------------------------------------------
+// #5 — summary boot.json trust posture mappers
+//
+// The boot.json `verified_via` + `loader` fields are derived from the Secure
+// Boot state and the native-PE policy via these pure mappers. The tokens MUST
+// come from the same stable vocabulary the per-event trust log uses, so a
+// consumer reading either source sees identical strings.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn report_verified_via_maps_each_sb_state() {
+    assert_eq!(
+        report_verified_via(ReportSbState::Off),
+        V_DEGRADED_TRUST_SB_OFF
+    );
+    assert_eq!(
+        report_verified_via(ReportSbState::Direct),
+        V_DEGRADED_TRUST_SB_DIRECT
+    );
+    // Shim posture reports shim_mok: a shim_rejected image returns to the
+    // menu and never reaches boot.json, so the success token is correct.
+    assert_eq!(report_verified_via(ReportSbState::Shim), V_SHIM_MOK);
+}
+
+#[test]
+fn report_verified_via_emits_only_stable_vocabulary() {
+    for sb in [
+        ReportSbState::Off,
+        ReportSbState::Direct,
+        ReportSbState::Shim,
+    ] {
+        assert!(
+            ALL_VERIFIED_VIA.contains(&report_verified_via(sb)),
+            "report verified_via for {sb:?} must be in the stable vocabulary",
+        );
+    }
+}
+
+#[test]
+fn report_loader_native_unless_never_or_chainload() {
+    // Kernel/UKI on the default policy: native PE loader.
+    assert_eq!(
+        report_loader(/*never=*/ false, /*chainload=*/ false),
+        V_NATIVE_PE_LOADER
+    );
+    // native_pe = "never" pins the firmware LoadImage path.
+    assert_eq!(report_loader(true, false), V_FIRMWARE_LOADIMAGE);
+    // Chainload targets always go through firmware LoadImage, regardless of
+    // the native_pe policy.
+    assert_eq!(report_loader(false, true), V_FIRMWARE_LOADIMAGE);
+    assert_eq!(report_loader(true, true), V_FIRMWARE_LOADIMAGE);
 }
 
 #[test]

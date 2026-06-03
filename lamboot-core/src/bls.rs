@@ -1,3 +1,5 @@
+//! Layer: 4 — Policy & State.
+//!
 //! Boot Loader Specification (BLS) Type 1 discovery — volume side.
 //!
 //! The pure byte-level parser lives in `bls_parse.rs` so host tests
@@ -28,7 +30,7 @@ use crate::{
         bls_sort_compare, count_digits_in_filename, has_extension_ignore_case,
         is_native_architecture,
     },
-    discovery::{BootEntry, EntryKind, Icon},
+    boot_types::{BootEntry, EntryKind, Icon},
     fs::Volume,
     policy::Policy,
     trust_log::{TrustEvent, TrustLog},
@@ -202,8 +204,14 @@ pub(crate) fn scan_volume_for_bls(
         entries.len()
     )));
 
-    // Sort entries per BLS spec.
-    entries.sort_by(bls_sort_compare);
+    // Sort entries per BLS spec. When the operator has set
+    // `bls_ignore_sort_key = true` in policy.toml (the Fedora bootupd
+    // model — see lamboot-install/TROUBLESHOOTING.md §3.0 Bug 22), the
+    // comparator skips the sort-key presence test and value compare,
+    // collapsing both BLS cohorts into a single version-descending
+    // bucket. Default (false) preserves the spec-faithful sort.
+    let ignore_sort_key = policy.bls_ignore_sort_key;
+    entries.sort_by(|a, b| bls_sort_compare(a, b, ignore_sort_key));
 
     entries
 }

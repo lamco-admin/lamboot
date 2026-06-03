@@ -1,3 +1,5 @@
+//! Layer: 3 — Parsers & Shared Types.
+//!
 //! Native Rust PE loader — SDS-3.
 //!
 //! Loads a PE/COFF binary from a byte slice into memory, applies
@@ -32,8 +34,8 @@ use uefi_raw::{
 };
 
 use crate::pe_loader_pure::{
-    apply_relocations_to_slice, hex_encode_32, parse_headers, sha256_of, validate_headers,
-    PeLoadError, PeSummary,
+    apply_relocations_to_slice, hex_encode_32, parse_headers_with_diag, sha256_of,
+    validate_headers, PeLoadError, PeSummary,
 };
 
 /// Handle to a loaded, ready-to-run PE image.
@@ -141,30 +143,58 @@ pub(crate) fn load_pe(
     bytes: &[u8],
     load_options: Option<Box<[u16]>>,
     source_backend: &'static str,
+    diag_esp: Option<&mut crate::fs::Volume>,
 ) -> Result<LoadedImage, PeLoadError> {
-    // 1. Parse + validate headers (pure code).
-    let summary = parse_headers(bytes)?;
+    let mut diag = diag_esp;
+    macro_rules! diag {
+        ($msg:expr) => {
+            if let Some(ref mut e) = diag {
+                crate::diag::append(e, $msg);
+            }
+        };
+    }
+    diag!("PE1 enter_load_pe\n");
+
+    // Build a closure that forwards to the diag esp. We CAN'T capture
+    // `diag` (the &mut Option<&mut Volume>) into a FnMut and use it
+    // both inside parse_headers_with_diag AND afterward without
+    // lifetime acrobatics; so we just split into a brief scope.
+    let summary = {
+        let mut cb_diag = |msg: &str| {
+            if let Some(ref mut e) = diag {
+                crate::diag::append(e, msg);
+            }
+        };
+        parse_headers_with_diag(bytes, Some(&mut cb_diag))?
+    };
+    diag!("PE2 after_parse_headers\n");
     validate_headers(&summary, bytes)?;
+    diag!("PE3 after_validate_headers\n");
 
-    // 2. Compute SHA-256 of the ORIGINAL bytes before any allocation
-    //    or relocation. This is what ShimLock::Verify hashed.
     let sha256 = sha256_of(bytes);
+    diag!("PE4 after_sha256\n");
 
-    // 3. Allocate the image range.
+    diag!("PE5 before_allocate_image_pages\n");
     let (image_base, pages_allocated, actual_base) = allocate_image_pages(&summary)?;
+    if let Some(ref mut e) = diag {
+        crate::diag::append_fmt(
+            e,
+            format_args!("PE6 after_allocate_image_pages pages={pages_allocated}\n"),
+        );
+    }
 
-    // 4. Zero the whole allocation (PE BSS-style sections rely on this).
-    // SAFETY: image_base is a freshly allocated range of
-    // pages_allocated * 4096 bytes owned exclusively by us.
+    diag!("PE7 before_write_bytes_zero\n");
     unsafe {
         ptr::write_bytes(image_base, 0, pages_allocated * 4096);
     }
+    diag!("PE8 after_write_bytes_zero\n");
 
     // 5. Copy each section.
     // SAFETY: summary.sections came from validate_headers which
     // bounds-checked every (raw_offset, copy_len) against bytes.len()
     // and every (virt_addr, virt_size) against size_of_image. The
     // destination range is inside our allocation.
+    diag!("PE9 before_copy_sections\n");
     for plan in &summary.sections {
         if plan.copy_len == 0 {
             continue;
@@ -175,8 +205,10 @@ pub(crate) fn load_pe(
             ptr::copy_nonoverlapping(src, dst, plan.copy_len as usize);
         }
     }
+    diag!("PE10 after_copy_sections\n");
 
     // 6. Apply relocations, unless we got the preferred base.
+    diag!("PE11 before_relocation_decision\n");
     if actual_base != summary.preferred_base {
         let Some(reloc_dir) = summary.reloc_dir.filter(|d| d.size > 0) else {
             // No relocation directory AND we didn't get preferred base.
@@ -195,11 +227,10 @@ pub(crate) fn load_pe(
             // kernels with DYNAMIC_BASE + self-relocation. Every
             // established Linux-EFI bootloader (sd-boot, GRUB,
             // rEFInd) behaves this way.
-            log::info!(
-                "pe_loader: no reloc directory and non-preferred base; \
-                 assuming position-independent image (Linux EFI stub)"
-            );
+            diag!("PE12 EFI_stub_no_reloc_path\n");
             // Fall through — skip to install + entry-point compute.
+            // Borrow `diag` again — diag was moved into the macro; need
+            // to pass into finish_load_without_relocs.
             return finish_load_without_relocs(
                 image_base,
                 pages_allocated,
@@ -207,6 +238,7 @@ pub(crate) fn load_pe(
                 sha256,
                 source_backend,
                 load_options,
+                diag,
             );
         };
 
@@ -245,11 +277,15 @@ pub(crate) fn load_pe(
         }
     }
 
-    // 7. Install LoadedImageProtocol.
+    diag!("PE14r before_install_loaded_image_protocol_reloc_path\n");
     let (handle, protocol_data, load_options_guard) =
         match install_loaded_image_protocol(image_base, summary.size_of_image, load_options) {
-            Ok(triple) => triple,
+            Ok(triple) => {
+                diag!("PE15r after_install_loaded_image_protocol_ok\n");
+                triple
+            }
             Err(e) => {
+                diag!("PE15r_err install_loaded_image_protocol_failed\n");
                 unsafe {
                     if let Some(nn) = core::ptr::NonNull::new(image_base) {
                         let _ = uefi::boot::free_pages(nn, pages_allocated);
@@ -302,11 +338,11 @@ pub(crate) unsafe fn start_image(image: LoadedImage) -> uefi::Status {
     let handle = image.handle;
     let system_table = system_table_raw_ptr();
 
-    log::info!(
-        "pe_loader: invoking entry point at {:p} (image handle {:?})",
-        entry as *const (),
-        handle
-    );
+    // v0.11.0: log::info! here was the last ConOut emission before
+    // entry() and hung mid-message on ASUS G10AJ (only "[" reached
+    // the screen). Same firmware-coupling issue we've hit elsewhere
+    // with log:: macros at post-selection depth. Removed entirely;
+    // a successful handoff leaves no time to print anyway.
 
     // SAFETY: entry is an efiapi function pointer constructed from a
     // validated in-range address (§5.1 check). handle is a real UEFI
@@ -314,7 +350,6 @@ pub(crate) unsafe fn start_image(image: LoadedImage) -> uefi::Status {
     // hands our own entry — re-passing it is correct.
     let status = unsafe { entry(handle, system_table) };
 
-    // Child returned. Drop the LoadedImage → free_pages.
     drop(image);
     status
 }
@@ -336,11 +371,25 @@ fn finish_load_without_relocs(
     sha256: [u8; 32],
     source_backend: &'static str,
     load_options: Option<Box<[u16]>>,
+    mut diag: Option<&mut crate::fs::Volume>,
 ) -> Result<LoadedImage, PeLoadError> {
+    macro_rules! diag {
+        ($msg:expr) => {
+            if let Some(ref mut e) = diag {
+                crate::diag::append(e, $msg);
+            }
+        };
+    }
+    diag!("PE13 finish_load_without_relocs_enter\n");
+    diag!("PE14 before_install_loaded_image_protocol\n");
     let (handle, protocol_data, load_options_guard) =
         match install_loaded_image_protocol(image_base, summary.size_of_image, load_options) {
-            Ok(t) => t,
+            Ok(t) => {
+                diag!("PE15 after_install_loaded_image_protocol_ok\n");
+                t
+            }
             Err(e) => {
+                diag!("PE15_err install_loaded_image_protocol_failed\n");
                 if let Some(nn) = core::ptr::NonNull::new(image_base) {
                     unsafe {
                         let _ = uefi::boot::free_pages(nn, pages_allocated);
@@ -349,6 +398,7 @@ fn finish_load_without_relocs(
                 return Err(e);
             }
         };
+    diag!("PE16 before_compute_entry_point\n");
 
     // SAFETY: validate_headers ensured entry_rva is within image
     // bounds and in an executable section. The target OS's EFI stub

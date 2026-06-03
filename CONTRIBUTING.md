@@ -24,6 +24,7 @@ lamboot-core/src/
   bls.rs          BLS Type 1 parser + UAPI.10 version sort
   gui.rs          Double-buffered framebuffer + VGA font
   console.rs      Text console fallback
+  boot_types.rs   Shared BootEntry/EntryKind/Icon + preflight result types
   discovery.rs    BLS-first entry discovery + ESP fallback
   boot.rs         Boot execution (chainload/UKI/Linux+LoadFile2)
   initrd.rs       LoadFile2 initrd protocol provider
@@ -50,10 +51,12 @@ lamboot-core/src/
 
 ### New Boot Entry Type
 
-1. Add variant to `EntryKind` in `discovery.rs`
-2. Implement detection in `discovery.rs`
-3. Handle boot in `boot::boot_entry()`
-4. Add icon in `Icon` enum
+1. Add the variant to `EntryKind` in `boot_types.rs` (the shared Layer-3 type module that owns `BootEntry`, `EntryKind`, and `Icon`)
+2. Add the corresponding `Icon` variant in `boot_types.rs`
+3. Implement detection/aggregation in `discovery.rs`
+4. Handle boot in `boot::boot_entry()`
+
+Keep the type/variant edits in `boot_types.rs` — don't add boot-entry types to `discovery.rs` (the Layer-7 orchestration module only aggregates detected entries).
 
 ### New Diagnostic Module
 
@@ -62,6 +65,8 @@ lamboot-core/src/
 3. Use `#![no_main]` `#![no_std]` with `#[entry]` and `uefi::helpers::init()`
 4. Add to `modules/manifest.toml` for a friendly name
 5. Build: `cargo build --target x86_64-unknown-uefi --release -p your-module`
+
+> **Layer declaration is mandatory.** Every new module must declare its layer with a `//! Layer: N` doc comment matching the model in `docs/ARCHITECTURE-LAYERS.md` and be registered in `tools/layer-map.toml`. `tools/check-layers.py` runs in the pre-commit hook and in CI; it fails the build on a missing declaration or an upward (lower-on-higher) dependency. The layer graph is a verified acyclic DAG, so a new module may only depend on modules at its own layer or below.
 
 ### New UEFI Protocol
 

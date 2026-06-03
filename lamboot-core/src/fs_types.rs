@@ -1,3 +1,5 @@
+//! Layer: 2 — Storage & Filesystems.
+//!
 //! Pure value types for the filesystem abstraction.
 //!
 //! Split out of `fs_backend.rs` so they can be host-tested without bringing

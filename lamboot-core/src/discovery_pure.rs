@@ -1,3 +1,5 @@
+//! Layer: 3 (pure) — Parsers & Shared Types.
+//!
 //! Pure helpers for discovery — host-testable, no UEFI dependencies.
 //!
 //! Lives split from `discovery.rs` so it can be `#[path]`-included into

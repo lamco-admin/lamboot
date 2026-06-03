@@ -1,3 +1,5 @@
+//! Layer: 3 — Parsers & Shared Types.
+//!
 //! Pure BLS Type 1 parser — no UEFI, no Volume, no I/O.
 //!
 //! This module holds the byte-level parsing logic that can run on any
@@ -205,7 +207,14 @@ impl BlsEntry {
 ///   2. Entries with `sort-key` sort before those without.
 ///   3. Compare `sort-key`, then `machine-id`, then `version` (descending).
 ///   4. Filename fallback (descending version order when both have version).
-pub fn bls_sort_compare(a: &BlsEntry, b: &BlsEntry) -> Ordering {
+///
+/// When `ignore_sort_key` is true (operator opt-in via
+/// `policy.bls_ignore_sort_key = true`), rules 2 and 3's sort-key
+/// presence test and sort-key value compare are skipped, collapsing
+/// both cohorts into one bucket and relying on machine-id + version
+/// + filename fallback. This is the Fedora bootupd model and the
+/// canonical fix for the BLS sort-key cohort split (Bug 22).
+pub fn bls_sort_compare(a: &BlsEntry, b: &BlsEntry, ignore_sort_key: bool) -> Ordering {
     // Bad entries last.
     let a_bad = a.boot_count_state() == BootCountState::Bad;
     let b_bad = b.boot_count_state() == BootCountState::Bad;
@@ -217,36 +226,57 @@ pub fn bls_sort_compare(a: &BlsEntry, b: &BlsEntry) -> Ordering {
         };
     }
 
-    // sort-key presence: entries WITH sort-key come first.
-    let a_has_sk = a.sort_key.is_some();
-    let b_has_sk = b.sort_key.is_some();
-    if a_has_sk != b_has_sk {
-        return if a_has_sk {
-            Ordering::Less
-        } else {
-            Ordering::Greater
-        };
-    }
-
-    // Both have sort-key: compare sort-key → machine-id → version (desc).
-    if a_has_sk && b_has_sk {
-        let sk_cmp = cmp_opt_str(a.sort_key.as_ref(), b.sort_key.as_ref());
-        if sk_cmp != Ordering::Equal {
-            return sk_cmp;
-        }
-
+    if ignore_sort_key {
+        // Bug 22 / Option F path — ignore sort-key entirely.
+        // Compare machine-id → version (desc) → filename fallback.
         let mid_cmp = cmp_opt_str(a.machine_id.as_ref(), b.machine_id.as_ref());
         if mid_cmp != Ordering::Equal {
             return mid_cmp;
         }
+        if a.version.is_some() && b.version.is_some() {
+            let ver_cmp = version_compare(
+                a.version.as_deref().unwrap_or(""),
+                b.version.as_deref().unwrap_or(""),
+            );
+            if ver_cmp != Ordering::Equal {
+                return ver_cmp.reverse();
+            }
+        }
+        // Fall through to filename fallback below.
+    } else {
+        // Spec-faithful path (default).
 
-        // Version: descending (newer first).
-        let ver_cmp = version_compare(
-            a.version.as_deref().unwrap_or(""),
-            b.version.as_deref().unwrap_or(""),
-        );
-        if ver_cmp != Ordering::Equal {
-            return ver_cmp.reverse();
+        // sort-key presence: entries WITH sort-key come first.
+        let a_has_sk = a.sort_key.is_some();
+        let b_has_sk = b.sort_key.is_some();
+        if a_has_sk != b_has_sk {
+            return if a_has_sk {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
+
+        // Both have sort-key: compare sort-key → machine-id → version (desc).
+        if a_has_sk && b_has_sk {
+            let sk_cmp = cmp_opt_str(a.sort_key.as_ref(), b.sort_key.as_ref());
+            if sk_cmp != Ordering::Equal {
+                return sk_cmp;
+            }
+
+            let mid_cmp = cmp_opt_str(a.machine_id.as_ref(), b.machine_id.as_ref());
+            if mid_cmp != Ordering::Equal {
+                return mid_cmp;
+            }
+
+            // Version: descending (newer first).
+            let ver_cmp = version_compare(
+                a.version.as_deref().unwrap_or(""),
+                b.version.as_deref().unwrap_or(""),
+            );
+            if ver_cmp != Ordering::Equal {
+                return ver_cmp.reverse();
+            }
         }
     }
 

@@ -1,0 +1,132 @@
+#!/bin/bash
+# lamboot-host-sampler — runtime metrics sampler for LamBoot host-side
+# observability.
+#
+# Reads NVRAM EFI variables (boot state, crash counter), ESP free
+# space, system uptime, and emits a single JSON line to
+# /var/log/lamboot/sampler.jsonl per invocation.
+#
+# Designed to be called by lamboot-host-sampler.timer every 5 minutes.
+# Best-effort: missing inputs degrade to null fields, never error.
+#
+# Schema (additive, v1):
+#   ts             unix epoch seconds (int)
+#   sampler_ver    this script's version (string)
+#   boot_state     byte value from LamBootState EFI var (int or null)
+#   crash_count    byte value from LamBootCrashCount EFI var (int or null)
+#   uptime_sec     /proc/uptime first field (float)
+#   esp_free_kb    available KB on ESP mount (int or null)
+#   esp_mount      where the ESP was found (string or null)
+#   sb_state       Secure Boot state byte (0=off, 1=on, null=unknown)
+#   kernel_version uname -r (string)
+#
+# Rotation: log truncates to 10 MB cap with a single .1.gz rollover.
+# This keeps disk footprint bounded without depending on logrotate.
+
+set -uo pipefail
+
+SAMPLER_VERSION="0.11.13"
+
+VENDOR_GUID="4c414d42-4f4f-5400-0000-000000000001"
+EFIVARS_DIR="/sys/firmware/efi/efivars"
+EVAR_BOOT_STATE="${EFIVARS_DIR}/LamBootState-${VENDOR_GUID}"
+EVAR_CRASH_CT="${EFIVARS_DIR}/LamBootCrashCount-${VENDOR_GUID}"
+# Microsoft SetupMode-{8be4df61-...} signals Secure Boot policy state
+EVAR_SB_STATE="${EFIVARS_DIR}/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+
+LOG_DIR="/var/log/lamboot"
+LOG_FILE="${LOG_DIR}/sampler.jsonl"
+MAX_SIZE_BYTES=$(( 10 * 1024 * 1024 ))   # 10 MB
+
+mkdir -p "$LOG_DIR" 2>/dev/null || {
+    # If we can't create the log dir, exit cleanly — better silent skip
+    # than systemd reporting failure.
+    exit 1
+}
+
+# Read the first data byte after the 4-byte EFI attribute prefix.
+# Returns "null" if unreadable, an unquoted decimal int otherwise.
+read_efivar_byte() {
+    local f="$1"
+    [ -r "$f" ] || { echo "null"; return; }
+    local b
+    b=$(od -An -t u1 -N1 -j4 "$f" 2>/dev/null | tr -d ' ')
+    if [ -z "$b" ] || ! [[ "$b" =~ ^[0-9]+$ ]]; then
+        echo "null"
+    else
+        echo "$b"
+    fi
+}
+
+# Find the ESP mount. Try /boot/efi first (Fedora/Debian convention),
+# then /efi (systemd-boot recent default), then /boot (Arch + LVM
+# convention where ESP is mounted directly at /boot).
+find_esp_mount() {
+    local m
+    for m in /boot/efi /efi /boot; do
+        if mountpoint -q "$m" 2>/dev/null; then
+            # Confirm vfat (catches the /boot=ext4 case where ESP is
+            # actually at /boot/efi).
+            local fstype
+            fstype=$(findmnt -no FSTYPE "$m" 2>/dev/null)
+            if [ "$fstype" = "vfat" ]; then
+                echo "$m"
+                return 0
+            fi
+        fi
+    done
+    echo ""
+}
+
+# JSON-escape a string for embedding in the JSON line.
+json_str() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '"%s"' "$s"
+}
+
+# ── Collect ────────────────────────────────────────────────────────────
+ts=$(date -u +%s)
+uptime_sec=$(awk '{print $1}' /proc/uptime 2>/dev/null || echo "0")
+kver=$(uname -r 2>/dev/null || echo "unknown")
+boot_state=$(read_efivar_byte "$EVAR_BOOT_STATE")
+crash_count=$(read_efivar_byte "$EVAR_CRASH_CT")
+sb_state=$(read_efivar_byte "$EVAR_SB_STATE")
+
+esp_mount=$(find_esp_mount)
+esp_free_kb="null"
+if [ -n "$esp_mount" ]; then
+    f=$(df --output=avail -k "$esp_mount" 2>/dev/null | tail -1 | tr -d ' ')
+    if [[ "$f" =~ ^[0-9]+$ ]]; then
+        esp_free_kb="$f"
+    fi
+fi
+
+# ── Emit ───────────────────────────────────────────────────────────────
+{
+    printf '{'
+    printf '"ts":%d,'                "$ts"
+    printf '"sampler_ver":%s,'       "$(json_str "$SAMPLER_VERSION")"
+    printf '"boot_state":%s,'        "$boot_state"
+    printf '"crash_count":%s,'       "$crash_count"
+    printf '"uptime_sec":%s,'        "$uptime_sec"
+    printf '"esp_free_kb":%s,'       "$esp_free_kb"
+    printf '"esp_mount":%s,'         "$([ -n "$esp_mount" ] && json_str "$esp_mount" || echo null)"
+    printf '"sb_state":%s,'          "$sb_state"
+    printf '"kernel_version":%s'     "$(json_str "$kver")"
+    printf '}\n'
+} >> "$LOG_FILE" 2>/dev/null
+
+# ── Rotate ─────────────────────────────────────────────────────────────
+if [ -f "$LOG_FILE" ]; then
+    sz=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$sz" -gt "$MAX_SIZE_BYTES" ]; then
+        # Single-tier rotation: .1.gz only, prior is overwritten.
+        rm -f "${LOG_FILE}.1.gz" 2>/dev/null
+        mv "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null
+        gzip "${LOG_FILE}.1" 2>/dev/null || rm -f "${LOG_FILE}.1"
+    fi
+fi
+
+exit 0

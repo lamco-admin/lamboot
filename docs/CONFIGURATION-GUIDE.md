@@ -1,7 +1,7 @@
 # LamBoot Configuration Guide
 
-**Version:** 0.8.3
-**Updated:** 2026-04-21
+**Version:** 0.12.0
+**Updated:** 2026-05-30
 
 ---
 
@@ -32,10 +32,22 @@ When updating LamBoot via `lamboot-install --update`, the existing policy.toml i
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `version` | integer | `1` | Config format version. Always `1`. |
-| `default_timeout_ms` | integer | `4000` | Auto-boot delay in milliseconds. Set to `0` for no auto-boot (wait forever). |
+| `default_timeout_ms` | integer | `5000` | Auto-boot delay in milliseconds. Set to `0` for no auto-boot (wait forever). |
 | `default_entry` | string | _(none)_ | Entry ID to auto-boot. If unset, the first entry by sort order is selected. |
+| `default_pattern` | string | _(none)_ | Glob over entry `id`. When set, the default selector picks the highest-version entry whose `id` matches the pattern, across all sort-key cohorts. Wins over `default_entry` when both are set and the pattern matches at least one entry. Mirrors sd-boot's escape hatch for distros that emit `sort-key` inconsistently (see Bug 22 / the cohort-split note below). |
+| `bls_ignore_sort_key` | boolean | `false` | When `true`, the sort comparison ignores the BLS `sort-key` field entirely and orders by version + filename. Mirrors Fedora bootupd's choice; fixes both menu order and the default cursor when a distro mixes sort-key presence across kernels mid-upgrade. Spec deviation when on. |
 
 **Entry IDs** are derived from BLS filenames: `fedora-6.19.9.conf` → entry ID `bls-fedora-6.19.9`. For ESP-discovered entries: `windows`, `grub`, `refind`, `fallback`. For tools: `tool-diag-shell`, `tool-pci-inventory`, etc.
+
+> **Cohort-split escape hatches.** `default_pattern` and
+> `bls_ignore_sort_key` exist for one real failure mode: a distro that
+> emits `sort-key` on some kernels but not others (observed mid-upgrade
+> on Debian forky/sid and Pop!_OS), which strands the wrong kernel at
+> the top of the menu. Fresh v0.11.0+ installs ship the template with
+> `bls_ignore_sort_key = true`; existing installs are left as-is and the
+> new template lands at `policy.toml.new`. Either knob resolves it; the
+> runtime also surfaces a cohort-split notice when it detects the
+> condition.
 
 #### Example
 
@@ -49,8 +61,8 @@ default_entry = "bls-fedora-6.19.9"
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `secure_boot_required` | boolean | `false` | When `true`, logs a warning if Secure Boot is disabled. _(Advisory only — does not block boot.)_ |
-| `measured_boot` | boolean | `false` | Informational flag indicating TPM measurement is desired. _(TPM measurement always runs when TPM is present, regardless of this setting.)_ |
-| `crash_threshold` | integer | `2` | Number of failed boot attempts before crash loop fallback triggers. |
+| `measured_boot` | boolean | `true` | Informational flag indicating TPM measurement is desired. _(TPM measurement always runs when a TPM is present, regardless of this setting; it defaults on because it is free when a TPM exists and a no-op when it does not.)_ |
+| `crash_threshold` | integer | `3` | Number of failed boot attempts before crash loop fallback triggers. |
 | `fallback_order` | array | `[]` | Entry IDs to try during crash loop, in priority order. If empty or none match, the menu is shown for manual selection. |
 | `allowlist` | array | `[]` | Allowed EFI paths. If empty, all paths are allowed. Supports `*` wildcards. |
 | `denylist` | array | `[]` | Denied EFI paths. Overrides the allowlist. Supports `*` wildcards. |
@@ -143,6 +155,19 @@ See `docs/specs/SPEC-NATIVE-PE-LOADER.md` for the full spec.
 LamBoot v0.8.x loaded every driver in the drivers directory at every boot, via `LoadImage`+`StartImage` under `SecurityOverride`. Each such load triggers shim 15.8 to uninstall `ShimLock`, preventing LamBoot from verifying kernels afterward. With the native ext4 reader (SDS-2) in v0.9.x, the ext4 driver is no longer needed for the 95%-of-users case — Auto mode removes it from the load path entirely, closing the shim-uninstall window for ext4-on-/boot systems.
 
 See `docs/specs/SPEC-UEFI-FSDRV-DEPRECATION.md` for the full deprecation schedule.
+
+---
+
+### `[diagnostics]` Section (v0.11.0+)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `verbose` | boolean | `false` | When `true`, LamBoot writes a full breadcrumb trace of the boot path to the audit log for troubleshooting. Default off — no breadcrumbs are written. Turn on only to investigate a boot problem; on firmware with the `conout_fat_coupling` quirk the breadcrumbs are coalesced in RAM and flushed once before kernel handoff so enabling this never adds FAT-write churn to the hang-prone band. |
+
+```toml
+[diagnostics]
+verbose = true
+```
 
 ---
 

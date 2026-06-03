@@ -1,20 +1,32 @@
+//! Layer: 1 — Firmware Boundary.
+//!
 //! SecurityArchProtocol override for shim+MOK *driver* loads.
 //!
-//! # Scope as of v0.9.x (SDS-4 native trust chain)
+//! # Scope (SDS-4 native trust chain)
 //!
-//! This module's override is now scoped to **legacy UEFI filesystem-driver
-//! `LoadImage` calls only**. The kernel-load path no longer routes through
-//! here:
+//! The override is installed inside [`crate::boot::load_efi_image_from_buffer`],
+//! so it covers **every `BS->LoadImage(FromBuffer)` call LamBoot makes** — not
+//! only driver loads. In practice that is:
 //!
-//! - Kernels are verified via [`ShimLock::Verify`] directly on the in-memory
-//!   bytes in [`crate::boot::verify_kernel_bytes`], then handed to
-//!   [`crate::pe_loader`] for a native-PE load. `BS->LoadImage` is not
-//!   invoked on kernels under the native path, so no firmware `db` check
-//!   runs and no `SecurityArch` delegation is needed.
-//! - Drivers (legacy UEFI FS drivers wired via
-//!   [`crate::drivers::load_drivers`]) still go through `BS->LoadImage`.
-//!   Those *do* hit the firmware security hooks and therefore still
-//!   require this override when signed with MOK-only certs.
+//! - **Legacy UEFI FS drivers** (via [`crate::drivers::load_drivers`]) — the
+//!   original and primary reason the override exists: MOK-only-signed drivers
+//!   are rejected by firmware `db` under shim < v16, and the override routes
+//!   the check through [`ShimLock::Verify`] instead.
+//! - **Chainloaded EFI applications** and the **firmware kernel-fallback path**
+//!   (`firmware_load_and_start`), which also go through
+//!   `load_efi_image_from_buffer`. When shim is present these LoadImage calls
+//!   therefore also delegate to `ShimLock::Verify` rather than firmware `db`
+//!   alone. This is a broader trust surface than "drivers only"; it is the
+//!   honest scope.
+//! - **Native-PE kernel loads do NOT route through here.** Kernels taking the
+//!   native path are verified via `ShimLock::Verify` directly on the in-memory
+//!   bytes in [`crate::boot::verify_kernel_bytes`] and handed to
+//!   [`crate::pe_loader`] without `BS->LoadImage`, so no `SecurityArch`
+//!   delegation is involved on that path.
+//!
+//! The guard is a no-op when Secure Boot is off or shim is absent (the
+//! `SecurityArch` protocols aren't located), so it only changes behavior under
+//! shim+SB.
 //!
 //! The long-term intent per SDS-6 is to retire the legacy UEFI FS driver
 //! path entirely (ext4 is already natively read by `ext4-view`). Once the

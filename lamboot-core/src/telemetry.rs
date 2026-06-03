@@ -1,3 +1,5 @@
+//! Layer: 5 (cross-cutting) — Trust & Audit.
+//!
 //! Boot telemetry — per-phase timing measurements.
 //!
 //! Measures wall-clock time for each boot phase using the UEFI RTC.

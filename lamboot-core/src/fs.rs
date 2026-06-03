@@ -1,3 +1,5 @@
+//! Layer: 2 — Storage & Filesystems.
+//!
 //! Layer-2 filesystem coordinator.
 //!
 //! Owns `Volume` — the caller-facing handle for reading any mounted
@@ -27,7 +29,7 @@ use alloc::{
 };
 
 use log::{debug, info};
-use uefi::{proto::media::fs::SimpleFileSystem, Handle};
+use uefi::{boot::ScopedProtocol, proto::media::fs::SimpleFileSystem, Handle};
 
 use crate::{
     fs_backend::{
@@ -222,6 +224,20 @@ impl Volume {
         }
     }
 
+    /// Get a mutable reference to the cached `SimpleFileSystem` for the
+    /// FAT backend, opening it on first call. `None` for non-FAT volumes.
+    ///
+    /// Routes through the FsBackend trait so reads (which go through
+    /// FatBackend::read etc.) AND writes (via EspWriter) both share
+    /// the same single SFS open. Critical: without sharing, the SFS
+    /// open count compounds across reads + writes and hits the
+    /// firmware FAT-driver hang threshold (~14 opens) on real
+    /// Proxmox hosts. See FatBackend::fat_sfs_mut for the cache
+    /// implementation.
+    pub(crate) fn fat_sfs_mut(&mut self) -> Option<&mut SimpleFileSystem> {
+        self.backend.fat_sfs_mut()
+    }
+
     // ---------- identity ----------
 
     pub(crate) fn identity(&self) -> &VolumeIdentity {
@@ -258,10 +274,14 @@ impl Volume {
         if let Some(cached) = self.cache.get(&key) {
             return Ok(cached.to_vec());
         }
+        // Miss path: the freshly-read `data` IS the bytes the caller wants, so
+        // return it directly and hand a single copy to the cache. The previous
+        // `Arc::from(slice)` + `arc.to_vec()` copied the buffer twice — a full
+        // multi-MB memcpy wasted on every kernel/initrd/UKI load (each read
+        // exactly once, i.e. always a miss).
         let data = self.backend.read(path)?;
-        let arc: Arc<[u8]> = Arc::from(data.as_slice());
-        self.cache.insert(key, arc.clone());
-        Ok(arc.to_vec())
+        self.cache.insert(key, Arc::from(data.as_slice()));
+        Ok(data)
     }
 
     pub(crate) fn read_to_string(&mut self, path: &Path) -> Result<String, FsError> {
@@ -279,10 +299,11 @@ impl Volume {
         if let Some(cached) = self.cache.get(&key) {
             return Ok(cached.to_vec());
         }
+        // Miss path: return the freshly-read bytes directly, cache one copy.
+        // See `read` — avoids the redundant second full-buffer copy.
         let data = self.backend.read_at(path, offset, len)?;
-        let arc: Arc<[u8]> = Arc::from(data.as_slice());
-        self.cache.insert(key, arc.clone());
-        Ok(arc.to_vec())
+        self.cache.insert(key, Arc::from(data.as_slice()));
+        Ok(data)
     }
 
     pub(crate) fn exists(&mut self, path: &Path) -> Result<bool, FsError> {
@@ -488,9 +509,20 @@ fn enumerate_fat_volumes(starting_index: u32) -> Vec<Volume> {
     let mut next_index = starting_index;
     for handle in handles {
         // Skip handles we can't open exclusively (ESP is open elsewhere, etc).
-        if uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(handle).is_err() {
+        let Ok(mut sfs) = uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(handle) else {
+            continue;
+        };
+        // Liveness probe: some firmware exposes an SFS handle for a FAT
+        // partition it then refuses to serve (`open_volume()` returns
+        // EFI_UNSUPPORTED — memory obs 4d6f6a9a). A `FatBackend` over such a
+        // handle is dead, so skip it here; the native FatRo fallback in
+        // `partitions::mount_xbootldr` mounts those volumes instead. Skipping
+        // avoids a dead duplicate shadowing the live FatRo volume.
+        if sfs.open_volume().is_err() {
             continue;
         }
+        // Release the exclusive open so FatBackend::new can re-open cleanly.
+        drop(sfs);
         let Ok(backend) = FatBackend::new(handle) else {
             continue;
         };

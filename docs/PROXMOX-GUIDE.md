@@ -1,6 +1,6 @@
 # LamBoot Proxmox Integration Guide
 
-**Version:** 0.8.3
+**Version:** 0.12.0
 **Updated:** 2026-04-21
 
 ## Overview

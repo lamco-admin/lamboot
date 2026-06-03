@@ -1,0 +1,102 @@
+#!/bin/bash
+# lamboot-reboot-once — schedule LamBoot for the very next boot, then revert.
+#
+# UEFI-native one-shot: writes the BootNext NVRAM variable, which firmware
+# consumes and clears on the subsequent boot. Works regardless of root
+# filesystem; does NOT depend on GRUB grubenv (which on LVM-backed root has
+# a "next_entry won't auto-clear" wart that bites every iteration).
+#
+# Falls back to `grub-reboot` if no LamBoot firmware Boot entry exists
+# (legacy install or BIOS-mode system).
+#
+# Usage:
+#   lamboot-reboot-once                  # schedule, do NOT reboot
+#   lamboot-reboot-once --reboot         # schedule AND reboot now
+#   lamboot-reboot-once --label LamBoot  # custom label match (default: case-insensitive 'lamboot')
+#   lamboot-reboot-once --dry-run        # show what would happen
+#
+# Exit codes:
+#   0  scheduled (BootNext set or grub-reboot accepted)
+#   1  no matching boot entry found
+#   2  efibootmgr not present AND grub-reboot not present
+#   3  efivars not writable (likely not running as root)
+
+set -euo pipefail
+
+REBOOT=0
+DRY_RUN=0
+LABEL_RE='lamboot'
+GRUB_LABEL='LamBoot (chainload)'
+
+while (( $# )); do
+    case "$1" in
+        --reboot) REBOOT=1 ;;
+        --dry-run) DRY_RUN=1 ;;
+        --label) LABEL_RE="$2"; shift ;;
+        --grub-label) GRUB_LABEL="$2"; shift ;;
+        --help|-h)
+            sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+            exit 0
+            ;;
+        *) echo "lamboot-reboot-once: unknown flag: $1" >&2; exit 64 ;;
+    esac
+    shift
+done
+
+if [[ $EUID -ne 0 ]]; then
+    echo "lamboot-reboot-once: must run as root (need to write BootNext efivar)" >&2
+    exit 3
+fi
+
+have_efibootmgr=0
+have_grub_reboot=0
+command -v efibootmgr >/dev/null 2>&1 && have_efibootmgr=1
+command -v grub-reboot >/dev/null 2>&1 && have_grub_reboot=1
+
+if (( ! have_efibootmgr && ! have_grub_reboot )); then
+    echo "lamboot-reboot-once: neither efibootmgr nor grub-reboot found" >&2
+    exit 2
+fi
+
+bootnum=""
+if (( have_efibootmgr )); then
+    # Find the first Boot#### entry whose label matches LABEL_RE.
+    # efibootmgr line format: Boot0000* LamBoot   HD(...)
+    bootnum=$(efibootmgr 2>/dev/null \
+        | awk -v re="$LABEL_RE" 'BEGIN{IGNORECASE=1} /^Boot[0-9A-Fa-f]{4}\*/ {
+            id = substr($1, 5, 4);
+            $1 = ""; sub(/^ */, "");
+            if (tolower($0) ~ tolower(re)) { print id; exit }
+        }')
+fi
+
+if [[ -n "$bootnum" ]]; then
+    if (( DRY_RUN )); then
+        echo "would: efibootmgr --bootnext $bootnum  (label match: $LABEL_RE)"
+    else
+        efibootmgr --bootnext "$bootnum" >/dev/null
+        echo "lamboot-reboot-once: BootNext=$bootnum scheduled (next boot only)"
+    fi
+elif (( have_grub_reboot )); then
+    if (( DRY_RUN )); then
+        echo "would: grub-reboot '$GRUB_LABEL'"
+        echo "note: grub-reboot 'next_entry' on LVM-backed root may persist; clear with:"
+        echo "      grub-editenv /boot/grub/grubenv unset next_entry"
+    else
+        grub-reboot "$GRUB_LABEL"
+        echo "lamboot-reboot-once: grub-reboot '$GRUB_LABEL' scheduled"
+        echo "                     (LVM-grubenv may not auto-clear; clear manually if needed)"
+    fi
+else
+    echo "lamboot-reboot-once: no matching Boot entry for /$LABEL_RE/i and no grub-reboot fallback" >&2
+    exit 1
+fi
+
+if (( REBOOT )); then
+    if (( DRY_RUN )); then
+        echo "would: reboot"
+    else
+        echo "lamboot-reboot-once: rebooting now"
+        systemctl reboot
+    fi
+fi

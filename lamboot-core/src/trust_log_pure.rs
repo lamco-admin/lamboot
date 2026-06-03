@@ -1,3 +1,5 @@
+//! Layer: 5 (cross-cutting) — Trust & Audit.
+//!
 //! Pure (no UEFI) portions of the trust-log subsystem.
 //!
 //! SDS-4 PR-4: split out so lamboot-fs-tests can include this file
@@ -82,6 +84,61 @@ pub const ALL_VERIFIED_VIA: &[&str] = &[
     V_FIRMWARE_LOADIMAGE,
 ];
 
+// ---------------------------------------------------------------------------
+// Summary boot.json trust posture (issue #5)
+//
+// The summary `boot.json` records the entry KIND (chainload/uki/linux_legacy)
+// but not HOW the binary was verified or which loader ran — that lived only
+// in the per-event trust log, so consumers could not tell a native-PE boot
+// from a firmware-LoadImage boot without parsing a second file. These pure
+// mappers derive the `verified_via` + `loader` posture from the Secure Boot
+// state and the native-PE policy so it can be surfaced in boot.json itself.
+//
+// boot.json is written pre-handoff and only on a boot that proceeds: a
+// rejected image returns to the menu and writes no report. So the success-
+// path posture below is what the boot would record — the shim case is always
+// `shim_mok` (a `shim_rejected` never reaches report-write).
+// ---------------------------------------------------------------------------
+
+/// Secure Boot posture as seen by the summary report. Pure mirror of the
+/// three live `secure::SecureBootState` cases, kept UEFI-dependency-free so
+/// the posture mapping is host-testable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReportSbState {
+    /// Secure Boot disabled.
+    Off,
+    /// Secure Boot on, shim in the chain (verification via ShimLock + MOK).
+    Shim,
+    /// Secure Boot on, no shim (LamBoot trusted directly via firmware db).
+    Direct,
+}
+
+/// `verified_via` token for the summary boot.json, by Secure Boot posture.
+/// Matches the success path of `verify_kernel_bytes`. This is a POSTURE mapper,
+/// not a per-image result — boot.json is written pre-verification (see
+/// report.rs); the authoritative outcome is the trust log's `image_verified`
+/// `status`. Both derive from the one `sb_state` detected per boot, so the
+/// posture token here is always consistent with the verify path.
+pub fn report_verified_via(sb: ReportSbState) -> &'static str {
+    match sb {
+        ReportSbState::Off => V_DEGRADED_TRUST_SB_OFF,
+        ReportSbState::Direct => V_DEGRADED_TRUST_SB_DIRECT,
+        ReportSbState::Shim => V_SHIM_MOK,
+    }
+}
+
+/// `loader` token for the summary boot.json. Chainload targets (Windows,
+/// GRUB, EFI fallback) always go through firmware `LoadImage`; for kernels
+/// and UKIs the native PE loader runs unless policy pins `native_pe = "never"`
+/// (which collapses `choose_load_path` to the firmware path).
+pub fn report_loader(native_pe_never: bool, is_chainload: bool) -> &'static str {
+    if is_chainload || native_pe_never {
+        V_FIRMWARE_LOADIMAGE
+    } else {
+        V_NATIVE_PE_LOADER
+    }
+}
+
 /// One evidence record, built up as LamBoot progresses and flushed at key points.
 #[derive(Debug, Clone)]
 pub struct TrustEvent {
@@ -154,15 +211,23 @@ impl TrustEvent {
 /// key points (after driver loads, before kernel handoff, etc.) so partial
 /// state is captured even if we crash later.
 pub struct TrustLog {
-    /// Events recorded since the last flush. Drained into `committed`
-    /// each flush; callers that only want the pending tail should use
-    /// [`TrustLog::pending_events`].
+    /// Events recorded since the last flush.
     events: Vec<TrustEvent>,
-    /// All events ever recorded this boot, preserved across flushes so that
-    /// multiple flushes produce a cumulative on-disk log rather than each
-    /// flush overwriting the last. Cleared only when a new boot begins.
+    /// All events ever recorded this boot, preserved across flushes.
     committed: Vec<TrustEvent>,
     boot_seq: u64,
+    /// When true, `record()` skips the log:: macro emission and only
+    /// pushes the event into `events`. Set via `set_quiet` from main.rs
+    /// based on `firmware_quirks.conout_fat_coupling`. On quirky
+    /// firmware (ASUS G10AJ class) the log macro inside record kills
+    /// the firmware FAT driver; on modern firmware it is safe and
+    /// useful for live console audit.
+    quiet: bool,
+    /// On-ESP path the UEFI-side wrapper writes the serialized log to.
+    /// Default is the BLS-spec `\loader\boot-trust.log`. Set via
+    /// `set_log_path` from main.rs to an alternate path when the
+    /// spec path is known-broken on the running firmware.
+    log_path: &'static str,
 }
 
 impl TrustLog {
@@ -171,21 +236,41 @@ impl TrustLog {
             events: Vec::new(),
             committed: Vec::new(),
             boot_seq: 0,
+            quiet: false,
+            log_path: "/loader/boot-trust.log",
         }
     }
 
+    /// Suppress the log:: macro emission inside record(). Used to gate
+    /// off a firmware-specific ConOut/FAT coupling that hangs the boot.
+    pub fn set_quiet(&mut self, q: bool) {
+        self.quiet = q;
+    }
+
+    /// Override the on-ESP path the UEFI-side wrapper writes to.
+    pub fn set_log_path(&mut self, p: &'static str) {
+        self.log_path = p;
+    }
+
+    /// Path the UEFI-side `flush()` wrapper writes to.
+    pub fn log_path(&self) -> &'static str {
+        self.log_path
+    }
+
     pub fn record(&mut self, ev: TrustEvent) {
-        log::info!(
-            "trust: {}{} verified_via={} status={}",
-            ev.event,
-            if ev.path.is_empty() {
-                String::new()
-            } else {
-                format!(" path={}", ev.path)
-            },
-            ev.verified_via,
-            ev.status,
-        );
+        if !self.quiet {
+            log::info!(
+                "trust: {}{} verified_via={} status={}",
+                ev.event,
+                if ev.path.is_empty() {
+                    String::new()
+                } else {
+                    format!(" path={}", ev.path)
+                },
+                ev.verified_via,
+                ev.status,
+            );
+        }
         self.events.push(ev);
     }
 
@@ -196,6 +281,29 @@ impl TrustLog {
     pub fn serialize_merged(&mut self) -> String {
         self.committed.append(&mut self.events);
         serialize_events(&self.committed, self.boot_seq)
+    }
+
+    /// Serialize ONLY the events recorded since the last flush, with seq
+    /// numbers continuing from where `committed` left off. Move them into
+    /// `committed` so the next call to `serialize_pending` only sees newly
+    /// recorded events.
+    ///
+    /// Used by the UEFI-side `flush()` wrapper to true-append only the
+    /// new tail to `\loader\boot-trust.log` rather than rewriting the
+    /// whole cumulative log on every flush — the v0.9.x todo
+    /// referenced in trust_log.rs's flush comment, finally landed in
+    /// v0.11.0 because the over-rewrite pattern was triggering a
+    /// firmware FAT-driver hang after ~14 flushes on real Proxmox
+    /// hosts (observed on pve2 / ASUS G10AJ).
+    pub fn serialize_pending(&mut self) -> String {
+        if self.events.is_empty() {
+            return String::new();
+        }
+        let start_seq = self.committed.len() as u64 + self.boot_seq;
+        let pending: Vec<TrustEvent> = self.events.drain(..).collect();
+        let serialized = serialize_events(&pending, start_seq);
+        self.committed.extend(pending);
+        serialized
     }
 
     /// Read-only view of all events committed so far this boot. Host-test

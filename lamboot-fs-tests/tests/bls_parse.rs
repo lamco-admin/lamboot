@@ -319,7 +319,7 @@ fn bls_sort_places_bad_entries_last() {
     let good = BlsEntry::parse("good.conf", "title G\nlinux /v\n").unwrap();
     let bad = BlsEntry::parse("bad+0-3.conf", "title B\nlinux /v\n").unwrap();
     let mut v = vec![bad.clone(), good.clone()];
-    v.sort_by(bls_sort_compare);
+    v.sort_by(|a, b| bls_sort_compare(a, b, false));
     assert_eq!(v[0].id, "good");
     assert_eq!(v[1].id, "bad");
 }
@@ -333,7 +333,7 @@ fn bls_sort_prefers_entries_with_sort_key() {
     let with_sk = BlsEntry::parse("a.conf", "title A\nsort-key zzzz\nlinux /v\n").unwrap();
     let without_sk = BlsEntry::parse("b.conf", "title B\nlinux /v\n").unwrap();
     let mut v = vec![without_sk, with_sk];
-    v.sort_by(bls_sort_compare);
+    v.sort_by(|a, b| bls_sort_compare(a, b, false));
     assert!(
         v[0].sort_key.is_some(),
         "entry with sort-key must come first"
@@ -353,7 +353,7 @@ fn bls_sort_version_descending_when_both_have_version() {
     let old = BlsEntry::parse("fedora-6.18.conf", "title Old\nversion 6.18\nlinux /v\n").unwrap();
     let new = BlsEntry::parse("fedora-6.19.conf", "title New\nversion 6.19\nlinux /v\n").unwrap();
     let mut v = vec![old, new];
-    v.sort_by(bls_sort_compare);
+    v.sort_by(|a, b| bls_sort_compare(a, b, false));
     assert_eq!(
         v[0].id, "fedora-6.19",
         "newer version in filename must sort first"
@@ -373,7 +373,7 @@ fn bls_sort_filename_ascending_when_missing_version() {
     let recovery =
         BlsEntry::parse("Recovery-79EB-58C6.conf", "title Recovery\nlinux /v\n").unwrap();
     let mut v = vec![recovery, pop_os];
-    v.sort_by(bls_sort_compare);
+    v.sort_by(|a, b| bls_sort_compare(a, b, false));
     assert_eq!(
         v[0].id, "Pop_OS-current",
         "#51 fix: Pop_OS must sort before Recovery"

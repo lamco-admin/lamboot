@@ -1,3 +1,5 @@
+//! Layer: 4 — Policy & State.
+//!
 //! Boot health monitoring via UEFI NVRAM variables.
 //!
 //! Implements a state machine for crash detection and recovery:
@@ -38,8 +40,10 @@ const ATTRS: VariableAttributes = VariableAttributes::NON_VOLATILE
     .union(VariableAttributes::BOOTSERVICE_ACCESS)
     .union(VariableAttributes::RUNTIME_ACCESS);
 
-/// LamBoot version packed as u32: major << 16 | minor << 8 | patch
-const LAMBOOT_VERSION: u32 = 2 << 8; // 0.2.0
+// Version constants come from `crate::version` — the single source of
+// truth derived from CARGO_PKG_VERSION. Never reintroduce a literal
+// version here. See `version.rs` for the rule and the Bug 20 history.
+use crate::version::{loader_info_utf16le, VERSION_PACKED_U32};
 
 /// Boot state machine values
 #[repr(u8)]
@@ -111,18 +115,20 @@ fn write_timestamp() -> Result {
     Ok(())
 }
 
-/// Set Boot Loader Interface variables (systemd-boot compatible)
+/// Set Boot Loader Interface variables (systemd-boot compatible).
+/// The strings are built from `crate::version` so they always match the
+/// shipping binary; never re-introduce a literal version here (Bug 20).
 fn set_loader_info() -> Result {
-    // LoaderInfo — identifies the bootloader
-    let info = b"L\0a\0m\0B\0o\0o\0t\0 \x000\0.\x002\0.\x000\0\0\0";
-    runtime::set_variable(LOADER_INFO_VAR, LOADER_VENDOR, ATTRS, info)?;
+    // LoaderInfo — UTF-16LE "LamBoot X.Y.Z\0", read by systemd-boot's bootctl
+    let info = loader_info_utf16le();
+    runtime::set_variable(LOADER_INFO_VAR, LOADER_VENDOR, ATTRS, &info)?;
 
-    // LamBootVersion — machine-readable version
+    // LamBootVersion — machine-readable packed u32 for fleet tooling
     runtime::set_variable(
         VERSION_VAR,
         LAMBOOT_VENDOR,
         ATTRS,
-        &LAMBOOT_VERSION.to_le_bytes(),
+        &VERSION_PACKED_U32.to_le_bytes(),
     )?;
 
     Ok(())
@@ -134,19 +140,26 @@ fn set_loader_info() -> Result {
 /// - Previous state Booting → crash detected → increment counter
 /// - Previous state BootedOK/Fresh → success → reset counter
 /// - Sets state to Booting, writes timestamp, sets loader info
-pub(crate) fn assess_boot_health() -> Result<u8> {
+///
+/// Infallible by design: NVRAM persistence is best-effort (a read-only or full
+/// variable store must never abort an otherwise-bootable machine), so the
+/// computed crash count is always returned — never an error.
+pub(crate) fn assess_boot_health() -> u8 {
     // vmgenid check: if VM generation changed (snapshot restore, template clone),
     // reset state to Fresh to avoid false crash loop detection
     if let Some(current_genid) = crate::partitions::read_vmgenid() {
         let stored_genid = get_vmgenid();
         if stored_genid.is_none() || stored_genid.as_ref() != Some(&current_genid) {
             log::info!("VM generation ID changed — resetting boot state");
-            set_state(BootState::Fresh)?;
-            runtime::set_variable(CRASH_COUNTER_VAR, LAMBOOT_VENDOR, ATTRS, &[0])?;
-            set_vmgenid(&current_genid)?;
+            // NVRAM persistence is best-effort: a read-only / full variable
+            // store must not abort an otherwise-bootable machine. Health
+            // tracking degrades gracefully when it can't write.
+            let _ = set_state(BootState::Fresh);
+            let _ = runtime::set_variable(CRASH_COUNTER_VAR, LAMBOOT_VENDOR, ATTRS, &[0]);
+            let _ = set_vmgenid(&current_genid);
             let _ = write_timestamp();
             let _ = set_loader_info();
-            return Ok(0);
+            return 0;
         }
     }
 
@@ -166,18 +179,21 @@ pub(crate) fn assess_boot_health() -> Result<u8> {
         }
     }
 
-    // Write updated counter
-    runtime::set_variable(CRASH_COUNTER_VAR, LAMBOOT_VENDOR, ATTRS, &[counter])?;
-
-    // Transition to Booting state
-    set_state(BootState::Booting)?;
+    // Write updated counter + transition to Booting. Both are best-effort:
+    // a machine that cannot persist health bookkeeping (read-only OVMF_VARS,
+    // exhausted variable store, locked-down firmware) is still bootable, so
+    // these writes must never abort the boot. The computed crash count is
+    // returned regardless — when persistence fails the next boot simply sees
+    // stale state, which is far better than refusing to boot at phase 1.
+    let _ = runtime::set_variable(CRASH_COUNTER_VAR, LAMBOOT_VENDOR, ATTRS, &[counter]);
+    let _ = set_state(BootState::Booting);
 
     // Record timestamp and loader info
     let _ = write_timestamp();
     let _ = set_loader_info();
 
     log::info!("Boot health: prev={prev_state:?}, crash_counter={counter}");
-    Ok(counter)
+    counter
 }
 
 /// Check if we're in a crash loop based on the threshold

@@ -15,6 +15,43 @@ default_timeout_ms = 5000
 # If not specified, the first entry by sort order is selected.
 # default_entry = "fedora-6.12.0"
 
+# v0.10 — Bug 22 / BLS sort-key cohort split levers (both ROOT-level keys).
+#
+# When a distro's kernel-install plugin emits BLS entries with
+# inconsistent `sort-key` presence across kernel-install package
+# versions (the VM 100 / Debian forky-sid case), LamBoot's spec-
+# faithful sort leaves the newest-version kernel below older
+# kernels in the menu and default-selection. Two escape hatches:
+#
+# 1) default_pattern: glob over entry.id. The default-entry selector
+#    picks the highest-version match regardless of cohort. Mirrors
+#    sd-boot's `default <machine-id>*.conf` upstream workaround
+#    (keszybz, systemd#23669). Wins over default_entry when both
+#    are set and at least one entry matches.
+# default_pattern = "bls-debian-*"
+#
+# 2) bls_ignore_sort_key (set below — TRUE by default in fresh installs
+#    from v0.11.0 onward). When true, collapses both BLS cohorts into
+#    a single ordering by (machine-id, version_compare, filename).
+#    Both menu order AND default-entry cursor honor the collapsed
+#    ordering. Fresh-install-default decision: Option D in CHANGELOG
+#    v0.11.0 — see rationale + decision matrix there.
+#
+#    Set to `false` to restore strict BLS §3.1 spec behavior (matches
+#    sd-boot). Useful on multi-OS systems where different distros'
+#    entries should remain grouped by sort-key.
+#
+#    NOTE: this key MUST live at the root of policy.toml, NOT inside a
+#    `[bls]` section. v0.10.0's parser is section-aware and looks up
+#    qualified keys like `section.key`; only the bare `bls_ignore_sort_key`
+#    at root matches. A future release may add `[bls]`-section parsing as
+#    an alias.
+bls_ignore_sort_key = true
+#
+# A runtime diagnostic detects the cohort-split condition and
+# surfaces a menu-footer notice with the recommended escape hatch;
+# no policy.toml setting needed to enable.
+
 [security]
 # Refuse to boot if Secure Boot is disabled
 secure_boot_required = false

@@ -1,3 +1,5 @@
+//! Layer: 2 — Storage & Filesystems.
+//!
 //! FAT adapter for `FsBackend`.
 //!
 //! Wraps UEFI's `SimpleFileSystem` + `File` protocols. Preserves v0.8.3
@@ -37,6 +39,14 @@ pub(crate) struct FatBackend {
     handle: Handle,
     uuid: Option<Uuid>,
     label: Option<String>,
+    /// Persistent `SimpleFileSystem` open. Lazily initialized on first
+    /// `sfs_mut()` call and reused for all subsequent reads + writes.
+    /// Avoids the per-call exclusive-open pattern that hit the
+    /// firmware FAT-driver hang on real Proxmox hosts (ASUS G10AJ:
+    /// ~14 cumulative exclusive SFS opens per boot freezes the
+    /// driver). `ScopedProtocol` releases on `FatBackend::drop`
+    /// (Volume drop = boot handoff or LamBoot exit).
+    sfs: Option<uefi::boot::ScopedProtocol<SimpleFileSystem>>,
 }
 
 impl FatBackend {
@@ -62,6 +72,7 @@ impl FatBackend {
             handle,
             uuid,
             label,
+            sfs: None,
         })
     }
 
@@ -71,9 +82,21 @@ impl FatBackend {
         self.handle
     }
 
-    fn open_root(&self) -> Result<uefi::proto::media::file::Directory, FsError> {
-        let mut fs = uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(self.handle)?;
-        let root = fs.open_volume()?;
+    /// Lazy-init + cache the persistent `SimpleFileSystem` open.
+    /// Subsequent calls return the same reference.
+    fn sfs_mut(&mut self) -> Result<&mut SimpleFileSystem, FsError> {
+        if self.sfs.is_none() {
+            let sfs = uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(self.handle)?;
+            self.sfs = Some(sfs);
+        }
+        // unwrap is safe: just set Some above
+        Ok(self.sfs.as_deref_mut().expect("just set"))
+    }
+
+    /// Open the FAT root directory using the cached SFS.
+    fn open_root(&mut self) -> Result<uefi::proto::media::file::Directory, FsError> {
+        let sfs = self.sfs_mut()?;
+        let root = sfs.open_volume()?;
         Ok(root)
     }
 }
@@ -186,6 +209,12 @@ impl FsBackend for FatBackend {
         self.label.as_deref()
     }
 
+    fn fat_sfs_mut(&mut self) -> Option<&mut SimpleFileSystem> {
+        // Initialize the cache via the same path open_root takes —
+        // first-call opens exclusively; subsequent calls reuse.
+        self.sfs_mut().ok()
+    }
+
     fn read(&mut self, path: &Path) -> Result<Vec<u8>, FsError> {
         let mut root = self.open_root()?;
         let mut file = open_file_read(&mut root, path)?;
@@ -193,7 +222,11 @@ impl FsBackend for FatBackend {
         let info = file
             .get_info::<FileInfo>(&mut info_buf)
             .map_err(|err| FsError::from(err.to_err_without_payload()))?;
-        let size = info.file_size() as usize;
+        // Clamp the allocation to the read-contract cap. file_size() is the
+        // firmware-reported FAT directory-entry size (attacker-controlled on a
+        // probed volume); checked_full_read_len also rejects a >usize::MAX size
+        // loudly rather than truncating via `as usize` on a 32-bit build.
+        let size = crate::fs_backend::checked_full_read_len(info.file_size())?;
         let mut out = vec![0u8; size];
         let got = file.read(&mut out)?;
         out.truncate(got);
@@ -310,32 +343,36 @@ impl FsStream for FatStream {
 // operation is inherently FAT-specific and needs the same CString16 conversion
 // machinery. Callers get to this through `fs_writer::EspWriter`.
 pub(crate) fn fat_rename(
-    handle: Handle,
+    sfs: &mut SimpleFileSystem,
     dir_path: &Path,
     old_name: &str,
     new_name: &str,
 ) -> Result<(), FsError> {
-    let mut fs = uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(handle)?;
-    let mut root = fs.open_volume()?;
     let old_full = dir_path.join(old_name)?;
     let new_full = dir_path.join(new_name)?;
 
-    // Read content of old file.
-    let mut old_file = open_file_read(&mut root, old_full.as_path())?;
-    let mut info_buf = vec![0u8; 512];
-    let size = old_file
-        .get_info::<FileInfo>(&mut info_buf)
-        .map_err(|err| FsError::from(err.to_err_without_payload()))?
-        .file_size() as usize;
-    let mut content = vec![0u8; size];
-    let got = old_file.read(&mut content)?;
-    content.truncate(got);
-    drop(old_file);
+    // Read content of old file (its own open_volume scope).
+    let content = {
+        let mut root = sfs.open_volume()?;
+        let mut old_file = open_file_read(&mut root, old_full.as_path())?;
+        let mut info_buf = vec![0u8; 512];
+        let size = crate::fs_backend::checked_full_read_len(
+            old_file
+                .get_info::<FileInfo>(&mut info_buf)
+                .map_err(|err| FsError::from(err.to_err_without_payload()))?
+                .file_size(),
+        )?;
+        let mut content = vec![0u8; size];
+        let got = old_file.read(&mut content)?;
+        content.truncate(got);
+        content
+    };
 
     // Write to new path (create or overwrite).
-    fat_write(handle, new_full.as_path(), &content)?;
+    fat_write(sfs, new_full.as_path(), &content)?;
 
-    // Delete old.
+    // Delete old (open_volume again — sfs is the same persistent handle).
+    let mut root = sfs.open_volume()?;
     let old_cstr = to_uefi_path(old_full.as_path())?;
     let handle_old = root.open(&old_cstr, FileMode::ReadWrite, FileAttribute::empty())?;
     if let Some(regular) = handle_old.into_regular_file() {
@@ -346,9 +383,12 @@ pub(crate) fn fat_rename(
     Ok(())
 }
 
-pub(crate) fn fat_write(handle: Handle, path: &Path, data: &[u8]) -> Result<(), FsError> {
-    let mut fs = uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(handle)?;
-    let mut root = fs.open_volume()?;
+pub(crate) fn fat_write(
+    sfs: &mut SimpleFileSystem,
+    path: &Path,
+    data: &[u8],
+) -> Result<(), FsError> {
+    let mut root = sfs.open_volume()?;
     let cstr = to_uefi_path(path)?;
 
     // Delete first so shrinking writes leave no tail bytes. UEFI's
@@ -367,22 +407,69 @@ pub(crate) fn fat_write(handle: Handle, path: &Path, data: &[u8]) -> Result<(), 
     Ok(())
 }
 
-pub(crate) fn fat_append(handle: Handle, path: &Path, data: &[u8]) -> Result<(), FsError> {
+pub(crate) fn fat_append(
+    sfs: &mut SimpleFileSystem,
+    path: &Path,
+    data: &[u8],
+) -> Result<(), FsError> {
     // Read existing content if any, append, write back. Required for the
     // UEFI-portable append semantics; set_position(file_size) + write is
     // subtly buggy on some OVMF builds (observed with boot-trust.log).
-    let mut existing = match read_through(handle, path) {
+    let mut existing = match read_through_sfs(sfs, path) {
         Ok(bytes) => bytes,
         Err(FsError::NotFound) => Vec::new(),
         Err(e) => return Err(e),
     };
     existing.extend_from_slice(data);
-    fat_write(handle, path, &existing)
+    fat_write(sfs, path, &existing)
 }
 
-pub(crate) fn fat_ensure_dir(handle: Handle, path: &Path) -> Result<(), FsError> {
-    let mut fs = uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(handle)?;
-    let mut root = fs.open_volume()?;
+/// True positional append via FileProtocol::SetPosition(u64::MAX) + Write.
+/// Writes only `data` at the current EOF — no read-modify-write of the
+/// whole file. Required to keep cumulative ESP-write count bounded on
+/// firmware whose FAT driver hangs after many full-file rewrites
+/// (observed on ASUS G10AJ at pve2: every fat_write is a full overwrite,
+/// and the 14th cumulative overwrite per boot hangs the firmware FAT
+/// driver, freezing LamBoot mid-handoff).
+///
+/// `u64::MAX` (`0xFFFFFFFFFFFFFFFF`) is the UEFI spec sentinel for
+/// EFI_FILE_PROTOCOL.SetPosition meaning "seek to end of file." Distinct
+/// from the historical `set_position(file_size) + write` pattern the
+/// old `fat_append` comment warns about — that form read the file size
+/// from FileInfo first, which has its own bugs on some OVMF builds. The
+/// sentinel form is implementation-direct in firmware and avoids the
+/// FileInfo round-trip.
+///
+/// Safety / portability note: if a particular firmware misbehaves on
+/// the sentinel form, callers can fall back to `fat_append` (the
+/// read-modify-write form) — but that defeats the point of bounded
+/// ESP-write count, so detect-and-fallback is preferable to
+/// unconditional fallback.
+pub(crate) fn fat_true_append(
+    sfs: &mut SimpleFileSystem,
+    path: &Path,
+    data: &[u8],
+) -> Result<(), FsError> {
+    let mut root = sfs.open_volume()?;
+    let cstr = to_uefi_path(path)?;
+
+    // Open in CreateReadWrite so the file is created if missing —
+    // matches the existing fat_write contract.
+    let h = root.open(&cstr, FileMode::CreateReadWrite, FileAttribute::empty())?;
+    let mut regular = h.into_regular_file().ok_or(FsError::IsDirectory)?;
+
+    // u64::MAX is the UEFI spec sentinel for "seek to EOF".
+    regular
+        .set_position(u64::MAX)
+        .map_err(|err| FsError::from(err.to_err_without_payload()))?;
+    regular
+        .write(data)
+        .map_err(|err| FsError::from(err.to_err_without_payload()))?;
+    Ok(())
+}
+
+pub(crate) fn fat_ensure_dir(sfs: &mut SimpleFileSystem, path: &Path) -> Result<(), FsError> {
+    let mut root = sfs.open_volume()?;
     let cstr = to_uefi_path(path)?;
     let h = root.open(&cstr, FileMode::CreateReadWrite, FileAttribute::DIRECTORY)?;
     drop(h);
@@ -391,9 +478,8 @@ pub(crate) fn fat_ensure_dir(handle: Handle, path: &Path) -> Result<(), FsError>
 
 /// FAT delete — used by `EspWriter::delete` for explicit file removal
 /// (e.g. by SDS-7 `lamboot-migrate` when overwriting prior migration state).
-pub(crate) fn fat_delete(handle: Handle, path: &Path) -> Result<(), FsError> {
-    let mut fs = uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(handle)?;
-    let mut root = fs.open_volume()?;
+pub(crate) fn fat_delete(sfs: &mut SimpleFileSystem, path: &Path) -> Result<(), FsError> {
+    let mut root = sfs.open_volume()?;
     let cstr = to_uefi_path(path)?;
     let h = root.open(&cstr, FileMode::ReadWrite, FileAttribute::empty())?;
     match h.into_regular_file() {
@@ -404,15 +490,19 @@ pub(crate) fn fat_delete(handle: Handle, path: &Path) -> Result<(), FsError> {
     }
 }
 
-fn read_through(handle: Handle, path: &Path) -> Result<Vec<u8>, FsError> {
-    let mut fs = uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(handle)?;
-    let mut root = fs.open_volume()?;
+/// Variant of `read_through` that uses a caller-supplied
+/// `SimpleFileSystem` rather than opening one. Used by `fat_append`
+/// (which now receives an SFS from `EspWriter`) to share the volume's
+/// cached SFS open and avoid bumping the firmware open count.
+fn read_through_sfs(sfs: &mut SimpleFileSystem, path: &Path) -> Result<Vec<u8>, FsError> {
+    let mut root = sfs.open_volume()?;
     let mut file = open_file_read(&mut root, path)?;
     let mut info_buf = vec![0u8; 512];
-    let size = file
-        .get_info::<FileInfo>(&mut info_buf)
-        .map_err(|err| FsError::from(err.to_err_without_payload()))?
-        .file_size() as usize;
+    let size = crate::fs_backend::checked_full_read_len(
+        file.get_info::<FileInfo>(&mut info_buf)
+            .map_err(|err| FsError::from(err.to_err_without_payload()))?
+            .file_size(),
+    )?;
     let mut out = vec![0u8; size];
     let got = file.read(&mut out)?;
     out.truncate(got);

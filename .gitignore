@@ -4,6 +4,15 @@ dist/
 **/*.rs.bk
 *.pdb
 
+# Release tarball staging dirs (per-version, written by the release ceremony —
+# multi-MB build-host artifacts; provenance lives in git tags + GitHub releases,
+# not in source history).
+/[0-9]*.[0-9]*.[0-9]*/
+
+# Local analysis / tooling scratch (knowledge-graph + dashboard)
+.understand-anything/
+.understand-anything-dashboard.log
+
 # ESP images for testing
 *.img
 *.vhd
@@ -44,5 +53,16 @@ PK-*.pem
 KEK-*.pem
 db-*.pem
 
+# Read-path test scratch files (manual FS read-contract probing, e.g.
+# readtest17c.txt). Root-level throwaways — never part of the source tree.
+readtest*.txt
+
 __pycache__/
 *.pyc
+
+# Test-fixture credential artifacts from archinstall runs.
+# user_configuration.json (storage layout) is fine to commit; the
+# credential files are not — even when the password is a throwaway
+# test value, the file pattern is categorically credentials.
+docs/test-fixtures/**/PASSWORDS.txt
+docs/test-fixtures/**/user_credentials.json

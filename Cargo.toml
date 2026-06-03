@@ -10,7 +10,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.9.1"
+version = "0.15.2"
 authors = ["Greg Lamberson <greg@lamco.io>", "Lamco Development <office@lamco.io>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"

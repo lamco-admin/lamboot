@@ -1,3 +1,5 @@
+//! Layer: 1 — Firmware Boundary.
+//!
 //! TPM 2.0 measured boot via TCG2 protocol.
 //!
 //! Extends PCR registers with measurements of boot components:
@@ -54,30 +56,35 @@ impl TpmContext {
         }
     }
 
-    /// Measure a kernel image into PCR 4
-    pub(crate) fn measure_kernel(&self, kernel_data: &[u8]) {
+    /// Measure a kernel image into PCR 4. Returns `true` iff the PCR was
+    /// actually extended (so the caller can record an honest trust event
+    /// rather than claiming a measurement that did not happen).
+    #[must_use]
+    pub(crate) fn measure_kernel(&self, kernel_data: &[u8]) -> bool {
         self.measure(
             PCR_BOOT_CODE,
             EventType::EFI_BOOT_SERVICES_APPLICATION,
             HashLogExtendEventFlags::PE_COFF_IMAGE,
             kernel_data,
             b"LamBoot: Kernel Image",
-        );
+        )
     }
 
-    /// Measure boot configuration (policy file) into PCR 5
-    pub(crate) fn measure_config(&self, config_data: &[u8]) {
+    /// Measure boot configuration (policy file) into PCR 5.
+    #[must_use]
+    pub(crate) fn measure_config(&self, config_data: &[u8]) -> bool {
         self.measure(
             PCR_BOOT_CONFIG,
             EventType::IPL,
             HashLogExtendEventFlags::empty(),
             config_data,
             b"LamBoot: Boot Configuration",
-        );
+        )
     }
 
-    /// Measure kernel command line into PCR 12 (UTF-16, no trailing NUL)
-    pub(crate) fn measure_cmdline(&self, cmdline: &str) {
+    /// Measure kernel command line into PCR 12 (UTF-16, no trailing NUL).
+    #[must_use]
+    pub(crate) fn measure_cmdline(&self, cmdline: &str) -> bool {
         // Convert to UTF-16 without trailing NUL (per systemd convention)
         let utf16: Vec<u16> = cmdline.encode_utf16().collect();
         let bytes: Vec<u8> = utf16.iter().flat_map(|c| c.to_le_bytes()).collect();
@@ -88,11 +95,11 @@ impl TpmContext {
             HashLogExtendEventFlags::empty(),
             &bytes,
             b"LamBoot: Kernel Command Line",
-        );
+        )
     }
 
-    /// Measure a loaded driver/module binary into PCR 4
-    pub(crate) fn measure_driver(&self, data: &[u8], path: &str) {
+    /// Measure a loaded driver/module binary into PCR 4.
+    pub(crate) fn measure_driver(&self, data: &[u8], path: &str) -> bool {
         let desc = alloc::format!("LamBoot: Driver {path}");
         self.measure(
             PCR_BOOT_CODE,
@@ -100,11 +107,11 @@ impl TpmContext {
             HashLogExtendEventFlags::PE_COFF_IMAGE,
             data,
             desc.as_bytes(),
-        );
+        )
     }
 
-    /// Measure a BLS entry file into PCR 5
-    pub(crate) fn measure_bls_entry(&self, entry_data: &[u8], entry_id: &str) {
+    /// Measure a BLS entry file into PCR 5.
+    pub(crate) fn measure_bls_entry(&self, entry_data: &[u8], entry_id: &str) -> bool {
         let desc = alloc::format!("LamBoot: BLS Entry {entry_id}");
         self.measure(
             PCR_BOOT_CONFIG,
@@ -112,10 +119,14 @@ impl TpmContext {
             HashLogExtendEventFlags::empty(),
             entry_data,
             desc.as_bytes(),
-        );
+        )
     }
 
-    /// Core measurement function — hash, extend PCR, and log event.
+    /// Core measurement function — hash, extend PCR, and log event. Returns
+    /// `true` iff the PCR was actually extended; `false` when the TPM is
+    /// absent, the protocol won't open, or the extend call fails (all
+    /// non-fatal — measured boot never blocks boot). The boolean lets callers
+    /// record `kernel_measured` only when a real extend occurred.
     #[expect(
         clippy::unused_self,
         reason = "TpmContext methods keep &self for API consistency — future implementations will use stored protocol handle"
@@ -127,13 +138,13 @@ impl TpmContext {
         flags: HashLogExtendEventFlags,
         data: &[u8],
         description: &[u8],
-    ) {
+    ) -> bool {
         let Ok(handle) = uefi::boot::get_handle_for_protocol::<Tcg>() else {
-            return; // No TPM, silently succeed
+            return false; // No TPM — no extend happened.
         };
 
         let Ok(mut tcg) = uefi::boot::open_protocol_exclusive::<Tcg>(handle) else {
-            return;
+            return false;
         };
 
         // Create event input
@@ -142,7 +153,7 @@ impl TpmContext {
                 Ok(e) => e,
                 Err(e) => {
                     log::warn!("Failed to create PCR event: {e:?}");
-                    return;
+                    return false;
                 }
             };
 
@@ -150,10 +161,12 @@ impl TpmContext {
         match tcg.hash_log_extend_event(flags, data, &event) {
             Ok(()) => {
                 log::info!("TPM: measured {} bytes into PCR {}", data.len(), pcr.0);
+                true
             }
             Err(e) => {
                 log::warn!("TPM measurement failed for PCR {}: {e:?}", pcr.0);
                 // Non-fatal — never block boot for TPM errors
+                false
             }
         }
     }

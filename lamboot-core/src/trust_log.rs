@@ -1,3 +1,5 @@
+//! Layer: 5 (cross-cutting) — Trust & Audit.
+//!
 //! Trust-evidence log — UEFI-side wrapper.
 //!
 //! The schema, event builder, accumulator, stable vocabulary, and JSON-Lines
@@ -41,34 +43,54 @@ pub(crate) use crate::trust_log_pure::{
 };
 use crate::{fs::Volume, fs_backend::PathBuf, fs_writer::EspWriter};
 
-const LOG_PATH: &str = "/loader/boot-trust.log";
+// Default trust log path lives on the TrustLog struct (see
+// trust_log_pure.rs) and is BLS-spec `\loader\boot-trust.log`.
+// main.rs may call `set_log_path` to point at the alternate path
+// when on quirky firmware. The const below is retained as the
+// fallback for callers that didn't go through the runtime setter.
+#[expect(dead_code, reason = "kept as documentation of the spec path")]
+const SPEC_LOG_PATH: &str = "/loader/boot-trust.log";
 
 impl TrustLog {
-    /// Flush all accumulated events to `\loader\boot-trust.log` on the ESP.
-    /// Preserves all events recorded this boot across multiple flushes by
-    /// keeping an internal `committed` list and rewriting the full cumulative
-    /// log on each flush. (`EspWriter::write` overwrites; proper append via
-    /// `FileProtocol::Write` at current EOF is a Path G v0.9.x task.)
+    /// Flush events recorded since the last flush via true positional
+    /// append. Only the new tail is written each call — the
+    /// previously-flushed events remain on disk as-is.
+    ///
+    /// v0.11.0: switched from `EspWriter::write` (full-file overwrite)
+    /// to `EspWriter::true_append` (SetPosition(u64::MAX) + Write of
+    /// new bytes only). The overwrite pattern triggered a firmware
+    /// FAT-driver hang after ~14 cumulative full-file rewrites per
+    /// boot on real Proxmox hosts (observed on pve2 / ASUS G10AJ),
+    /// freezing LamBoot mid-kernel-handoff. True append keeps per-flush
+    /// cost O(new-bytes) instead of O(cumulative-bytes), bounding the
+    /// ESP-write work per boot and matching the BLS-spec expectation
+    /// that audit-style logs are append-only.
+    ///
+    /// First flush of a boot starts at file EOF — if a prior boot's
+    /// log was left in place the new events append after it. The boot
+    /// header (`boot_start` event) is sequence-numbered to make
+    /// per-boot grouping post-hoc easy.
+    ///
     /// Best-effort: errors are logged but do not propagate.
     pub(crate) fn flush(&mut self, esp: &mut Volume) {
         if self.pending_events().is_empty() {
             return;
         }
 
-        let buf = self.serialize_merged();
+        let buf = self.serialize_pending();
         let cumulative = self.committed_events().len();
 
         let Some(mut writer) = EspWriter::new(esp) else {
             log::warn!("trust-log write skipped: target volume is not FAT");
             return;
         };
-        let Ok(path) = PathBuf::from_str(LOG_PATH) else {
+        let Ok(path) = PathBuf::from_str(self.log_path()) else {
             log::warn!("trust-log write skipped: log path failed canonicalization");
             return;
         };
-        match writer.write(path.as_path(), buf.as_bytes()) {
-            Ok(()) => log::debug!("trust-log flushed ({cumulative} events cumulative)"),
-            Err(e) => log::warn!("trust-log write failed: {e}"),
+        match writer.true_append(path.as_path(), buf.as_bytes()) {
+            Ok(()) => log::debug!("trust-log appended ({cumulative} events cumulative)"),
+            Err(e) => log::warn!("trust-log append failed: {e}"),
         }
     }
 }

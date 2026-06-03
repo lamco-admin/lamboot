@@ -115,7 +115,7 @@ Every signed LamBoot binary includes a `.sbat` PE section:
 
 ```csv
 sbat,1,SBAT Version,sbat,1,https://github.com/rhboot/shim/blob/main/SBAT.md
-lamboot,1,Lamco Development,lamboot,0.9.1,https://github.com/lamco-admin/lamboot
+lamboot,1,Lamco Development,lamboot,0.12.0,https://github.com/lamco-admin/lamboot
 ```
 
 When a security vulnerability is found and fixed:
@@ -222,7 +222,6 @@ Both are complementary. LamBoot implements both.
 - [Security Guide](SECURITY-GUIDE.md) — TPM, crash loop, boot counting
 - [Install Reference](INSTALL-REFERENCE.md) — lamboot-install CLI
 - [Proxmox Guide](PROXMOX-GUIDE.md) — VM deployment
-- [Roadmap](ROADMAP.md) — integration timeline
 
 ---
 

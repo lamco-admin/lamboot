@@ -1,7 +1,7 @@
 # LamBoot Developer Guide
 
-**Version:** 0.8.3
-**Updated:** 2026-04-21
+**Version:** 0.13.0
+**Updated:** 2026-06-01
 **Audience:** new contributors, integrators, and anyone reading the LamBoot source
 
 ---
@@ -18,13 +18,15 @@ lamboot-dev/
 ├── lamboot-core/                  The bootloader
 │   ├── Cargo.toml
 │   └── src/
-│       ├── main.rs                Orchestration — 10-phase boot flow
-│       ├── bls.rs                 BLS Type 1 parser (UAPI.10 version sort, boot counting)
+│       ├── main.rs                Layer 7 — orchestration, 10-phase boot flow
+│       ├── boot_types.rs          Layer 3 — shared BootEntry/EntryKind/Icon + preflight result types
+│       ├── bls_parse.rs           Layer 3 — pure BLS Type 1 parser (UAPI.10 version sort)
+│       ├── bls.rs                 Layer 4 — BLS coordinator (boot counting, default selection inputs)
 │       ├── boot.rs                Chainload, UKI, Linux boot under SecurityOverride
 │       ├── console.rs             Serial/text console fallback menu
 │       ├── discovery.rs           BLS-first entry discovery with ESP fallback
 │       ├── drivers.rs             EFI filesystem driver loader, trust events
-│       ├── fs.rs                  ESP mount, volume I/O, multi-partition scan
+│       ├── fs.rs                  Layer 2 — ESP mount, volume I/O, multi-partition scan
 │       ├── gui.rs                 Double-buffered framebuffer, boot menu
 │       ├── health.rs              NVRAM state machine, Boot Loader Interface vars
 │       ├── initrd.rs              LoadFile2 provider for Linux initrd
@@ -46,12 +48,15 @@ lamboot-dev/
 │   ├── sign-lamboot.sh            Sign bootloader + drivers + modules
 │   ├── sign-unlock / sign-lock    Session-cached signing-key unlock
 │   ├── lamboot-monitor.py         Proxmox host-side VM boot health monitor
+│   ├── layer-map.toml             Source of truth for the 8-layer module map
+│   ├── check-layers.py            Enforces layer declarations + acyclic dependency DAG
 │   └── build-ovmf-vars.sh         Build pre-enrolled OVMF_VARS
-├── docs/                          User-facing documentation
+├── docs/                          User-facing documentation (ARCHITECTURE-LAYERS.md is authoritative for layers)
 ├── examples/                      Sample policy.toml, BLS entries
 ├── dist/                          Build output (gitignored)
 ├── keys/                          Signing keys (gitignored)
-└── .githooks/                     pre-commit: fmt + clippy + cargo check
+├── .github/workflows/ci.yml       CI: fmt + clippy + cargo check + layer contract
+└── .githooks/                     pre-commit: fmt + clippy + cargo check + layer contract
 ```
 
 ---
@@ -129,13 +134,14 @@ See `CLAUDE.md` in the repo root for the canonical rules. Summary:
 
 1. **Create the module.** `lamboot-core/src/netboot.rs`.
 2. **Choose a domain-specific name.** Not `network.rs`; maybe `pxe.rs` or `http_boot.rs` depending on the protocol.
-3. **Declare in `main.rs`.**
+3. **Declare the module's layer.** Add a `//! Layer: N` doc comment at the top of the file, choosing the layer per `docs/ARCHITECTURE-LAYERS.md` (a network-boot subsystem that loads external code is typically Layer 4). Add a matching entry to `tools/layer-map.toml`, then run `python3 tools/check-layers.py`. The checker fails on a missing declaration or any upward dependency (a lower layer importing a higher one) — the module graph must stay an acyclic DAG. The pre-commit hook and CI both enforce this, so run it before you commit.
+4. **Declare in `main.rs`.**
    ```rust
    mod netboot;
    ```
-4. **Wire into the boot flow.** `main.rs` is the orchestration. Add a phase with a log line and explicit ordering relative to other phases. Don't hide cross-phase state in globals; pass it through function arguments.
-5. **Record trust events.** If your subsystem loads code from an external source, push a `TrustEvent` so the boot-trust log captures the decision.
-6. **Test in QEMU.** Add a harness script if the setup is non-trivial.
+5. **Wire into the boot flow.** `main.rs` is the orchestration (Layer 7). Add a phase with a log line and explicit ordering relative to other phases. Don't hide cross-phase state in globals; pass it through function arguments.
+6. **Record trust events.** If your subsystem loads code from an external source, push a `TrustEvent` so the boot-trust log captures the decision.
+7. **Test in QEMU.** Add a harness script if the setup is non-trivial.
 
 **Example: adding a diagnostic module.**
 
@@ -213,6 +219,7 @@ The signing script uses `llvm-objcopy` to embed the SBAT section; falls back to 
 1. `cargo fmt --check` (nightly)
 2. `cargo clippy` — all warnings treated as errors
 3. `cargo check --target x86_64-unknown-uefi`
+4. `python3 tools/check-layers.py` — the layer contract: every module must carry a `//! Layer: N` declaration matching `tools/layer-map.toml`, and the dependency graph must stay an acyclic DAG with no upward edges. `.github/workflows/ci.yml` runs the same four checks on every push.
 
 Enabled via `git config core.hooksPath .githooks` (already set in this repo). To run manually:
 

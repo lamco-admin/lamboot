@@ -1,0 +1,53 @@
+#!/bin/bash
+# /etc/kernel/postinst.d/zzzz-lamboot-proxmox
+#
+# Proxmox-host LamBoot kernel-upgrade trigger. Fires AFTER
+# zz-proxmox-boot has refreshed BLS entries on all configured ESPs
+# (proxmox-boot-uuids). The four-z prefix sorts strictly after
+# `zz-proxmox-boot` to ensure proxmox-boot-tool's writes are complete
+# before we amend them.
+#
+# Called by dpkg postinst when a kernel is installed. Arguments:
+#   $1  KERNEL_VERSION   (e.g. 6.14.8-2-pve)
+#   $2  KERNEL_IMAGE     (path to vmlinuz, optional)
+#
+# Only fires on Proxmox-host installs (detected by the marker file
+# /etc/lamboot/proxmox-host.conf that lamboot-install --proxmox-host
+# creates). On any other system this is a no-op so the trigger can be
+# safely shipped in the lamboot package without affecting non-Proxmox
+# Debian/Ubuntu users.
+#
+# Action: invoke lamboot-bls-amend.service if systemd is available
+# (PATH B with proxmox-boot-tool); otherwise call lamboot-install
+# --refresh directly (PATH A with cmdline-sync).
+
+set -uo pipefail
+
+# Gate: only run if this is a Proxmox-host LamBoot install
+[ -f /etc/lamboot/proxmox-host.conf ] || exit 0
+
+# Gate: lamboot-install must exist (package may have been removed
+# while the hook is still in /etc — dpkg cleanup race)
+[ -x /usr/bin/lamboot-install ] || exit 0
+
+KERNEL_VERSION="${1:-}"
+
+# Detect PATH B (proxmox-boot-tool / ESP mirror) vs PATH A.
+# PATH B: /etc/kernel/proxmox-boot-uuids exists and has at least one entry.
+PATH_B=0
+if [ -s /etc/kernel/proxmox-boot-uuids ]; then
+    PATH_B=1
+fi
+
+if (( PATH_B )) && systemctl --quiet is-active multi-user.target 2>/dev/null; then
+    # Async via systemd so dpkg's postinst returns quickly. The amend
+    # service runs `lamboot-install --refresh --quiet` which is itself
+    # idempotent.
+    systemctl --no-block start lamboot-bls-amend.service 2>/dev/null || \
+        /usr/bin/lamboot-install --refresh --quiet 2>&1 || true
+else
+    # PATH A or systemd unavailable — run synchronously.
+    /usr/bin/lamboot-install --refresh --quiet 2>&1 || true
+fi
+
+exit 0

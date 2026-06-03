@@ -1,15 +1,15 @@
 # LamBoot Security Guide
 
-**Version:** 0.8.3
-**Updated:** 2026-04-21
+**Version:** 0.12.0
+**Updated:** 2026-05-30
 
-> **Note:** This document is retained for historical reference. For v0.8.3, the authoritative security documentation is:
+> **Note:** This document is retained for historical reference. The authoritative security documentation is:
 > - [`SECURITY-MODEL.md`](SECURITY-MODEL.md) — honest threat model (what LamBoot defends vs. what it doesn't)
 > - [`SECURE-BOOT-DEPLOYMENT.md`](SECURE-BOOT-DEPLOYMENT.md) — four Secure Boot deployment configurations
 > - [`KEY-GENERATION.md`](KEY-GENERATION.md) — production PK/KEK/db key hierarchy
 > - [`MOK-ENROLLMENT-GUIDE.md`](MOK-ENROLLMENT-GUIDE.md) — MokManager walkthrough
 >
-> The content below is still accurate but less complete than the v0.8.3 model doc.
+> The content below is still accurate but less complete than the threat-model doc.
 
 ---
 

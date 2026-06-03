@@ -1,0 +1,117 @@
+# LamBoot module → layer map (authoritative, machine-checked)
+#
+# This is the single source of truth for the layer contract. tools/check-layers.py
+# enforces two rules against it:
+#   1. Declaration: every lamboot-core/src/*.rs module must carry a matching
+#      `//! Layer: N` (or `//! Layer: N (tag)`) doc comment.
+#   2. Direction: a module may depend (via `use crate::X`) only on modules whose
+#      layer is <= its own, EXCEPT dependencies on `cross_cutting` modules, which
+#      any layer may use (they are written-to/observed from above, never the
+#      reverse), and within a `pure` pair (the pure half and its io shell share a
+#      layer number).
+#
+# Layer numbering follows docs/ARCHITECTURE-LAYERS.md, corrected to match the
+# shipped code (the post-v0.13.0 boot_types extraction). The graph is a verified
+# acyclic DAG (tools/check-layers.py --graph proves it).
+#
+# Semantic layers (low → high):
+#   0  Platform Introspection   — pure-read environment discovery
+#   1  Firmware Boundary         — direct UEFI protocol access
+#   2  Storage & Filesystems     — block I/O + FsBackend family + write path
+#   3  Parsers & Shared Types    — pure parsers + the structured types they yield
+#   4  Policy & State            — config-driven decisions, NVRAM state
+#   5  Trust & Audit             — append-only evidence (cross-cutting; see below)
+#   6  Presentation              — GUI / console / input
+#   7  Orchestration             — boot-flow assembly, cross-backend aggregation
+#
+# Cross-cutting modules carry `//! Layer: N (cross-cutting)` and are exempt from
+# the direction rule as a dependency *target* (anything may use them):
+#   diag (breadcrumb sink), version (build identity), telemetry (timing),
+#   trust_log/trust_log_pure (audit log — the doc's original Layer-5 exemption).
+#
+# Pure pairs carry `//! Layer: N (pure)` on the pure half; both halves share N:
+#   bls_parse↔bls, pe_loader_pure↔pe_loader, trust_log_pure↔trust_log,
+#   discovery_pure↔discovery.
+
+[layers]
+# --- Layer 0: Platform Introspection ---
+acpi          = 0
+hypervisor    = 0
+smbios        = 0
+fw_cfg        = 0
+fw_cfg_config = 0
+secure        = 0          # SB-state query (pure firmware-var read; no side effects)
+sb_classify_pure = 0       # (pure) — SecureBoot-read classification + retry (host-tested)
+input         = 0          # raw key/pointer event source
+
+# --- Layer 1: Firmware Boundary ---
+security_override = 1
+tpm               = 1
+firmware_quirks   = 1
+
+# --- Layer 2: Storage & Filesystems (read backends + write path) ---
+fs_types                = 2
+read_limit_pure         = 2          # (pure) — full-file read-size cap + bounds check (host-tested)
+fs_backend              = 2
+fs_backend_fat          = 2
+fs_backend_fat_ro       = 2          # native read-only FAT reader (fatfs over BlockIO)
+fs_backend_ext4         = 2
+fs_backend_btrfs        = 2
+fs_backend_lvm          = 2
+fs_backend_lvm_btrfs    = 2
+fs_backend_lvm_dispatch = 2
+fs_backend_lvm_fat      = 2          # FAT-on-LVM (fatfs over OwnedLvReader)
+fs                      = 2
+fs_writer               = 2          # the write path — Layer 2 (write)
+initrd                  = 2          # LoadFile2 initrd provider; reads via fs
+
+# --- Layer 3: Parsers & Shared Types ---
+bls_parse      = 3          # (pure) — the real BLS parser
+pe_loader_pure = 3          # (pure)
+discovery_pure = 3          # (pure)
+boot_types     = 3          # shared boot-entry + preflight data types
+uki            = 3          # UKI section parser
+pe_loader      = 3          # native PE loader (io shell over pe_loader_pure)
+
+# --- Layer 4: Policy & State ---
+policy           = 4
+boot_route_pure  = 4          # (pure) — native-vs-firmware load-route decision (host-tested)
+autodiscovery = 4
+preflight     = 4
+health        = 4
+partitions    = 4          # GPT/XBOOTLDR discovery feeding policy/state
+drivers       = 4          # policy-gated legacy FS-driver loader
+bls           = 4          # BLS discovery coordinator (io shell over the L3 bls_parse;
+                           #   drives health boot-counter + autodiscovery — Policy & State)
+
+# --- Layer 5: Trust & Audit (cross-cutting) ---
+trust_log      = 5          # (cross-cutting)
+trust_log_pure = 5          # (cross-cutting, pure)
+report         = 5
+bootlog        = 5
+telemetry      = 5          # (cross-cutting)
+diag           = 5          # (cross-cutting) breadcrumb sink
+version        = 5          # (cross-cutting) build identity
+
+# --- Layer 6: Presentation ---
+gui     = 6
+console = 6
+
+# --- Layer 7: Orchestration ---
+boot      = 7
+discovery = 7          # cross-backend aggregation (io shell over discovery_pure)
+main      = 7          # the 10-phase boot flow
+
+[cross_cutting]
+# Modules any layer may depend on (audit/diagnostic sinks + build identity).
+modules = ["diag", "version", "telemetry", "trust_log", "trust_log_pure"]
+
+[pure_pairs]
+# pure half = io shell (share a layer number; the pure→io direction is allowed
+# within the pair even though textually the io shell is "higher").
+# Note: bls_parse(L3)↔bls(L4) is NOT listed — bls is a genuine Layer-4
+# coordinator (drives health + autodiscovery), so bls→bls_parse is an ordinary
+# downward edge, not a same-layer pure-pair exemption.
+pe_loader_pure = "pe_loader"
+trust_log_pure = "trust_log"
+discovery_pure = "discovery"

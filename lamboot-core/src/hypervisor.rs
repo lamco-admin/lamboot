@@ -1,3 +1,5 @@
+//! Layer: 0 — Platform Introspection.
+//!
 //! Hypervisor detection via CPUID.
 //!
 //! Detects whether LamBoot is running inside a virtual machine and
