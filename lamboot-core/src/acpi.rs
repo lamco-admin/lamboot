@@ -174,7 +174,7 @@ fn parse_xsdt(xsdt_ptr: *const u8) -> Option<Vec<*const u8>> {
     }
 
     let table_length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-    if table_length < 36 || table_length > MAX_ACPI_TABLE_LEN {
+    if !(36..=MAX_ACPI_TABLE_LEN).contains(&table_length) {
         return None;
     }
 
@@ -217,7 +217,7 @@ fn parse_rsdt(rsdt_ptr: *const u8) -> Option<Vec<*const u8>> {
     }
 
     let table_length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-    if table_length < 36 || table_length > MAX_ACPI_TABLE_LEN {
+    if !(36..=MAX_ACPI_TABLE_LEN).contains(&table_length) {
         return None;
     }
 
@@ -262,7 +262,7 @@ fn parse_dmar(table_ptr: *const u8, info: &mut IommuInfo) {
     // 8-byte prefix is the minimum any SDT carries.
     let prefix = unsafe { core::slice::from_raw_parts(table_ptr, 8) };
     let table_length = u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]) as usize;
-    if table_length < 48 || table_length > MAX_ACPI_TABLE_LEN {
+    if !(48..=MAX_ACPI_TABLE_LEN).contains(&table_length) {
         return;
     }
 
@@ -407,7 +407,7 @@ fn parse_ivrs(table_ptr: *const u8, info: &mut IommuInfo) {
     // 8-byte prefix is the minimum any SDT carries.
     let prefix = unsafe { core::slice::from_raw_parts(table_ptr, 8) };
     let table_length = u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]) as usize;
-    if table_length < 48 || table_length > MAX_ACPI_TABLE_LEN {
+    if !(48..=MAX_ACPI_TABLE_LEN).contains(&table_length) {
         return;
     }
 

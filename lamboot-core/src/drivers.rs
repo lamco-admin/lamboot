@@ -51,7 +51,19 @@ fn filesystem_natively_covered(driver_filename: &str) -> bool {
     if lower.starts_with("fat_") || lower.starts_with("vfat_") {
         return true;
     }
-    // xfs/zfs/ntfs/f2fs/iso9660 — no native backend yet.
+    // lamzfs covers a read-only ZFS boot pool (single/mirror/raidz1) and lamxfs
+    // covers XFS. Both ship a legacy EfiFs driver in the tarball, and skipping it
+    // is load-bearing: a loaded EfiFs driver attaches to the partition BY_DRIVER
+    // and exposes it as a generic SimpleFileSystem, shadowing the native backend
+    // (the partition then enumerates as a foreign "FAT" volume and the native
+    // probe's exclusive open can be refused on firmware that won't force-
+    // disconnect the driver). The XFS entry corrects the same gap, confirmed via
+    // the ZFS live-boot test.
+    if lower.starts_with("zfs_") || lower.starts_with("xfs_") {
+        return true;
+    }
+    // ntfs/f2fs/iso9660 — no native backend yet. exFAT has a native backend
+    // (lamexfat) but ships no legacy driver, so it needs no skip entry.
     false
 }
 

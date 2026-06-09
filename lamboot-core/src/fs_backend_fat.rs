@@ -84,6 +84,10 @@ impl FatBackend {
 
     /// Lazy-init + cache the persistent `SimpleFileSystem` open.
     /// Subsequent calls return the same reference.
+    #[expect(
+        clippy::expect_used,
+        reason = "infallible: Some is set immediately above"
+    )]
     fn sfs_mut(&mut self) -> Result<&mut SimpleFileSystem, FsError> {
         if self.sfs.is_none() {
             let sfs = uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(self.handle)?;

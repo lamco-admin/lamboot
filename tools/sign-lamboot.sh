@@ -2,7 +2,7 @@
 # Sign LamBoot EFI binaries for Secure Boot.
 #
 # Prerequisites:
-#   - keys/db.key and keys/db.crt must exist (see docs/KEY-GENERATION.md)
+#   - keys/db.key and keys/db.crt must exist (see https://lamco.ai/products/lamboot/docs/key-generation/)
 #   - sbsign, sbverify, objcopy, openssl installed
 #
 # Usage:
@@ -49,7 +49,7 @@ fi
 # Sanity checks
 if [ ! -f "$DB_KEY" ]; then
     echo "ERROR: signing key not found at $DB_KEY" >&2
-    echo "Generate production keys per docs/KEY-GENERATION.md first." >&2
+    echo "Generate production keys per https://lamco.ai/products/lamboot/docs/key-generation/ first." >&2
     exit 1
 fi
 

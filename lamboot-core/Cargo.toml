@@ -22,7 +22,42 @@ ext4-view = { version = "=0.9.3", default-features = false }
 # (same discipline as ext4-view). Features: enable all three compression
 # backends (zstd default + zlib + lzo) so any distro's btrfs /boot is
 # readable regardless of compress=… mount opt.
-lambutter = { version = "=0.3.0", default-features = false, features = ["zstd", "zlib", "lzo"] }
+lambutter = { version = "=0.3.1", default-features = false, features = ["zstd", "zlib", "lzo"] }
+
+# Path B (native XFS read backend): lamxfs is the Lamco-authored clean-room
+# no_std read-only XFS reader — the #1 RHEL-family de-bundling gap (XFS is the
+# default /boot+/ on RHEL/Rocky/Alma/Oracle/Amazon). Same architectural role as
+# lambutter for btrfs and ext4-view for ext4. Published to crates.io as
+# `lamxfs`; exact-pinned per SDS-2 §11.2 so a lamxfs minor bump is a deliberate
+# lamboot change, not silent drift. no_std by default (no `std` feature) — the
+# read path forbids unsafe and never panics on hostile media.
+lamxfs = { version = "=0.1.0", default-features = false }
+
+# Native read-only exFAT backend: lamexfat is the Lamco-authored no_std reader
+# for removable/utility media — an exFAT USB stick or SD card holding a kernel +
+# initrd or a boot image (including the >4 GiB payloads FAT32 cannot hold). exFAT
+# is never the ESP and never a Linux root, so it does not overlap the
+# ext4/btrfs/xfs/FAT backends. Published to crates.io as `lamexfat`; exact-pinned
+# per SDS-2 §11.2 so a minor bump is a deliberate lamboot change, not silent
+# drift. no_std by default; the read path forbids unsafe and caps every
+# allocation against a hostile DataLength.
+lamexfat = { version = "=0.1.0", default-features = false }
+
+# Native read-only ZFS backend: lamzfs is the Lamco-authored no_std reader for a
+# ZFS boot pool — the unencrypted `bpool` of an Ubuntu/Debian root-on-ZFS install
+# (kernels + initrds under bpool/BOOT/<id>). Single / mirror / raidz1, all six
+# OpenZFS codecs, scalar-only and #![forbid(unsafe_code)]. A whole ZFS member is
+# never the ESP and never read by the ext4/btrfs/xfs backends, so it does not
+# overlap them. Published to crates.io as `lamzfs`; exact-pinned per SDS-2 §11.2
+# so a minor bump is a deliberate lamboot change, not silent drift. default
+# features off; codecs + mirror enabled explicitly.
+lamzfs = { version = "=0.1.1", default-features = false, features = [
+    "lz4",
+    "zstd",
+    "gzip",
+    "lzjb",
+    "mirror",
+] }
 
 # lamlvm: Lamco-authored no_std read-only LVM2 PV/VG/LV parser. Vendored +
 # modernized fork of main--/rust-lvm2 (MIT). Used by `fs_backend_lvm` to
@@ -31,7 +66,7 @@ lambutter = { version = "=0.3.0", default-features = false, features = ["zstd", 
 # Published to crates.io as `lamlvm`. Exact-pinned per SDS-2 §11.2 so a lamlvm
 # minor bump is a deliberate lamboot change, not silent drift (same discipline
 # as ext4-view above).
-lamlvm = { version = "=0.1.0", default-features = false }
+lamlvm = { version = "=0.1.1", default-features = false }
 
 # embedded-io: required to bridge UEFI BlockIO into the no_std `Read + Seek`
 # trait surface that lamlvm consumes. Same version line lamlvm pins.
@@ -39,26 +74,53 @@ embedded-io = { version = "0.6", default-features = false, features = ["alloc"] 
 
 # FatRo: native read-only FAT reader for non-ESP FAT volumes the firmware
 # refuses to serve (separate vfat /boot on OVMF/i440FX — root cause memory
-# obs 4d6f6a9a). Pinned to a git rev: the no_std IoBase/Read/Write/Seek
-# surface only exists on the unpublished 0.4.0 master line; crates.io 0.3.6 is
-# std/core_io-based. RO-by-construction — consumed only through `FsBackend`
-# (read surface); `BackendTag::FatRo` is rejected by `EspWriter::new`, so the
-# native FAT path has no constructible write surface. Features: `alloc`
-# (LamBoot is alloc) + `lfn` (so `vmlinuz-*` long names resolve); `unicode`
-# omitted (kernel/initrd names are ASCII) to keep the signed binary smaller.
-# Vendoring + supply-chain audit is the productionization follow-up.
-fatfs = { git = "https://github.com/rafalh/rust-fatfs", rev = "c4b88477b22ca7e5131fbd8891f62a5deaa88e6e", default-features = false, features = ["alloc", "lfn"] }
+# obs 4d6f6a9a). Backed by `lamfat` — Lamco's crates.io republish of the fatfs
+# no_std 0.4.0 line (the only one with the IoBase/Read/Write/Seek surface), which
+# republishes exactly the commit this used to git-pin (c4b88477). Imported under
+# the local name `fatfs` (package = "lamfat") so the FatRo code is unchanged.
+# Exact-pinned per SDS-2 §11.2 — a lamfat bump is a deliberate lamboot change,
+# not silent drift (same discipline as ext4-view / lambutter / lamlvm). RO-by-
+# construction — consumed only through `FsBackend` (read surface); `BackendTag::
+# FatRo` is rejected by `EspWriter::new`, so the native FAT path has no
+# constructible write surface. Features: `alloc` (LamBoot is alloc) + `lfn` (so
+# `vmlinuz-*` long names resolve); `unicode` omitted (kernel/initrd names are
+# ASCII) to keep the signed binary smaller.
+fatfs = { package = "lamfat", version = "=0.4.2", default-features = false, features = ["alloc", "lfn"] }
 
-# SDS-3: native PE loader. Exact-pinned per spec §11 version-pinning
-# policy. `pe64` enables 64-bit PE parsing (the only format we support
-# per spec §5.1); `endian_fd` enables scroll-based endian-aware parsing.
-# Default features pull in `std` — disable.
-goblin = { version = "=0.10.5", default-features = false, features = ["pe64", "endian_fd"] }
+# lamfold: the Lamco-authored no_std read-only media-filesystem stack (Family A:
+# iso/udf/squashfs/erofs/cramfs/romfs/cpio over a BlockSource, with the fs-verity
+# "shepherd" integrity seam). Consumed per SPEC-LAMFOLD-INTEGRATION: lamboot-core
+# bridges its own BlockSource to lamfold's via SourceReader, then
+# LamfoldBackend<S,F> adapts each FoldFrontend to FsBackend. crates.io exact-pins
+# (SDS-2 §11.2 — the lambutter/lamlvm discipline; a minor bump is a deliberate
+# lamboot change, never silent drift, and the offline Debian -Zbuild-std build
+# forbids git/path deps). RO-by-construction: every lamfold backend is read-only
+# and rejected by EspWriter. `default-features = false` drops each frontend's
+# host-only `std`; the codecs are pulled by feature: erofs→verity+lz4+deflate+
+# zstd+lzma (the full compressed-COMPACT head set — RHEL/immutable-distro EROFS
+# defaults to deflate/zstd/lzma over big-pcluster), iso/cramfs→deflate. Phase 1
+# wires the low-risk frontends; squash (xz/zstd/lzo) and udf land in phase 2.
+lamfold = { version = "=0.1.1", default-features = false, features = ["verify"] }
+lamfold-erofs = { version = "=0.1.1", default-features = false, features = ["verity", "lz4", "deflate", "zstd", "lzma"] }
+lamfold-iso = { version = "=0.1.0", default-features = false, features = ["zisofs"] }
+lamfold-cramfs = { version = "=0.1.0", default-features = false }
+lamfold-romfs = { version = "=0.1.0", default-features = false }
+lamfold-cpio = { version = "=0.1.0", default-features = false }
+# Phase 2: squash (all five codecs — gzip/xz/zstd/lz4/lzo, pulling ruzstd/
+# lzma-rust2/lzokay, all verified to build no_std-UEFI) + udf (no codec).
+lamfold-squash = { version = "=0.1.0", default-features = false, features = ["gzip", "xz", "zstd", "lz4", "lzo"] }
+lamfold-udf = { version = "=0.1.0", default-features = false }
+
+# SDS-3: the native PE loader (`pe_loader_pure.rs`) hand-rolls its PE/COFF
+# header read from fixed offsets — no third-party PE parser. goblin was
+# removed in the v0.16.x fix: its 0.9.3 `Header::parse` rejected the Linux
+# EFI-stub layout (omitted DOS stub, e_lfanew == 0x40), and dropping it
+# also removes `plain`/`scroll` from the Debian-archive dependency set.
 
 # SDS-3: SHA-256 for trust-log `image_loaded_native` events. Pure
 # software — `asm` feature requires nightly + arch-specific assembly,
 # keep off. Default features pull in `std`; disable.
-sha2 = { version = "=0.10.8", default-features = false }
+sha2 = { version = "=0.10.9", default-features = false }
 
 [lints]
 workspace = true

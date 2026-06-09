@@ -55,6 +55,27 @@ pub(crate) enum EntryKind {
         initrd_paths: Vec<String>,
         options: String,
     },
+    /// Boot an OS from an ISO9660 medium (SPEC-BOOT-FROM-ISO). The source —
+    /// either an `.iso` file on a mounted volume or a physical optical drive —
+    /// is carried by [`IsoSource`]; the loopback/optical mount + Path-A
+    /// resolution happen at boot time.
+    Iso {
+        source: IsoSource,
+    },
+}
+
+/// Where the ISO9660 bytes for an [`EntryKind::Iso`] come from.
+#[derive(Debug, Clone)]
+pub(crate) enum IsoSource {
+    /// An `.iso` file on the volume named by `BootEntry::source_volume_index`.
+    /// Booted via `FileBlockSource` (Path A1 `loopback.cfg`, else A2 file form).
+    File { iso_path: String },
+    /// A physical optical drive — the `BlockIO` handle *is* the byte source.
+    /// `handle` is an opaque firmware token (Copy, valid for the firmware's
+    /// boot-services lifetime), not a firmware call, so it is layer-legal here.
+    /// `label` is the ISO9660 PVD volume label, read once at discovery and used
+    /// to render the Path-A2 direct-media command line (`CDLABEL=`/`archisolabel=`).
+    Optical { handle: uefi::Handle, label: String },
 }
 
 /// Menu icon hint for a `BootEntry`.

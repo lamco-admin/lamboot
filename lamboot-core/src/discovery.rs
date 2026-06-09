@@ -10,7 +10,7 @@ use core::cmp::Ordering;
 use crate::{
     bls,
     bls_parse::BlsEntry,
-    boot_types::{BootEntry, EntryKind, Icon},
+    boot_types::{BootEntry, EntryKind, Icon, IsoSource},
     fs::Volume,
     fs_types::FileKind,
     policy::Policy,
@@ -107,6 +107,31 @@ pub(crate) fn discover_all_entries(
         entries.push(bls_entry.to_boot_entry());
     }
 
+    // Phase 1.7: boot-from-ISO discovery (SPEC-BOOT-FROM-ISO §5). OFF by default
+    // (`policy.iso_enabled`). When enabled, scan every volume's ISO directories
+    // for `*.iso` and emit one loopback-mountable `Iso` candidate per file —
+    // mounted at boot via a `FileBlockSource` (the M0/M1 path).
+    if policy.iso_enabled {
+        for (volume_index, volume) in volumes.iter_mut().enumerate() {
+            let tag = volume.backend_tag();
+            let mut iso_entries = discover_iso_files(volume);
+            for e in &mut iso_entries {
+                e.source_volume_index = volume_index;
+                e.source_backend_tag = tag;
+            }
+            entries.extend(iso_entries);
+        }
+    }
+
+    // Phase 1.8: optical-drive boot-from-ISO (SPEC-BOOT-FROM-ISO scenario d). OFF
+    // by default (`policy.iso_optical_enabled`). A physical CD/DVD/BD is not a
+    // GPT FS partition, so it never appears in `volumes`; scan `BlockIO` handles
+    // directly. The 2048-byte-sector filter in `scan_optical_handles` keeps a
+    // dd'd isohybrid USB out (it is surfaced as its ESP partition instead).
+    if policy.iso_optical_enabled {
+        entries.extend(discover_optical(trust_log));
+    }
+
     // Phase 2: ESP-only scanners. These paths are UEFI conventions (Windows
     // boot manager, UKIs under \EFI\Linux\, chainload targets) that only
     // live on the FAT ESP by firmware contract. Tag each entry as
@@ -136,6 +161,78 @@ pub(crate) fn discover_all_entries(
         entries,
         cohort_split,
     }
+}
+
+/// Boot-from-ISO candidates on one volume: every `*.iso` under the conventional
+/// ISO directories. One `EntryKind::Iso` per file — the loopback mount + boot
+/// method (Path A/B) happen at boot time (M2 mount, M3/M4 selection), not here.
+/// Gated by `policy.iso_enabled` at the call site; the caller stamps
+/// `source_volume_index`/`source_backend_tag`.
+fn discover_iso_files(volume: &mut Volume) -> Vec<BootEntry> {
+    const ISO_DIRS: &[&str] = &["/isos", "/boot/isos"];
+    let mut entries = Vec::new();
+    for dir in ISO_DIRS {
+        let Ok(pb) = crate::fs_types::PathBuf::from_str(dir) else {
+            continue;
+        };
+        let Ok(listing) = volume.read_dir(pb.as_path()) else {
+            continue; // directory absent on this volume — normal
+        };
+        for de in listing {
+            if matches!(de.kind, FileKind::Directory) {
+                continue;
+            }
+            if !de.name.to_ascii_lowercase().ends_with(".iso") {
+                continue;
+            }
+            let iso_path = format!("{dir}/{}", de.name);
+            entries.push(BootEntry {
+                id: format!("iso-{}", de.name),
+                name: format!("ISO: {}", de.name),
+                kind: EntryKind::Iso {
+                    source: IsoSource::File { iso_path },
+                },
+                icon: Icon::Linux,
+                bls_filename: None,
+                preflight: None,
+                source_volume_index: 0,
+                source_backend_tag: "",
+            });
+        }
+    }
+    entries
+}
+
+/// Boot-from-ISO candidates for physical optical drives (SPEC-BOOT-FROM-ISO
+/// scenario d): one `EntryKind::Iso { source: Optical }` per inserted ISO9660
+/// disc found by [`scan_optical_handles`](crate::partitions::scan_optical_handles).
+/// The disc is mounted + the distro resolved (Path A2, by volume label) at boot,
+/// not here. Gated by `policy.iso_optical_enabled` at the call site.
+fn discover_optical(trust_log: &mut TrustLog) -> Vec<BootEntry> {
+    let mut entries = Vec::new();
+    for (handle, label) in crate::partitions::scan_optical_handles() {
+        let shown = if label.is_empty() {
+            String::from("optical disc")
+        } else {
+            label.clone()
+        };
+        log::info!("Optical disc discovered: [{shown}]");
+        trust_log
+            .record(TrustEvent::new("iso_optical_discovered").with_note(&format!("label={label}")));
+        entries.push(BootEntry {
+            id: format!("optical-{}", label.to_lowercase()),
+            name: format!("Optical: {shown}"),
+            kind: EntryKind::Iso {
+                source: IsoSource::Optical { handle, label },
+            },
+            icon: Icon::Linux,
+            bls_filename: None,
+            preflight: None,
+            source_volume_index: 0,
+            source_backend_tag: "optical",
+        });
+    }
+    entries
 }
 
 /// SDS-5 §5 dedup for BLS entries before they become `BootEntry`s.
@@ -202,6 +299,14 @@ fn dedup_entries(entries: &mut Vec<BootEntry>) {
             EntryKind::LinuxLegacy {
                 ref kernel_path, ..
             } => extract_filename_lower(kernel_path),
+            EntryKind::Iso {
+                source: IsoSource::File { iso_path },
+            } => extract_filename_lower(iso_path),
+            // Optical entries dedup on the volume label (no file path); two
+            // discs are never the same medium, so the label key is sufficient.
+            EntryKind::Iso {
+                source: IsoSource::Optical { label, .. },
+            } => format!("optical:{}", label.to_lowercase()),
         };
         if seen.iter().any(|s| s == &key) {
             false
@@ -460,18 +565,30 @@ fn discover_other_loaders(
         // Only meaningful for that one path; GRUB/rEFInd are different
         // binaries by definition.
         if *path == "\\EFI\\BOOT\\BOOTX64.EFI" {
+            // Primary guard: did we boot FROM the removable fallback path? If so,
+            // offering it back re-invokes LamBoot itself. This is the effective
+            // check — the hash guard below compares the on-disk BOOTX64.EFI to
+            // the in-memory, firmware-relocated running image, which never match
+            // for a firmware-loaded fallback (the bug behind the observed RHEL
+            // self-loop), so it cannot be relied on alone.
+            if crate::boot_entry::booted_via_removable_fallback() {
+                log::debug!(
+                    "discover_other_loaders: skipping EFI Fallback synthetic — \
+                     booted via removable fallback path \\EFI\\BOOT\\BOOTX64.EFI (self-loop guard)"
+                );
+                continue;
+            }
             if let Some(self_hash) = self_image_sha256 {
-                if let Ok(bytes) = esp.read(
-                    crate::fs_types::PathBuf::from_str("/EFI/BOOT/BOOTX64.EFI")
-                        .unwrap()
-                        .as_path(),
-                ) {
-                    let bootx_hash = crate::pe_loader_pure::sha256_of(&bytes);
-                    if bootx_hash == self_hash {
-                        log::debug!(
-                            "discover_other_loaders: skipping EFI Fallback synthetic — \\EFI\\BOOT\\BOOTX64.EFI hash matches running image (self-loop guard)"
-                        );
-                        continue;
+                if let Ok(bootx_path) = crate::fs_types::PathBuf::from_str("/EFI/BOOT/BOOTX64.EFI")
+                {
+                    if let Ok(bytes) = esp.read(bootx_path.as_path()) {
+                        let bootx_hash = crate::pe_loader_pure::sha256_of(&bytes);
+                        if bootx_hash == self_hash {
+                            log::debug!(
+                                "discover_other_loaders: skipping EFI Fallback synthetic — \\EFI\\BOOT\\BOOTX64.EFI hash matches running image (self-loop guard)"
+                            );
+                            continue;
+                        }
                     }
                 }
             }

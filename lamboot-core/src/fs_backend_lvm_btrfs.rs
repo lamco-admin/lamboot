@@ -9,7 +9,7 @@
 //!  UEFI BlockIO
 //!    │  (block-granular sector reads)
 //!    ▼
-//!  BlockIoPvReader  ── embedded_io::Read + Seek over the partition's bytes
+//!  BlockIoSource  ── embedded_io::Read + Seek over the partition's bytes (block_source)
 //!    │  (shared with fs_backend_lvm::LvmExt4Backend — same PV adapter,
 //!    │   different filesystem at the bottom of the chain)
 //!    ▼
@@ -19,15 +19,15 @@
 //!  lamlvm::OwnedLvReader  ── embedded_io::Read + Seek over LV bytes
 //!    │
 //!    ▼
-//!  BtrfsBlockAdapter  ── lambutter::BlockRead (random-access) over the LV
+//!  block_source::SourceReader  ── lambutter::BlockRead (random-access) over the LV
 //!    │
 //!    ▼
 //!  lambutter::Btrfs  ── filesystem reads (RO)
 //! ```
 //!
 //! This is the LVM-on-btrfs companion to `fs_backend_lvm::LvmExt4Backend`.
-//! Identical PV layer; differs only in the LV → filesystem adapter and
-//! the filesystem object at the top.
+//! Identical PV layer and identical LV → filesystem adapter (the shared
+//! `SourceReader`); differs only in the filesystem object at the top.
 //!
 //! ## Why this exists (the v0.11.13 LVM-lambutter oversight)
 //!
@@ -50,31 +50,30 @@
 //!
 //! ## Adapter layer
 //!
-//! `BtrfsBlockAdapter` differs from `LvExt4Adapter` (in fs_backend_lvm)
-//! only in which upper-layer trait it implements. The adapter shape is:
-//!
-//! * ext4 case: `Ext4Read::read(start, dst)` — random-access I/O hint
-//!   from ext4-view; we seek-then-read-exact over the streaming LV.
-//! * btrfs case: `lambutter::BlockRead::read_at(offset, buf)` —
-//!   identical shape, identical seek-then-read-exact logic, just a
-//!   different trait name and error type.
+//! The LV → filesystem bridge is `block_source::SourceReader`, shared with
+//! the ext4-on-LV backend. It satisfies both `lambutter::BlockRead::read_at`
+//! (used here) and ext4-view's `Ext4Read::read` from a single seek-then-
+//! read-exact implementation, so this module no longer carries its own
+//! adapter. See `docs/specs/SPEC-FS-BACKEND-TRAIT.md` §5.2.
 //!
 //! No `unsafe` blocks. Each byte read goes through validated tree-walk
-//! + metadata-CRC32C verification inside lambutter before being
+//! and metadata-CRC32C verification inside lambutter before being
 //! returned (same security guarantee as `BtrfsBackend`).
 
-use alloc::{boxed::Box, format, string::String, vec::Vec};
-use core::error::Error;
+use alloc::{string::String, vec::Vec};
 
-use embedded_io::{Read as EioRead, Seek as EioSeek, SeekFrom as EioSeekFrom};
-use lambutter::{BlockRead, Btrfs};
+use lambutter::Btrfs;
 
 use crate::{
+    block_source::{BlockIoSource, SourceReader},
     fs_backend::{BackendTag, DirEntry, FsBackend, FsError, Metadata, Path, Uuid},
     fs_backend_btrfs::{lb_path, parse_btrfs_uuid_string, translate_lb_error, translate_metadata},
-    fs_backend_lvm::BlockIoPvReader,
     partitions::FsInfo,
 };
+
+/// The btrfs-on-LV reader stack: lambutter reading over the generic
+/// [`SourceReader`] seam wrapping a `lamlvm` logical-volume reader.
+type LvBtrfsSource = SourceReader<lamlvm::OwnedLvReader<BlockIoSource>>;
 
 /// Backend tag — surfaces in trust-log events. Format
 /// `lvm+lambutter@<lambutter-version>` lets audit consumers see which
@@ -86,7 +85,7 @@ pub(crate) const LVM_BTRFS_BACKEND_TAG: BackendTag = "lvm+lambutter@0.3.0-path";
 
 /// A mounted btrfs-on-LV volume.
 pub(crate) struct LvmBtrfsBackend {
-    fs: Btrfs<BtrfsBlockAdapter>,
+    fs: Btrfs<LvBtrfsSource>,
     fs_uuid: Option<Uuid>,
     /// Cached `vg/lv` identifier, surfaced in diagnostics.
     vg_lv: String,
@@ -99,18 +98,21 @@ impl LvmBtrfsBackend {
     /// AFTER it has opened the LV and probed the superblock. The caller
     /// passes:
     ///   * `owned` — the opened LV reader, positioned at byte 0
-    ///   * `lv_len` — LV size in bytes (needed by `lambutter::Btrfs::open`
-    ///     for end-of-volume bounds checking)
     ///   * `vg_lv` — the `"VG/LV"` identifier string used in trust logs
+    ///
+    /// The LV byte length that `lambutter::Btrfs::open` needs for
+    /// end-of-volume bounds checking is read straight off the source via
+    /// `SourceReader::byte_len()`, so it no longer has to be threaded in as a
+    /// separate parameter.
     ///
     /// Mirror of `LvmExt4Backend::from_lv_parts`, differing only in the
     /// filesystem at the bottom of the chain (lambutter vs ext4-view).
     pub(crate) fn from_lv_parts(
-        owned: lamlvm::OwnedLvReader<BlockIoPvReader>,
-        lv_len: u64,
+        owned: lamlvm::OwnedLvReader<BlockIoSource>,
         vg_lv: String,
     ) -> Result<Self, FsError> {
-        let reader = BtrfsBlockAdapter { lv: owned };
+        let reader = SourceReader::new(owned);
+        let lv_len = reader.byte_len();
         let fs = Btrfs::open(reader, lv_len).map_err(translate_lb_error)?;
 
         // lambutter v0.3.x doesn't expose superblock UUID accessor.
@@ -133,16 +135,15 @@ impl LvmBtrfsBackend {
     /// invoked today; the v0.11.14 probe doesn't extract UUIDs yet.
     #[expect(
         dead_code,
-        reason = "reserved entry point for once probe_lv_superblock starts \
+        reason = "reserved entry point for once probe_source_superblock starts \
                   extracting filesystem UUIDs; symmetry with BtrfsBackend::new"
     )]
     pub(crate) fn from_lv_parts_with_info(
-        owned: lamlvm::OwnedLvReader<BlockIoPvReader>,
-        lv_len: u64,
+        owned: lamlvm::OwnedLvReader<BlockIoSource>,
         vg_lv: String,
         info: &FsInfo,
     ) -> Result<Self, FsError> {
-        let mut backend = Self::from_lv_parts(owned, lv_len, vg_lv)?;
+        let mut backend = Self::from_lv_parts(owned, vg_lv)?;
         backend.fs_uuid = info.uuid.as_deref().and_then(parse_btrfs_uuid_string);
         Ok(backend)
     }
@@ -300,59 +301,5 @@ impl FsBackend for LvmBtrfsBackend {
     }
 }
 
-// ---------------------------------------------------------------------------
-// LV → lambutter::BlockRead adapter
-// ---------------------------------------------------------------------------
-
-/// Wraps an `OwnedLvReader` to satisfy lambutter's `BlockRead::read_at`
-/// shape. Performs seek-then-read-exact, looping over short reads (which
-/// the LV reader produces at segment boundaries).
-///
-/// Parallel to `fs_backend_lvm::LvExt4Adapter`. The only difference is
-/// which trait the adapter implements — `BlockRead::read_at(offset, buf)`
-/// vs `Ext4Read::read(start, dst)`. Both have the same signature shape
-/// and the same seek-then-fill semantics.
-struct BtrfsBlockAdapter {
-    lv: lamlvm::OwnedLvReader<BlockIoPvReader>,
-}
-
-impl BlockRead for BtrfsBlockAdapter {
-    type Error = Box<dyn Error + Send + Sync + 'static>;
-
-    fn read_at(&mut self, offset_bytes: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
-        if buf.is_empty() {
-            return Ok(());
-        }
-        self.lv
-            .seek(EioSeekFrom::Start(offset_bytes))
-            .map_err(|e| {
-                Box::new(LvBtrfsAdapterError(format!("seek: {e:?}")))
-                    as Box<dyn Error + Send + Sync>
-            })?;
-        let mut filled = 0;
-        while filled < buf.len() {
-            let n = self.lv.read(&mut buf[filled..]).map_err(|e| {
-                Box::new(LvBtrfsAdapterError(format!("read: {e:?}")))
-                    as Box<dyn Error + Send + Sync>
-            })?;
-            if n == 0 {
-                return Err(Box::new(LvBtrfsAdapterError(String::from(
-                    "EOF before read_at completed",
-                ))));
-            }
-            filled += n;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-struct LvBtrfsAdapterError(String);
-
-impl core::fmt::Display for LvBtrfsAdapterError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "LV→btrfs adapter error: {}", self.0)
-    }
-}
-
-impl Error for LvBtrfsAdapterError {}
+// The LV → lambutter `BlockRead` adapter that used to live here is now the
+// generic `block_source::SourceReader`, shared with the ext4-on-LV backend.

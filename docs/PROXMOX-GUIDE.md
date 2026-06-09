@@ -1,7 +1,7 @@
 # LamBoot Proxmox Integration Guide
 
-**Version:** 0.12.0
-**Updated:** 2026-04-21
+**Version:** 0.16.5
+**Updated:** 2026-06-08
 
 ## Overview
 
@@ -42,9 +42,13 @@ sudo efibootmgr -c -d /dev/vda -p 1 \
 sudo efibootmgr -o XXXX  # where XXXX is the LamBoot entry number
 ```
 
+Since v0.16.3 the manual `efibootmgr` steps are optional: on first boot LamBoot self-installs a labeled `LamBoot` `Boot####` entry pointing at `\EFI\LamBoot\lambootx64.efi` and front-loads `BootOrder` directly from the UEFI environment (no `efibootmgr`, no OS, no SELinux-confined-service block — `Boot####`/`BootOrder` are non-authenticated, so no Secure Boot keys are involved). It is idempotent on the exact `LamBoot` description. Disable it with `[boot-entry] self_install = false` in `policy.toml` (default **on**) if you manage firmware boot order externally.
+
+> **Proxmox/OVMF caveat:** if the ESP lives on a disk that is not in the VM's `boot:` order, OVMF prunes the named `Boot####` entry on reboot — self-install cannot prevent this. Add the ESP's disk to the boot order on the host (`qm set VMID --boot order=...`) or install via the removable-media fallback (`lamboot-install --update --fallback`). The installer emits an `esp_on_separate_disk` warning when it detects this layout.
+
 ### Step 2: Install Filesystem Drivers (Optional)
 
-If `/boot` is on an ext4 or btrfs partition (common on Fedora, Arch, etc.):
+Since the v0.16.0 native readers, LamBoot reads ext4, btrfs, XFS, exFAT, ZFS (single-disk/mirror/RAIDZ1 boot pools), and FAT natively in-binary, read-only — no firmware driver is required for a separate ext4/btrfs/xfs `/boot`. The bundled EfiFs `*.efi` drivers ship only as an inert fallback (the xfs/zfs ones are skipped at boot because the native readers cover them), so this step is normally unnecessary:
 
 ```bash
 sudo cp ext4_x64.efi /boot/efi/EFI/LamBoot/drivers/
@@ -381,10 +385,9 @@ efibootmgr -c -d /dev/vda -p 1 -l '\EFI\LamBoot\lambootx64.efi' -L 'LamBoot'
 ```bash
 # Verify entries exist
 ls /boot/efi/loader/entries/
-
-# If /boot is on ext4, install the ext4 driver
-cp ext4_x64.efi /boot/efi/EFI/LamBoot/drivers/
 ```
+
+LamBoot reads `/boot` natively (ext4/btrfs/XFS/exFAT/ZFS/FAT) — no EfiFs driver is needed. If a BIOS-installed RHEL-family VM (legacy-MBR table, XFS `/boot` as a primary partition) shows no entries, update to v0.16.3 or later: partition discovery now enumerates MBR and BlockIO-only partitions, not just GPT. Check `boot.log` for the discovered partition count and the mount path the native backend took.
 
 ### VM stuck in CrashLoop
 

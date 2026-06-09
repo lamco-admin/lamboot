@@ -39,4 +39,4 @@ try:
     __version__ = metadata.version("lamboot-inspect")
 except metadata.PackageNotFoundError:
     # Running from a source checkout that hasn't been pip-installed.
-    __version__ = "0.8.3"
+    __version__ = "0.9.0"

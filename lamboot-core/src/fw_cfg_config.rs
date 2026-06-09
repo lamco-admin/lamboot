@@ -37,14 +37,14 @@ impl FwCfgConfig {
     /// simply yield None-ish fields and let SMBIOS-based fallback take
     /// over downstream.
     pub(crate) fn parse(input: &str) -> Self {
-        let mut out = FwCfgConfig::default();
-        out.fleet_id = extract_string_field(input, "fleet_id");
-        out.vmid = extract_string_field(input, "vmid");
-        out.role = extract_string_field(input, "role");
-        // The hookscript field is "hostname"; we expose it as host_node
-        // to disambiguate from the GUEST's hostname inside the VM.
-        out.host_node = extract_string_field(input, "hostname");
-        out
+        FwCfgConfig {
+            fleet_id: extract_string_field(input, "fleet_id"),
+            vmid: extract_string_field(input, "vmid"),
+            role: extract_string_field(input, "role"),
+            // The hookscript field is "hostname"; we expose it as host_node
+            // to disambiguate from the GUEST's hostname inside the VM.
+            host_node: extract_string_field(input, "hostname"),
+        }
     }
 }
 

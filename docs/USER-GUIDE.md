@@ -1,7 +1,7 @@
 # LamBoot User Guide
 
-**Version:** 0.12.0
-**Updated:** 2026-04-21
+**Version:** 0.16.5
+**Updated:** 2026-06-08
 
 ---
 
@@ -14,6 +14,8 @@ LamBoot is designed for both bare-metal Linux systems and Proxmox/QEMU/KVM virtu
 ### Key Features
 
 - **Graphical two-column boot menu** with mouse and keyboard support
+- **Boots BIOS-installed (legacy-MBR) disks** — partition discovery covers MBR and BlockIO-only partitions as well as GPT, so a BIOS-installed RHEL/Rocky/Alma/CentOS layout (an `msdos` table with `/boot` as a primary partition) is discovered and booted (v0.16.3)
+- **Self-installs its UEFI boot entry** — LamBoot ensures its own labeled `Boot####` NVRAM entry exists directly from the firmware environment (no `efibootmgr`, no OS, no Secure Boot keys), an OS-independent fallback alongside the installer's entry; opt out with `[boot-entry] self_install = false` (v0.16.3)
 - **BLS Type 1 entry discovery** with UAPI.10 version sorting and boot counting
 - **Unified Kernel Image (UKI) support** with PE section metadata extraction
 - **Preflight validation** — advisory checks on every entry before you boot (see [Preflight Validation](#preflight-validation))
@@ -21,7 +23,8 @@ LamBoot is designed for both bare-metal Linux systems and Proxmox/QEMU/KVM virtu
 - **TPM 2.0 measured boot** — kernel, config, and command line measured into PCRs
 - **Persistent boot logging** — write-through during early boot, readable after the OS starts
 - **Loadable diagnostic modules** — PCI inventory, memory test, interactive diagnostic shell
-- **Filesystem drivers** — loads ext4/btrfs drivers for non-FAT /boot partitions
+- **Native filesystem readers** — built-in read-only readers for ext4, btrfs, XFS, exFAT, and ZFS boot pools, plus a media stack (EROFS, ISO 9660, SquashFS, cramfs, romfs, UDF). No firmware filesystem driver needed for any of these; legacy UEFI drivers are only loaded for the few filesystems still without a native reader
+- **Boot from ISO (opt-in)** — boot a Linux distribution directly from an `.iso` on a mounted volume or from a physical optical disc (off by default; see [Configuration Guide](CONFIGURATION-GUIDE.md))
 - **Proxmox integration** — VMID display, hookscript monitoring, fleet operations
 - **Secure Boot compatible** — ShimLock verification, SBAT, signing pipeline
 
@@ -33,7 +36,7 @@ LamBoot executes a structured 10-phase boot sequence. For the full technical des
 2. **Security & hardware detection** — Secure Boot, TPM, SMBIOS, hypervisor, IOMMU
 3. **Mount ESP** — locate and mount the EFI System Partition
 4. **Load policy** — read `policy.toml` configuration
-5. **Load drivers** — ext4, btrfs, and other filesystem drivers
+5. **Load drivers** — load a legacy UEFI filesystem driver only for a `/boot` filesystem without a native reader; ext4, btrfs, XFS, exFAT, ZFS, and the media filesystems are read natively in-binary
 6. **Enumerate volumes** — discover additional partitions (XBOOTLDR, etc.)
 7. **Discover boot entries** — BLS entries, UKIs, Windows, other loaders, diagnostic tools
 8. **Preflight validation** — check each entry for potential issues
@@ -61,8 +64,8 @@ LamBoot has been tested on Fedora 43, Debian 13 (forky/sid), Ubuntu 24.04, Arch 
 Download the latest release archive and run the installer:
 
 ```bash
-tar xf lamboot-0.2.0-x86_64.tar.gz
-cd lamboot-0.2.0
+tar xf lamboot-0.16.5-x86_64.tar.gz
+cd lamboot-0.16.5
 
 # Install to the local system (requires root)
 sudo ./lamboot-install
@@ -105,7 +108,7 @@ LamBoot uses a two-column graphical menu at 1024x768 resolution:
 
 ### Header
 
-- **Left**: Lamco sheep logo, "LamBoot" title, version (e.g., `v0.2.0 (x86_64)`)
+- **Left**: Lamco sheep logo, "LamBoot" title, version (e.g., `v0.16.5 (x86_64)`)
 - **Right**: System identity information (when available):
   - **VM ID**: Shown as `VM 201` when configured via SMBIOS OEM strings (see [Configuration Guide](CONFIGURATION-GUIDE.md)). On Proxmox, this is auto-injected by the hookscript. On other hypervisors, set via QEMU `-smbios type=11,value=lamboot.vmid=201` or equivalent.
   - **Hypervisor**: Auto-detected via CPUID (KVM, Hyper-V, VMware, Xen, etc.). On bare metal, this line is absent.
@@ -212,7 +215,7 @@ JSON file with the complete boot context:
 
 ```json
 {
-  "lamboot_version": "0.2.0",
+  "lamboot_version": "0.16.5",
   "lamboot_arch": "x86_64",
   "timestamp": "2026-04-05T02:01:49",
   "entry_id": "bls-fedora-6.19.9",
@@ -236,7 +239,7 @@ JSON file with the complete boot context:
 Full boot trace with timestamps. Write-through during early boot (survives crashes), buffered during menu phase:
 
 ```
-=== LamBoot 0.2.0 (x86_64) boot log ===
+=== LamBoot 0.16.5 (x86_64) boot log ===
 === 2026-04-05T02:01:49 ===
 
 [2026-04-05T02:01:49] INFO: Crash counter: 0
@@ -258,6 +261,38 @@ Rolling log (10 KB max) of every boot with entry name and timestamp:
 ```
 
 All reports are at `/boot/efi/EFI/LamBoot/reports/` (accessible from the booted OS).
+
+---
+
+## Filesystem Support
+
+LamBoot reads `/boot` (and, where relevant, `/`) from a range of filesystems using **native, in-binary, read-only** readers — no firmware filesystem driver and no GPLv3 EfiFs `.efi` is needed for any of them:
+
+| Filesystem | Notes |
+|---|---|
+| FAT (ESP) | Served by firmware; non-ESP FAT volumes read natively |
+| ext4 | Native read-only reader |
+| btrfs | Native read-only reader |
+| XFS | Native read-only reader; also reads XFS on an LVM logical volume and inside an `.iso` loopback region |
+| exFAT | Native read-only reader; whole partitions only (removable boot media, including >4 GiB payloads) |
+| ZFS | Native read-only reader for **unencrypted** boot pools (the Ubuntu/Debian root-on-ZFS `bpool` pattern). Single-disk, mirror, and single-parity RAIDZ1 vdevs only; RAIDZ2/3, dRAID, multi-vdev, special vdevs, and native encryption are rejected |
+| Media: EROFS, ISO 9660, SquashFS, cramfs, romfs, UDF | Native read-only media stack. Media mounts are read-only but currently **unverified** (no integrity/trust-root check yet) |
+
+Every reader above is **read-only by construction** — there is no write path. The ESP writer only ever targets FAT. For the filesystems LamBoot does not read natively (e.g. NTFS, F2FS), the installer can still deploy a legacy UEFI driver; see [`--with-drivers-legacy`](INSTALL-REFERENCE.md).
+
+## Booting from an ISO (opt-in)
+
+LamBoot can boot a Linux distribution directly from an `.iso` file on a mounted volume, or from a physical optical disc. This is **opt-in and off by default** — enable it in `policy.toml`:
+
+```toml
+[boot-from-iso]
+enabled = true   # boot from an .iso on a mounted volume (scans /isos and /boot/isos)
+optical = true   # also boot from an inserted CD/DVD/BD
+```
+
+When present, LamBoot uses the distribution's own `/boot/grub/loopback.cfg`; otherwise it falls back to a per-distro-family recipe table (arch, ubuntu-casper, debian-live, fedora, opensuse, alpine, and their derivatives). Distribution kernels are Linux EFI-stub PEs, so the ISO path hands off via firmware `LoadImage`.
+
+> **Experimental.** Only Arch 2026.05 and Fedora 44 have been live-ISO-booted end to end; the other families are recipe/table-validated but not yet live-booted. El Torito chainload is not yet wired.
 
 ---
 
@@ -307,6 +342,8 @@ This removes:
 - Systemd integration (mark-success service, kernel-install plugin)
 
 The ESP itself and other bootloaders are not affected.
+
+> **Note on the self-installed boot entry.** Since v0.16.3 LamBoot re-creates its own `Boot####` NVRAM entry at boot from the firmware environment (`[boot-entry] self_install`, default on). After a `--remove` the installer deletes the entry, but if the LamBoot binary remains on the ESP and is launched again it will re-add a `LamBoot` entry. To fully suppress self-install, set `[boot-entry] self_install = false` in `policy.toml` before removal, or remove the binary from the ESP. See the [Configuration Guide](CONFIGURATION-GUIDE.md).
 
 ---
 

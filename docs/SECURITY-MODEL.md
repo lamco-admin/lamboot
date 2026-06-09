@@ -1,8 +1,8 @@
 # LamBoot Security Model
 
 **Audience:** system administrators, security engineers, auditors evaluating LamBoot's threat model.
-**Version:** 0.12.0 (native-path shipped)
-**Last updated:** 2026-05-30
+**Version:** 0.16.5 (native FS readers shipped in v0.16.0)
+**Last updated:** 2026-06-06
 
 > **Authoritative reference:** The formal trust-chain spec is
 > [`docs/specs/SPEC-NATIVE-TRUST-CHAIN.md`](specs/SPEC-NATIVE-TRUST-CHAIN.md)
@@ -19,7 +19,13 @@ The native boot path (SDS-2 ext4/ext2 backend + SDS-3 native PE loader +
 SDS-4 trust chain) resolves the older shim-15.8 `ShimLock`-uninstall
 failure by structurally bypassing it: LamBoot calls `ShimLock::Verify`
 once on the kernel bytes, then loads the kernel via its own PE loader.
-`BS->LoadImage` is never invoked for the kernel. Every decision lands
+`BS->LoadImage` is never invoked for the kernel. Since v0.16.1 that PE
+loader is parser-free: it is a hand-rolled `no_std` PE/COFF reader that
+reads only the load-bearing COFF + PE32+ optional-header fields from
+fixed offsets, and the third-party `goblin` PE parser (with its
+transitive `plain`/`scroll` crates) has been dropped from `lamboot-core`
+entirely — one fewer third-party parser on the trust and attack surface
+for every kernel LamBoot loads. Every decision lands
 as a `verified_via`-tagged trust-log event on `\loader\boot-trust.log`.
 This is the default path on a current install — confirmed in the field on
 ext4 and ext2 `/boot` under Secure Boot with shim+MOK.
@@ -34,6 +40,40 @@ The §3 honest-gaps below are ecosystem limitations that still apply —
 they are not LamBoot-specific and LamBoot cannot close them alone. What
 LamBoot does provide is that its own contribution to the chain is now
 auditable end-to-end.
+
+### Native filesystem readers shrink the third-party driver surface (since v0.16.0)
+
+LamBoot reads its on-disk filesystems with native, in-binary, memory-safe
+Rust readers rather than firmware filesystem drivers wherever it can. The
+readers for ext4/ext2/ext3, btrfs, and FAT were joined in v0.16.0 by native
+read-only readers for **XFS, exFAT, and ZFS**, plus a read-only **media stack**
+(EROFS, ISO 9660, SquashFS, cramfs, romfs, UDF). Each is `no_std`, read-only
+**by construction** (no write path exists), and the ZFS reader is
+`forbid(unsafe_code)`. ZFS coverage is deliberately scoped to **single-disk,
+mirror, and single-parity RAIDZ1** unencrypted boot pools — RAIDZ2/3, dRAID,
+multi-vdev stripe, special/allocation-class vdevs, and native encryption are
+rejected with a typed error rather than read on a partial implementation.
+
+The security payoff is that a default install now loads **zero** GPLv3 EfiFs
+`*.efi` filesystem drivers for these filesystems: in the default Auto driver
+mode (`[drivers].legacy_uefi_drivers = "auto"`), a legacy driver whose
+filesystem is natively covered is skipped, recorded as a
+`native_backend_preferred` / `legacy_driver_skipped_covered` event in the trust
+log. The bundled `xfs_x64.efi` / `zfs_x64.efi` drivers still ship as inert
+fallback but are no longer attached at boot — the native readers mount those
+filesystems. This removes those binaries (which cannot be Microsoft-signed and
+trip shim 15.8's `ShimLock` uninstall) from the live trust chain and replaces
+them with auditable Rust we ship and control.
+
+Two honest qualifiers belong here. First, the **media mounts are read-only but
+currently unverified** — the media stack mounts EROFS/ISO 9660/SquashFS/cramfs/
+romfs/UDF read-only, but there is no integrity or trust-root verification of
+media *content* yet; a Merkle trust-root path is later work. Second, the opt-in
+**boot-from-ISO** capability (`[boot-from-iso]`, default off) boots a stock
+distribution kernel, which is a Linux EFI-stub PE that LamBoot's native loader
+cannot load — so that path falls back to firmware `BS->LoadImage`, and the
+kernel handoff inherits the firmware/shim verification posture of §3.1 rather
+than the native `verified_via` evidence the BLS native path produces.
 
 ---
 
@@ -53,10 +93,12 @@ LamBoot inherits this ecosystem. What follows is what we do differently, what we
 | Tampered LamBoot binary on ESP | Detected at next boot via signature check |
 | Offline swap of ESP files | ESP sits inside the Secure Boot chain — unsigned replacements rejected |
 | Rollback to vulnerable bootloader version | SBAT generation checks (shim enforces this on LamBoot) |
-| Unauthorized driver load under Secure Boot | Path F (SecurityArchProtocol override) routes driver LoadImage through ShimLock::Verify — matches systemd-boot precedent |
+| Unauthorized driver load under Secure Boot | Native in-binary readers (ext4/ext2/ext3, btrfs, FAT, XFS, exFAT, ZFS) cover the common `/boot` and root filesystems, so in the default Auto driver mode their GPLv3 EfiFs `.efi` drivers are skipped and never loaded. For any residual filesystem that still needs a firmware driver, Path F (SecurityArchProtocol override) routes that driver's LoadImage through ShimLock::Verify — matches systemd-boot precedent |
 | Stale BLS entries referencing purged kernels | Install-script lifecycle fix: `--update` regenerates our manifest-tracked entries when their kernels disappear |
 | Opaque boot decisions | **Trust-evidence log** at `\loader\boot-trust.log` records every trust decision (LamBoot-unique in this class) |
 | TPM PCR manipulation via variant GRUB paths | UKIs have deterministic PCR values (LamBoot first-class supports UKIs) |
+| Lost / pruned LamBoot boot entry (no `efibootmgr`, SELinux-confined service blocked) | Bootloader-side NVRAM self-install (since v0.16.3): LamBoot ensures a labeled `Boot####` entry pointing at `\EFI\LamBoot\lambootx64.efi` exists and front-loads `BootOrder` directly from the UEFI environment. It writes only the non-authenticated `Boot####`/`BootOrder` variables — no Secure Boot key store (`PK`/`KEK`/`db`) and no signed variables are touched, so the operation needs no platform keys and is gated by `[boot-entry] self_install` (default on) |
+| BIOS-installed (legacy-MBR) `/boot` yielding zero discovered partitions | Partition discovery (since v0.16.3) is a three-source enumerator — GPT, MBR via `PartitionInfo.mbr_partition_record()`, and BlockIO-only logical partitions — so an `msdos`-table install (e.g. RHEL XFS `/boot` as a primary partition) is found and booted instead of dead-ending in the fallback self-loop |
 
 ---
 
@@ -133,7 +175,7 @@ UKIs in all configs: full signature coverage of kernel + initrd + cmdline.
 LamBoot writes `\loader\boot-trust.log` on the ESP recording every trust decision. Format: JSON Lines, UTF-8. One event per line. Sample:
 
 ```json
-{"seq":0,"event":"boot_start","note":"version=0.12.0 arch=x86_64 sb=ActiveWithShim crash_counter=0"}
+{"seq":0,"event":"boot_start","note":"version=0.16.5 arch=x86_64 sb=ActiveWithShim crash_counter=0"}
 {"seq":1,"event":"image_verified","path":"\\vmlinuz-6.12.90","sha256":"5af22ccd…","verified_via":"shim_mok","status":"SUCCESS"}
 {"seq":2,"event":"image_loaded_native","path":"\\vmlinuz-6.12.90","sha256":"5af22ccd…","verified_via":"shim_mok","status":"SUCCESS","note":"backend=ext4-view loader=native_pe_loader"}
 ```

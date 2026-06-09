@@ -75,6 +75,11 @@ pub(crate) enum FsError {
         backend: BackendTag,
     },
     Corrupt(&'static str),
+    /// Block-level integrity verification failed — the lamfold "shepherd" (a
+    /// Merkle / fs-verity check) refused a block. Deliberately distinct from
+    /// `Corrupt`: a verification refusal is a loud security status, never folded
+    /// into a generic parse error. SPEC-LAMFOLD-INTEGRATION §3.
+    IntegrityFailed(&'static str),
     /// A metadata-reported file size exceeded the read cap
     /// (`read_limit_pure::MAX_BOOT_FILE_BYTES`) or did not fit `usize`. Rejected
     /// before allocation so a hostile size field cannot trigger an OOM-abort
@@ -103,6 +108,7 @@ impl FsError {
             FsError::Unsupported(_) => "unsupported",
             FsError::UnsupportedFeature { .. } => "unsupported_feature",
             FsError::Corrupt(_) => "fs_corrupt",
+            FsError::IntegrityFailed(_) => "integrity_failed",
             FsError::FileTooLarge { .. } => "file_too_large",
             FsError::Io { .. } => "io_error",
             FsError::BackendOther(_) => "backend_other",
@@ -128,6 +134,7 @@ impl FsError {
             }
             FsError::Unsupported(_) | FsError::UnsupportedFeature { .. } => Status::UNSUPPORTED,
             FsError::Corrupt(_) => Status::VOLUME_CORRUPTED,
+            FsError::IntegrityFailed(_) => Status::SECURITY_VIOLATION,
             FsError::FileTooLarge { .. } => Status::OUT_OF_RESOURCES,
             FsError::Io { source } => source.status(),
             FsError::BackendOther(_) => Status::DEVICE_ERROR,
@@ -148,6 +155,7 @@ impl fmt::Display for FsError {
                 write!(f, "unsupported feature {feature} on backend {backend}")
             }
             FsError::Corrupt(what) => write!(f, "filesystem corrupt: {what}"),
+            FsError::IntegrityFailed(what) => write!(f, "integrity verification failed: {what}"),
             FsError::FileTooLarge { size, max } => {
                 write!(f, "file too large: {size} bytes exceeds cap {max}")
             }

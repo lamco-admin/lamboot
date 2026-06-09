@@ -42,8 +42,11 @@ UMBRELLA_SITES=(
     # tools/lamboot-install — readonly LAMBOOT_VERSION="..."
     "tools/lamboot-install|^readonly LAMBOOT_VERSION=\"[0-9]+\.[0-9]+\.[0-9]+\"|s|^readonly LAMBOOT_VERSION=\"[0-9]+\.[0-9]+\.[0-9]+\"|readonly LAMBOOT_VERSION=\"%VERSION%\"|"
 
-    # AUR PKGBUILD — pkgver=...
-    "packaging/aur/lamboot/PKGBUILD|^pkgver=[0-9]+\.[0-9]+\.[0-9]+|s|^pkgver=[0-9]+\.[0-9]+\.[0-9]+|pkgver=%VERSION%|"
+    # AUR is intentionally NOT swept here — packaging is decoupled
+    # (PACKAGING.md §4): per-channel revisions + the publish-time render from
+    # packaging/release.toml own the packaged version, not the umbrella sweep.
+    # The 2026-06 restructure moved aur/lamboot -> aur/lamboot-bin; re-coupling
+    # a per-pkgrel channel to this sweep would contradict the decoupled model.
 
     # archinstall plugin — __plugin_version__ = "..."
     "packaging/installers/archinstall/lamboot_plugin.py|^__plugin_version__ = \"[0-9]+\.[0-9]+\.[0-9]+\"|s|^__plugin_version__ = \"[0-9]+\.[0-9]+\.[0-9]+\"|__plugin_version__ = \"%VERSION%\"|"
@@ -52,10 +55,11 @@ UMBRELLA_SITES=(
     "packaging/installers/calamares/lamboot/main.py|^__plugin_version__ = \"[0-9]+\.[0-9]+\.[0-9]+\"|s|^__plugin_version__ = \"[0-9]+\.[0-9]+\.[0-9]+\"|__plugin_version__ = \"%VERSION%\"|"
 )
 
-# .SRCINFO is special — has 4 lines (pkgver, provides, 2x source URL).
-# Easier to regenerate from PKGBUILD via makepkg --printsrcinfo than to
-# in-place edit each line. We document this and skip in --check unless
-# the user has makepkg on path.
+# VESTIGIAL (2026-06: packaging decoupled — PACKAGING.md §4). The AUR .SRCINFO
+# is no longer umbrella-swept; the regenerate_srcinfo/check_srcinfo helpers
+# below are retained but unreferenced. Do NOT re-wire them into the umbrella
+# sweep — packaging versions are owned by packaging/release.toml + the
+# publish-time render. Kept (not deleted) so the recipe survives a policy revert.
 SRCINFO_PATH="packaging/aur/lamboot/.SRCINFO"
 
 # ============================================================================
@@ -235,8 +239,6 @@ mode_check() {
 
     check_sites "$cargo_ver" "umbrella" UMBRELLA_SITES
     total_drift=$((total_drift + DRIFT_COUNT))
-    check_srcinfo "$cargo_ver"
-    total_drift=$((total_drift + (DRIFT_COUNT - (total_drift)) ))
 
     # Re-run for protocol (single-site check)
     local saved_drift=$total_drift
@@ -330,7 +332,6 @@ mode_sync() {
 
     note "syncing all sites to Cargo.toml version: ${cargo_ver}"
     rewrite_sites "$cargo_ver" "umbrella" UMBRELLA_SITES
-    regenerate_srcinfo "$cargo_ver"
     note "sync complete"
 }
 
@@ -342,7 +343,6 @@ mode_bump() {
     cur_ver=$(read_cargo_version)
     note "bumping umbrella version: ${cur_ver} -> ${new_ver}"
     rewrite_sites "$new_ver" "umbrella" UMBRELLA_SITES
-    regenerate_srcinfo "$new_ver"
     sync_cargo_lock "$new_ver"
     note "bump complete"
 }

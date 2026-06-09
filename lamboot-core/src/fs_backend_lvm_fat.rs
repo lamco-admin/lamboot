@@ -9,7 +9,7 @@
 //!  UEFI BlockIO
 //!    │  (block-granular sector reads)
 //!    ▼
-//!  BlockIoPvReader  ── embedded_io::Read + Seek over the partition's bytes
+//!  BlockIoSource  ── embedded_io::Read + Seek over the partition's bytes (block_source)
 //!    │  (shared with the ext4/btrfs LVM backends — same PV adapter)
 //!    ▼
 //!  lamlvm::Lvm2::open  ── parses PV label + VG metadata
@@ -34,9 +34,10 @@
 //!
 //! fatfs's IO traits (`Read`/`Seek`) are *streaming* (implicit position),
 //! exactly the shape `embedded_io::Read`/`Seek` already expose on
-//! `OwnedLvReader`. So unlike `LvExt4Adapter` (which adapts a streaming LV to
-//! ext4-view's random-access `read(start, dst)`), this adapter is a thin
-//! trait-name bridge — no seek-then-read-exact dance. `Write` is a stub that
+//! `OwnedLvReader`. So unlike the shared `block_source::SourceReader` (which
+//! adapts a streaming LV to the random-access `read(start, dst)` /
+//! `read_at(offset, buf)` shape ext4-view and lambutter want), this adapter is
+//! a thin trait-name bridge — no seek-then-read-exact dance. `Write` is a stub that
 //! errors; fatfs never calls it on the read workload (see
 //! `fs_backend_fat_ro` module docs for the RO-correctness argument), and the
 //! distinct `FAT_RO_BACKEND_TAG`/`LVM_FAT_RO_BACKEND_TAG` keeps `EspWriter`
@@ -48,9 +49,9 @@ use embedded_io::{Read as EioRead, Seek as EioSeek, SeekFrom as EioSeekFrom};
 use fatfs::{IoBase, Read as FatRead, Seek as FatSeek, SeekFrom as FatSeekFrom, Write as FatWrite};
 
 use crate::{
+    block_source::BlockIoSource,
     fs_backend::{BackendTag, FsError},
     fs_backend_fat_ro::{FatRoBackend, FatRoIoError},
-    fs_backend_lvm::BlockIoPvReader,
 };
 
 /// Backend tag — surfaces in trust-log events. The `lvm+` prefix mirrors
@@ -62,7 +63,7 @@ pub(crate) const LVM_FAT_RO_BACKEND_TAG: BackendTag = "lvm+fatfs-ro@0.4.0-git";
 /// trait-name bridge from `embedded_io` (which `OwnedLvReader` already
 /// implements) to fatfs's equivalent streaming traits.
 pub(crate) struct LvFatAdapter {
-    lv: lamlvm::OwnedLvReader<BlockIoPvReader>,
+    lv: lamlvm::OwnedLvReader<BlockIoSource>,
 }
 
 impl IoBase for LvFatAdapter {
@@ -107,10 +108,10 @@ impl FatSeek for LvFatAdapter {
 
 /// Construct a FAT-on-LVM backend from a pre-opened `OwnedLvReader` positioned
 /// at byte 0 of the LV. Called by `fs_backend_lvm_dispatch::open_lvm_lv_backend`
-/// after `probe_lv_superblock` has identified the LV as FAT. fatfs re-validates
+/// after `probe_source_superblock` has identified the LV as FAT. fatfs re-validates
 /// the boot sector, so a misidentified LV fails here cleanly.
 pub(crate) fn from_lv_parts(
-    reader: lamlvm::OwnedLvReader<BlockIoPvReader>,
+    reader: lamlvm::OwnedLvReader<BlockIoSource>,
 ) -> Result<FatRoBackend<LvFatAdapter>, FsError> {
     FatRoBackend::from_adapter(LvFatAdapter { lv: reader }, LVM_FAT_RO_BACKEND_TAG)
 }

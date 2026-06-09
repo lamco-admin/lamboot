@@ -11,6 +11,14 @@
 //! the menu's `BootEntry`) lives in `bls.rs`. The split is a pure-
 //! function extraction; no behavior change.
 
+// `unreachable_pub` and `dead_code` are allowed: this module is `#[path]`-included
+// into both lamboot-core (a UEFI binary with no public API, where these pub items are
+// unreachable) and lamboot-fs-tests (whose host tests reach them as an external
+// consumer, so they must stay `pub`, and `#[expect]` would go unfulfilled there).
+// `allow` is the only annotation that suits both consumers; matches pe_loader_pure.rs.
+#![allow(dead_code)]
+#![allow(unreachable_pub)]
+
 use alloc::{string::String, vec::Vec};
 use core::cmp::Ordering;
 
@@ -211,8 +219,8 @@ impl BlsEntry {
 /// When `ignore_sort_key` is true (operator opt-in via
 /// `policy.bls_ignore_sort_key = true`), rules 2 and 3's sort-key
 /// presence test and sort-key value compare are skipped, collapsing
-/// both cohorts into one bucket and relying on machine-id + version
-/// + filename fallback. This is the Fedora bootupd model and the
+/// both cohorts into one bucket and relying on machine-id, version,
+/// and filename fallback. This is the Fedora bootupd model and the
 /// canonical fix for the BLS sort-key cohort split (Bug 22).
 pub fn bls_sort_compare(a: &BlsEntry, b: &BlsEntry, ignore_sort_key: bool) -> Ordering {
     // Bad entries last.

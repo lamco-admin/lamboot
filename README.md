@@ -6,12 +6,14 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![UEFI](https://img.shields.io/badge/target-UEFI-green.svg)](https://uefi.org/)
 
-LamBoot is a UEFI bootloader for Linux targeting hypervisor-managed VM environments (Proxmox in particular) and homelab / desktop systems. Eight clean architectural layers across 46 modules, ~16,000 lines of Rust. Graphical menu with mouse. BLS + UKI + `kernel-install` done right. Host-side fleet monitoring without an in-guest agent. An honest Secure Boot posture with a JSON trust-evidence log written to the ESP on every boot.
+**[Website](https://lamco.ai/products/lamboot/)** · **[Documentation](https://lamco.ai/products/lamboot/docs/)** · **[Install](https://lamco.ai/products/lamboot/install/)** · **[Repository](https://github.com/lamco-admin/lamboot)** · by **[Lamco Development LLC](https://lamco.ai/about/)**
 
-**Native filesystem reading, an honest Secure Boot posture, and a machine-checked architecture.** LamBoot reads ext4, btrfs, and FAT natively (FAT on LVM included), so the kernel-load path no longer leans on firmware filesystem drivers or `BS->LoadImage`, and a separate `/boot` is sourced in place rather than mirrored onto the ESP. Its 46-module core is organized into an 8-layer dependency DAG enforced on every commit — dependencies flow one direction, by construction. Every image-authentication decision is written to a JSON trust-evidence log on the ESP, and the shim 15.8 `ShimLock`-uninstall failure mode that blocked stock `/boot` on ext4 under Secure Boot is structurally unreachable. Pop!_OS / systemd-boot-discoverable-EFI auto-discovery is first-class. See [lamco.ai/lamboot](https://lamco.ai/lamboot/) for the roadmap and documentation.
+LamBoot is a UEFI bootloader for Linux targeting hypervisor-managed VM environments (Proxmox in particular) and homelab / desktop systems. Eight clean architectural layers across 62 modules, ~21,200 lines of Rust. Graphical menu with mouse. BLS + UKI + `kernel-install` done right. Host-side fleet monitoring without an in-guest agent. A verifiable Secure Boot posture with a JSON trust-evidence log written to the ESP on every boot.
 
-- **Current version:** 0.15.2 (June 2026)
-- **Binary size:** ~650 KB (x86_64; native ext4/btrfs/FAT readers + PE loader compiled in)
+**Native filesystem reading, a verifiable Secure Boot posture, and a machine-checked architecture.** LamBoot reads ext4, btrfs, FAT, XFS, exFAT, and ZFS boot pools natively and read-only (FAT and XFS on LVM included), plus a read-only media stack (EROFS, ISO 9660, SquashFS, cramfs, romfs, UDF), so the kernel-load path no longer leans on firmware filesystem drivers or `BS->LoadImage`, and a separate `/boot` is sourced in place rather than mirrored onto the ESP. Every new backend is read-only by construction — there is no write path, and the ESP writer only ever targets FAT. Its 62-module core is organized into an 8-layer dependency DAG enforced on every commit — dependencies flow one direction, by construction. Every image-authentication decision is written to a JSON trust-evidence log on the ESP, and the shim 15.8 `ShimLock`-uninstall failure mode that blocked stock `/boot` on ext4 under Secure Boot is structurally unreachable. Pop!_OS / systemd-boot-discoverable-EFI auto-discovery is first-class. See [lamco.ai/products/lamboot/](https://lamco.ai/products/lamboot/) for the roadmap and documentation.
+
+- **Current version:** 0.16.5 (June 2026)
+- **Binary size:** ~1.05 MB (x86_64; native ext4/btrfs/FAT/XFS/exFAT/ZFS + media readers + goblin-free PE loader compiled in)
 - **Platforms:** x86_64 UEFI, aarch64 UEFI
 - **License:** MIT OR Apache-2.0
 - **Architecture:** 8 layers, codified — see [`docs/ARCHITECTURE-LAYERS.md`](docs/ARCHITECTURE-LAYERS.md)
@@ -26,12 +28,12 @@ LamBoot is a UEFI bootloader for Linux targeting hypervisor-managed VM environme
 | 🏭 **Proxmox-native** | Host-side VM boot-health monitoring via NVRAM — no agent in the guest. First Linux bootloader with fleet ops as a first-class concern. |
 | ⚖️ **Modern Linux boot** | BLS Type 1 with UAPI.10 version sort. UKI first-class. LoadFile2 initrd (kernel 5.7+). kernel-install + postinst hooks. No GRUB scripting. |
 | 🖱️ **Graphical menu with a mouse** | Double-buffered GOP renderer, full pointer support, no flicker. Serial console fallback. Unique among Rust bootloaders. |
-| 🦀 **Memory-safe Rust** | `#![no_std]`, every `unsafe` block documented. 46 modules, ~16,000 lines of Rust — a fraction of GRUB's C, with native filesystem reading no other small bootloader has. |
-| 📝 **Honest Secure Boot** | JSON trust-evidence log on `\loader\boot-trust.log` — every image-authentication decision recorded. Threat model documents what LamBoot can and cannot verify. |
+| 🦀 **Memory-safe Rust** | `#![no_std]`, every `unsafe` block documented. 62 modules, ~21,200 lines of Rust — a fraction of GRUB's C, with native filesystem reading no other small bootloader has. |
+| 📝 **Auditable Secure Boot** | JSON trust-evidence log on `\loader\boot-trust.log` — every image-authentication decision recorded. Threat model documents what LamBoot can and cannot verify. |
 | 🧪 **Crash-loop recovery** | NVRAM state machine with automatic fallback entry selection, systemd-bless-boot compatible. |
 
-**Honest posture (v0.15.2):**
-- **Ships now:** native ext4, btrfs, and FAT read backends (FAT on LVM included), native PE loader, native trust chain, read-in-place `/boot` (no ESP kernel mirror), BLS multi-FS discovery, signing pipeline, SecurityOverride (Path F), trust-evidence log, install-script hardening, Proxmox integration, BLS+UKI handling. The previous shim 15.8 `ShimLock`-uninstall failure on stock `/boot` ext4 under Secure Boot is structurally unreachable on the kernel-load path.
+**Posture (v0.16.5):**
+- **Ships now:** native read-only ext4, btrfs, FAT, XFS, exFAT, and ZFS boot-pool read backends (FAT and XFS on LVM included; XFS also inside an `.iso` loopback region), a native read-only media stack (EROFS, ISO 9660, SquashFS, cramfs, romfs, UDF), a parser-free native PE loader (no `goblin`) with a native -> firmware `BS->LoadImage` fallback, native trust chain, read-in-place `/boot` (no ESP kernel mirror), GPT + MBR + BlockIO-only partition discovery (BIOS-installed `msdos`-table disks included), bootloader-side NVRAM self-install of the `LamBoot` boot entry, BLS multi-FS discovery, signing pipeline, SecurityOverride (Path F), trust-evidence log, install-script hardening, Proxmox integration, BLS+UKI handling. Every new backend is read-only by construction. The previous shim 15.8 `ShimLock`-uninstall failure on stock `/boot` ext4 under Secure Boot is structurally unreachable on the kernel-load path.
 - **Pop!_OS / systemd-boot-discoverable-EFI** kernels and recovery entries are auto-discovered.
 - Not shim-review approved yet (parallel track).
 - Not a GRUB drop-in — no legacy BIOS, no rescue shell, no GRUB config language.
@@ -41,13 +43,18 @@ LamBoot is a UEFI bootloader for Linux targeting hypervisor-managed VM environme
 
 ## Documentation
 
+The canonical product documentation lives at
+**[lamco.ai/products/lamboot/docs/](https://lamco.ai/products/lamboot/docs/)**
+(install reference, Secure Boot deployment, architecture, Proxmox operations,
+troubleshooting). The in-repo documents below are the source for those pages.
+
 ### Getting started
 - [**QUICKSTART.md**](QUICKSTART.md) — 30-second build and install
 - [**docs/INSTALL-REFERENCE.md**](docs/INSTALL-REFERENCE.md) — `lamboot-install` flags and walkthrough
 - [**docs/USER-GUIDE.md**](docs/USER-GUIDE.md) — end-user usage
 
 ### Secure Boot
-- [**docs/SECURITY-MODEL.md**](docs/SECURITY-MODEL.md) — honest threat model (what LamBoot defends vs. what it doesn't)
+- [**docs/SECURITY-MODEL.md**](docs/SECURITY-MODEL.md) — documented threat model (what LamBoot defends vs. what it doesn't)
 - [**docs/SECURE-BOOT-DEPLOYMENT.md**](docs/SECURE-BOOT-DEPLOYMENT.md) — four trust configurations with walkthroughs
 - [**docs/KEY-GENERATION.md**](docs/KEY-GENERATION.md) — PK/KEK/db production key hierarchy
 - [**docs/MOK-ENROLLMENT-GUIDE.md**](docs/MOK-ENROLLMENT-GUIDE.md) — MokManager screen-by-screen
@@ -74,7 +81,7 @@ LamBoot is a UEFI bootloader for Linux targeting hypervisor-managed VM environme
 ### Homelab (Secure Boot off)
 
 ```bash
-tar xzf lamboot-0.9.1-x86_64.tar.gz && cd lamboot-0.9.1
+tar xzf lamboot-0.16.5-x86_64.tar.gz && cd lamboot-0.16.5
 sudo ./lamboot-install
 # Reboot → pick "LamBoot" from firmware boot menu
 ```
@@ -90,7 +97,7 @@ sudo ./lamboot-install --signed
 
 ```bash
 # On host
-cp lamboot-0.9.1/OVMF_VARS_lamboot.fd /var/lib/vz/images/100/OVMF_VARS_100.fd
+cp lamboot-0.16.5/OVMF_VARS_lamboot.fd /var/lib/vz/images/100/OVMF_VARS_100.fd
 # In VM
 sudo ./lamboot-install --signed --no-mok
 ```
@@ -127,9 +134,9 @@ rustup target add x86_64-unknown-uefi aarch64-unknown-uefi
 ./build.sh
 
 # Output:
-#   dist/EFI/LamBoot/lambootx64.efi     (~600 KB, x86_64)
-#   dist/EFI/LamBoot/lambootaa64.efi    (aarch64)
-#   dist/EFI/LamBoot/drivers/*.efi      (ext4, btrfs, ntfs, etc.)
+#   dist/EFI/LamBoot/lambootx64.efi     (~1.05 MB, x86_64)
+#   dist/EFI/LamBoot/lambootaa64.efi    (~922 KB, aarch64)
+#   dist/EFI/LamBoot/drivers/*.efi      (GPL EfiFs fallback: ntfs, f2fs, iso9660; xfs/zfs skipped)
 #   dist/EFI/LamBoot/modules/*.efi      (nvme-diag, mem-quick, ...)
 
 # Test in QEMU
@@ -326,7 +333,7 @@ Chainloaded EFI applications in `\EFI\LamBoot\modules\`:
 | Module | Size | Description |
 |---|---|---|
 | `mem-quick.efi` | 24 KB | Walking-ones and address-pattern memory tests |
-| `nvme-diag.efi` | 15 KB | NVMe S.M.A.R.T. health check |
+| `nvme-diag.efi` | 15 KB | NVMe controller enumeration (S.M.A.R.T. health read is a stub) |
 | `pci-inventory.efi` | — | PCI device enumeration |
 | `diag-shell.efi` | — | Interactive diagnostic shell |
 
@@ -334,16 +341,18 @@ Manifest (`modules/manifest.toml`) provides friendly names. Modules signed with 
 
 ---
 
-## Filesystem drivers
+## Filesystem reading
 
-LamBoot loads EFI filesystem drivers from `\EFI\LamBoot\drivers\` at startup under the SecurityOverride Path F guard:
+LamBoot reads its boot-relevant filesystems with native, in-binary, read-only Rust readers — no firmware filesystem driver and no GPLv3 EfiFs `*.efi` on the kernel-load path:
 
 ```
-ext4_x64.efi    btrfs_x64.efi    ntfs_x64.efi    xfs_x64.efi
-zfs_x64.efi     f2fs_x64.efi     iso9660_x64.efi
+ext4    btrfs    FAT    XFS    exFAT    ZFS (boot pool)
+media:  EROFS    ISO 9660    SquashFS    cramfs    romfs    UDF
 ```
 
-After loading, LamBoot reconnects all controllers, making new SimpleFileSystem handles available.
+Every native reader is read-only by construction. ZFS is limited to single-disk, mirror, and single-parity RAIDZ1 boot pools (unencrypted); the media mounts are read-only but not yet integrity/trust-root verified.
+
+The GPL EfiFs `*.efi` drivers still ship in the bundle under `\EFI\LamBoot\drivers\` as inert fallback, but the readers above are what actually mount their filesystems — the bundled `xfs_x64.efi` and `zfs_x64.efi` are now **skipped at boot** because the native readers cover those formats. `ntfs_x64.efi`, `f2fs_x64.efi`, and `iso9660_x64.efi` are still firmware-served (a standalone `iso9660` partition still uses the driver, even though the media path reads ISO 9660 natively); LamBoot loads those at startup under the SecurityOverride Path F guard, then reconnects controllers to expose their SimpleFileSystem handles.
 
 **Sources:** [rEFInd](https://www.rodsbooks.com/refind/) (GPL-2.0) and [EfiFs](https://github.com/pbatard/efifs) (GPL-3.0). Distributed as separate binaries under GPL linking exception — LamBoot itself is MIT/Apache-2.0.
 
@@ -353,8 +362,8 @@ After loading, LamBoot reconnects all controllers, making new SimpleFileSystem h
 
 | | **LamBoot** | GRUB | systemd-boot | rEFInd | sd-boot-rs |
 |---|---|---|---|---|---|
-| Language | **Rust** | C | C | C++ | Rust |
-| Binary | **~600 KB** | ~4 MB | ~300 KB | ~1 MB | ~200 KB |
+| Language | **Rust** | C | C | C | Rust |
+| Binary | **~1.05 MB** | ~4 MB | ~300 KB | ~1 MB | ~200 KB |
 | Memory-safe | **Yes** | No | No | No | Yes |
 | GUI | **Yes + mouse** | No | Text | Yes + icons | No |
 | BLS | **Full** | Partial | Full | None | Partial |
@@ -363,7 +372,7 @@ After loading, LamBoot reconnects all controllers, making new SimpleFileSystem h
 | **Trust-evidence log** | **Yes (JSON)** | **No** | **No** | **No** | **No** |
 | Secure Boot | **DB + shim + MOK + SecurityOverride** | Shim | Shim | Shim | Shim |
 | TPM | **PCR 4/5/12** | No | PCR 4/5/8/12 | No | Roadmap |
-| Loadable FS drivers | **Yes** | Built-in | FAT only | Yes | Yes |
+| Native FS reading | **ext4/btrfs/FAT/XFS/exFAT/ZFS + media** | Built-in | FAT only | No | No |
 | Proxmox integration | **First-class** | Generic | Generic | Generic | Cloud |
 | x86_64 + aarch64 | **Both** | Both | Both | x86_64 | Both |
 | License | MIT OR Apache-2.0 | GPLv3 | LGPL-2.1+ | GPLv3 | MIT |

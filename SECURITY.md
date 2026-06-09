@@ -16,14 +16,14 @@ If you believe you've found a security vulnerability in LamBoot, please report i
 - Memory corruption in LamBoot's Rust code (even in `unsafe` blocks)
 - Signature verification bypasses or logic errors in LamBoot-specific code
 - MOK enrollment flaws in `lamboot-install`
-- Trust-evidence log tampering vulnerabilities (beyond the advisory v0.8.3 limitation — see [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md))
+- Trust-evidence log tampering vulnerabilities (beyond the advisory v0.8.3 limitation — see the [threat model](https://lamco.ai/products/lamboot/docs/threat-model/))
 - TPM measurement gaps or incorrect PCR extensions
 - Filesystem driver invocation flaws specific to LamBoot
 - Information disclosure of signing keys or MOK passwords through LamBoot code paths
 
 **Out of scope (report upstream):**
 - Bugs in `shim`, `grub`, the Linux kernel, OVMF, UEFI firmware, EfiFs drivers, or other dependencies. Report those to their respective projects.
-- The class of "bootloader → kernel handoff is not verified" — this is an ecosystem-wide design reality documented in our [security model](docs/SECURITY-MODEL.md) §3. Not a bug in LamBoot.
+- The class of "bootloader → kernel handoff is not verified" — this is an ecosystem-wide design reality documented in our [security model](https://lamco.ai/products/lamboot/docs/threat-model/) §3. Not a bug in LamBoot.
 - Secure Boot disabled by user (out of scope for any bootloader).
 
 ## Supported versions
@@ -37,7 +37,7 @@ Only the latest released LamBoot version receives security updates. We aim for a
 
 ## Signing keys
 
-See [`docs/KEY-GENERATION.md`](docs/KEY-GENERATION.md) for the production key hierarchy (PK/KEK RSA 4096, db RSA 2048 per shim-MOK compatibility constraints).
+See the [key-generation guide](https://lamco.ai/products/lamboot/docs/key-generation/) for the production key hierarchy (PK/KEK RSA 4096, db RSA 2048 per shim-MOK compatibility constraints).
 
 Public certificates are distributed in release tarballs as `keys/db.der` for MOK enrollment.
 
@@ -49,4 +49,4 @@ If the db signing key is compromised, expect an emergency release with a new db 
 
 ## What LamBoot does differently
 
-LamBoot is written in Rust with `unsafe` encapsulated in audited primitives. We maintain a trust-evidence log (`\loader\boot-trust.log`) that surfaces every image-authentication decision — no other production Linux bootloader does this. See [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md) for the full threat model and our honest statement of what we defend against vs. what remains in the broader ecosystem.
+LamBoot is written in Rust with `unsafe` encapsulated in audited primitives. We maintain a trust-evidence log (`\loader\boot-trust.log`) that surfaces every image-authentication decision — no other production Linux bootloader does this. See the [threat model](https://lamco.ai/products/lamboot/docs/threat-model/) for the full threat model and our honest statement of what we defend against vs. what remains in the broader ecosystem.

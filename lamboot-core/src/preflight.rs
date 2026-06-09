@@ -11,7 +11,7 @@
 use alloc::{format, string::String, vec::Vec};
 
 use crate::{
-    boot_types::{CheckResult, EntryKind, Icon, PreflightResult, Severity},
+    boot_types::{CheckResult, EntryKind, Icon, IsoSource, PreflightResult, Severity},
     fs::Volume,
     secure::SecureBootState,
 };
@@ -116,6 +116,22 @@ pub(crate) fn run_preflight(
             // ext4-view backend the `driver_count == 0` heuristic is a
             // false positive, and `check_file_exists_any` above already
             // answers the reachability question definitively.
+        }
+
+        EntryKind::Iso {
+            source: IsoSource::File { iso_path },
+        } => {
+            // The `.iso` must exist on a readable volume. Deeper validation
+            // (ISO9660 mount + loopback.cfg / El Torito) happens at boot
+            // (M2 mount, M3/M4 method selection), not in preflight.
+            checks.push(check_file_exists_any(esp, extra_volumes, iso_path));
+        }
+        EntryKind::Iso {
+            source: IsoSource::Optical { .. },
+        } => {
+            // The disc's presence + ISO9660 PVD were confirmed at discovery
+            // (scan_optical_handles probes the PVD); there is no file path to
+            // re-check, and the mount itself happens at boot.
         }
     }
 

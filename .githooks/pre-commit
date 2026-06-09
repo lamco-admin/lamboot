@@ -19,6 +19,25 @@ cargo check --target x86_64-unknown-uefi
 
 echo "pre-commit: checking layer contract..."
 python3 tools/check-layers.py
+# --graph is a SEPARATE, stricter check (module dependency graph is acyclic) that
+# CI also runs. Omitting it here once let a block_source<->fs_backend_lvm_dispatch
+# import cycle pass the hook but fail CI. Keep both in lockstep with .github/ci.yml.
+echo "pre-commit: checking module graph is acyclic..."
+python3 tools/check-layers.py --graph >/dev/null
+
+# Installer <-> runtime native-filesystem coverage must not drift (the v0.16.x
+# regression class: runtime gained xfs/zfs readers but the installer kept
+# shipping their legacy drivers). CI enforces the same check.
+echo "pre-commit: checking installer/runtime fs-coverage parity..."
+python3 tools/check-fs-coverage-parity.py
+
+# Placeholder scan — the same gate CI runs; fail on unresolved markers in sources.
+echo "pre-commit: scanning for unresolved placeholders..."
+if git grep -nE '\bXX\b|FIXME|PLACEHOLDER|YYYY' -- \
+    'lamboot-core/**' 'lamboot-modules/**' 'tools/**' 'lib/**' 'build.sh' 'package-release.sh'; then
+    echo "pre-commit: unresolved placeholder(s) found (see above) — aborting." >&2
+    exit 1
+fi
 
 # Installer dual-contract unit tests. Skipped (not failed) when bats is absent so
 # a contributor without it isn't blocked; CI installs bats and always enforces.

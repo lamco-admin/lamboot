@@ -46,7 +46,7 @@ fi
 
 # --- Constants ---
 
-readonly LAMBOOT_VERSION="0.15.2"
+readonly LAMBOOT_VERSION="0.16.5"
 readonly LAMBOOT_LABEL="LamBoot"
 
 readonly EFI_DIR="EFI/LamBoot"
@@ -187,7 +187,7 @@ emit_capabilities() {
         lamboot_version=$(< /usr/share/lamboot/EFI/LamBoot/.version)
     fi
     cat <<EOF
-{"protocol_version":${LAMBOOT_INSTALLER_PROTOCOL_VERSION},"tool":"lamboot-install","tool_version":"${LAMBOOT_VERSION}","lamboot_version":"${lamboot_version}","filesystems":{"native":["fat","ext2","ext3","ext4","btrfs"],"via_driver":["xfs","f2fs","ntfs","iso9660","zfs"]},"signing_modes":{"signed_release":true,"signed_mok":true,"signed_db":true,"unsigned":true},"secure_boot":{"shim_chain_supported":true,"shim_search_paths":["/EFI/ubuntu/shimx64.efi","/EFI/debian/shimx64.efi","/EFI/fedora/shimx64.efi","/EFI/centos/shimx64.efi","/EFI/rhel/shimx64.efi","/EFI/rocky/shimx64.efi","/EFI/almalinux/shimx64.efi","/EFI/opensuse/shimx64.efi","/EFI/proxmox/shimx64.efi","/EFI/systemd/shim.efi","/EFI/BOOT/BOOTX64.EFI"],"detect_default_loader":true},"trust_log_tokens":["shim_mok","degraded_trust_sb_direct","degraded_trust_sb_off","firmware_loadimage"],"commands":["install","update","remove"],"flags":["--esp","--signed","--no-shim","--no-mok","--with-drivers","--with-drivers-legacy","--with-modules","--update","--remove","--dry-run","--force","--force-foreign-esp","--quiet","--verbose","--fallback","--no-fallback","--replace-fallback","--replace","--no-bls","--keep-entries","--keep-logs","--install-toolkit","--no-install-toolkit","--kernel-firmware-db-signed","--set-default","--no-make-default","--no-efi-entry","--protocol-version","--capabilities","--json","--no-prompt","--root","--proxmox-host","--replace-grub","--refresh","--repair-bls","--capcheck-json"],"exit_codes":{"ok":0,"error":1,"partial":2,"noop":3,"unsafe":4,"abort":5,"not_applicable":6,"prerequisite_missing":7}}
+{"protocol_version":${LAMBOOT_INSTALLER_PROTOCOL_VERSION},"tool":"lamboot-install","tool_version":"${LAMBOOT_VERSION}","lamboot_version":"${lamboot_version}","filesystems":{"native":["fat","ext2","ext3","ext4","btrfs","xfs","exfat","zfs"],"via_driver":["f2fs","ntfs","iso9660"]},"signing_modes":{"signed_release":true,"signed_mok":true,"signed_db":true,"unsigned":true},"secure_boot":{"shim_chain_supported":true,"shim_search_paths":["/EFI/ubuntu/shimx64.efi","/EFI/debian/shimx64.efi","/EFI/fedora/shimx64.efi","/EFI/centos/shimx64.efi","/EFI/rhel/shimx64.efi","/EFI/rocky/shimx64.efi","/EFI/almalinux/shimx64.efi","/EFI/opensuse/shimx64.efi","/EFI/proxmox/shimx64.efi","/EFI/systemd/shim.efi","/EFI/BOOT/BOOTX64.EFI"],"detect_default_loader":true},"trust_log_tokens":["shim_mok","degraded_trust_sb_direct","degraded_trust_sb_off","firmware_loadimage"],"commands":["install","update","remove"],"flags":["--esp","--signed","--no-shim","--no-mok","--with-drivers","--with-drivers-legacy","--with-modules","--update","--remove","--dry-run","--force","--force-foreign-esp","--quiet","--verbose","--fallback","--no-fallback","--replace-fallback","--replace","--no-bls","--keep-entries","--keep-logs","--install-toolkit","--no-install-toolkit","--kernel-firmware-db-signed","--set-default","--no-make-default","--no-efi-entry","--protocol-version","--capabilities","--json","--no-prompt","--root","--proxmox-host","--replace-grub","--refresh","--repair-bls","--capcheck-json"],"exit_codes":{"ok":0,"error":1,"partial":2,"noop":3,"unsafe":4,"abort":5,"not_applicable":6,"prerequisite_missing":7}}
 EOF
 }
 
@@ -1279,17 +1279,20 @@ phase1_detect_environment() {
 
 # SDS-6: is a filesystem natively covered by a LamBoot backend compiled
 # into the bootloader binary (i.e. do we NOT need a legacy UEFI FS
-# driver for it)? Mirrors lamboot-core/src/drivers.rs::filesystem_natively_covered.
+# driver for it)? MUST mirror lamboot-core/src/drivers.rs::filesystem_natively_covered.
 #
-# Kept in sync by convention — if you add a native backend in lamboot-core,
-# extend this list too. Both sides cover:
+# Parity is enforced by tools/check-fs-coverage-parity.py (pre-commit + CI),
+# so this list and the Rust one cannot silently drift again. Both sides cover:
 #   * ext2/ext3/ext4 via ext4-view (SDS-2)
-#   * btrfs via lambutter (Path A; lamboot-core/src/fs_backend_btrfs.rs)
+#   * btrfs via lambutter (lamboot-core/src/fs_backend_btrfs.rs)
 #   * FAT is always UEFI-native
+#   * xfs via lamxfs (v0.16.0; fs_backend_xfs.rs)
+#   * zfs via lamzfs (v0.16.0; fs_backend_zfs.rs) — skipping the legacy EfiFs
+#     zfs driver is load-bearing: a loaded driver attaches BY_DRIVER and
+#     shadows the native backend, so the partition mis-enumerates as FAT.
 is_filesystem_natively_covered() {
     case "$1" in
-        ext2|ext3|ext4|btrfs|vfat|fat|fat32) return 0 ;;
-        # Future: xfs if native backend lands in lamboot-core.
+        ext2|ext3|ext4|btrfs|vfat|fat|fat32|xfs|zfs) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -1818,20 +1821,25 @@ detect_bls_target() {
             # /boot IS the ESP (e.g. ESP mounted directly at /boot).
             reason="boot_is_esp"
         else
-            case "$boot_fs" in
-                # Filesystems LamBoot reads natively. vfat is covered by the
-                # FatRo reader (v0.15.0); ext2/3/4 + btrfs by the native
-                # backends. xfs/f2fs/ntfs/zfs are via-driver/none — stay ESP.
-                vfat|ext2|ext3|ext4|btrfs)
-                    BLS_INSTALL_DIR="/boot/${BLS_DIR}"
-                    BLS_ON_BOOT=1
-                    BLS_PLACEMENT="boot_in_place"
-                    reason="native_readable_boot:${boot_fs}"
-                    ;;
-                *)
-                    reason="boot_fs_not_native:${boot_fs:-unknown}"
-                    ;;
-            esac
+            # Read-in-place (B-path) eligibility = LamBoot has a native
+            # backend for this fstype. Single source: is_filesystem_natively_
+            # covered() (parity-checked against drivers.rs), so adding a
+            # backend there auto-enables B-path here. zfs is the one
+            # documented exception: it IS natively readable via lamzfs, but is
+            # held to ESP-staging (A-path) until lamzfs is field-soaked across
+            # pool topologies — the v0.16.0 boot validation exercised only a
+            # single-vdev lz4 pool, not raidz/mirror/encrypted /boot. The
+            # driver-skip still applies (above); only read-in-place is deferred.
+            if [ "$boot_fs" = zfs ]; then
+                reason="native_readable_deferred_esp:zfs"
+            elif is_filesystem_natively_covered "$boot_fs"; then
+                BLS_INSTALL_DIR="/boot/${BLS_DIR}"
+                BLS_ON_BOOT=1
+                BLS_PLACEMENT="boot_in_place"
+                reason="native_readable_boot:${boot_fs}"
+            else
+                reason="boot_fs_not_native:${boot_fs:-unknown}"
+            fi
         fi
     fi
 
@@ -2051,7 +2059,7 @@ install_efi_binary() {
     if (( OPT_SIGNED )) && [ ! -f "$src" ]; then
         die "--signed requested but signed binary not found: $src
   Build with signing first: ./build.sh && ./tools/sign-lamboot.sh
-  (see docs/SECURE-BOOT-DEPLOYMENT.md)"
+  (see https://lamco.ai/products/lamboot/docs/secure-boot-deployment/)"
     fi
 
     # v0.10.1: under --root we don't know the TARGET's Secure Boot state
@@ -2064,7 +2072,7 @@ install_efi_binary() {
         die "Secure Boot is enabled but --signed was not specified.
   Installing an unsigned binary will not boot on this system.
   Use --signed (recommended), or --force to proceed anyway, or disable Secure Boot.
-  See docs/SECURE-BOOT-DEPLOYMENT.md for the decision tree."
+  See https://lamco.ai/products/lamboot/docs/secure-boot-deployment/ for the decision tree."
     fi
 
     # Validate the binary before installing
@@ -2135,6 +2143,15 @@ identify_bootloader() {
     local path="$1"
     [ -f "$path" ] || { echo "none"; return; }
 
+    # LamBoot FIRST. Our own binary embeds the string "systemd-boot" (the
+    # SecurityOverride mirrors systemd-boot's ShimLock dance), so running the
+    # systemd-boot check ahead of this misclassifies our OWN old fallback as
+    # systemd-boot and makes `--update --fallback` refuse to refresh it on an
+    # upgrade. Checking LamBoot up front is safe — no shim/GRUB/systemd-boot/
+    # rEFInd/Windows loader carries the "LamBoot" marker.
+    if grep -aqE "LamBoot|lamboot" "$path" 2>/dev/null; then
+        echo "lamboot"; return
+    fi
     # shim has a very distinctive "MokManager" string + UEFI Shim
     if grep -aqE "MokManager|shim_lock|UEFI[_ ]Shim" "$path" 2>/dev/null; then
         echo "shim"; return
@@ -2154,11 +2171,6 @@ identify_bootloader() {
     # Windows bootmgfw.efi / bootmgr.efi — distinctive copyright + path strings
     if grep -aqE "Windows Boot Manager|bootmgfw|bootmgr\\.efi" "$path" 2>/dev/null; then
         echo "windows"; return
-    fi
-    # LamBoot itself — if this is already our binary (hash match is a
-    # stronger test but we're pre-hash here; a string check is adequate)
-    if grep -aqE "LamBoot|lamboot" "$path" 2>/dev/null; then
-        echo "lamboot"; return
     fi
     echo "unknown"
 }
@@ -2630,7 +2642,7 @@ install_mok_enrollment() {
         echo ""
         echo "  After that second reboot, LamBoot will load normally."
         echo ""
-        echo "  Full walkthrough: docs/MOK-ENROLLMENT-GUIDE.md"
+        echo "  Full walkthrough: https://lamco.ai/products/lamboot/docs/mok-enrollment/"
         echo "========================================================================"
         echo ""
     fi
@@ -3000,6 +3012,44 @@ capture_prior_bootorder() {
         || detail "could not write BootOrder restore marker (non-fatal)"
 }
 
+# Warn when the ESP lives on a different physical disk than the OS root. On bare
+# metal this is fine — firmware enumerates every disk for removable/ESP boot
+# options. But on a VM hypervisor whose firmware only boot-indexes the disks in
+# the VM's configured boot order (observed on Proxmox/QEMU OVMF, VM 102), a named
+# UEFI Boot#### entry pointing at a NON-boot-indexed disk is silently PRUNED on
+# the next boot — leaving LamBoot reachable only via the \EFI\BOOT\BOOTX64.EFI
+# fallback (and, if that's stale, booting an OLD LamBoot). Surfacing it at install
+# time turns a silent revert-to-fallback into an actionable warning.
+warn_if_esp_on_separate_disk() {
+    [ -d /sys/firmware/efi/efivars ] || return 0   # no NVRAM runtime — nothing to persist
+    [ -n "$ESP_DISK" ] || return 0
+
+    local root_src root_disk
+    root_src=$(findmnt -n -o SOURCE / 2>/dev/null)
+    root_src=${root_src%%\[*}                       # strip btrfs [subvol] decoration
+    [ -n "$root_src" ] || return 0
+    root_disk=$(lsblk -nro PKNAME "$root_src" 2>/dev/null | head -1)
+    [ -n "$root_disk" ] || return 0                 # unresolvable (LVM/LUKS stack) — don't guess
+    root_disk="/dev/${root_disk}"
+    [ "$root_disk" = "$ESP_DISK" ] && return 0      # ESP shares the OS disk — durable
+
+    local virt=""
+    command -v systemd-detect-virt >/dev/null 2>&1 && virt=$(systemd-detect-virt 2>/dev/null)
+
+    warn "ESP is on a separate disk (${ESP_DISK}) from the OS root (${root_disk})."
+    if [ -n "$virt" ] && [ "$virt" != "none" ]; then
+        warn "  Under virtualization (${virt}), firmware usually only boot-indexes the disks"
+        warn "  in the VM's configured boot order. If ${ESP_DISK} is NOT in that order, the"
+        warn "  named 'LamBoot' UEFI entry is pruned on the next boot and LamBoot is reachable"
+        warn "  only via the \\EFI\\BOOT\\BOOTX64.EFI fallback."
+        warn "  Fix: add ${ESP_DISK} to the VM boot order (Proxmox:"
+        warn "       qm set <vmid> --boot 'order=<esp-disk>;<other-disks>'), or pass --fallback"
+        warn "       so the fallback path is kept current as well."
+    fi
+    emit_event "warning" "uefi_entry" \
+        "msg=esp_on_separate_disk" "esp_disk=${ESP_DISK}" "root_disk=${root_disk}" "virt=${virt:-unknown}"
+}
+
 create_efi_entry() {
     # Snapshot the pre-LamBoot BootOrder before any --create / --bootorder
     # mutation below (covers the make-default-last reorder and set_default_entry).
@@ -3047,6 +3097,8 @@ create_efi_entry() {
             detail "Boot order: ${safe_order} (LamBoot last, existing bootloader still default)"
         fi
     fi
+
+    warn_if_esp_on_separate_disk
 
     if (( OPT_SET_DEFAULT )); then
         set_default_entry "$existing"
@@ -3185,9 +3237,18 @@ exec >>"$LOG" 2>&1
 echo "=== lamboot first-boot $(date -Iseconds) ==="
 
 # At first boot the in-target toolkit (lamboot-install / efibootmgr) may not be
-# present yet; giving up permanently would strand the system on the fallback
-# path. entry_ok gates the self-disable so we retry until the entry exists.
+# present yet; a transient miss should retry. But a PERSISTENT block must not
+# loop forever — most importantly an SELinux-enforcing distro (RHEL/Rocky/Alma)
+# denying this confined service the efivarfs write, which no number of retries
+# fixes. After MAX_ATTEMPTS we log an actionable notice and disable the service
+# (non-fatal: the system stays bootable via the bootloader's own NVRAM
+# self-install — the primary pathway, policy [boot-entry] self_install — and/or
+# the firmware removable-media entry).
 entry_ok=0
+ATTEMPT_FILE="/var/lib/lamboot/first-boot-attempts"
+MAX_ATTEMPTS=3
+attempts=$(cat "$ATTEMPT_FILE" 2>/dev/null || echo 0)
+case "$attempts" in ''|*[!0-9]*) attempts=0 ;; esac
 
 # Exact-description boot-entry matcher: the entry's description must be exactly
 # "LamBoot", terminated by a TAB (efibootmgr's field separator before the device
@@ -3237,7 +3298,9 @@ else
             echo "UEFI Boot entry 'LamBoot' created"
             entry_ok=1
         else
-            echo "entry still absent after --update - will retry next boot"
+            # efibootmgr read OK above but the entry didn't appear → the create
+            # WRITE was refused (the classic SELinux-enforcing efivarfs denial).
+            echo "entry absent after --update — the NVRAM write was refused (e.g. SELinux-enforcing)"
         fi
     fi
 fi
@@ -3290,12 +3353,26 @@ touch "$ONETIME_MARKER"
 echo "one-time NVRAM setup (MOK/ShimRetain) complete"
 fi
 
-# Disable only once the boot entry is confirmed; otherwise retry next boot.
+# Disable once the entry is confirmed, OR after MAX_ATTEMPTS to avoid an infinite
+# retry on a persistently-blocked write. Either way the system stays bootable.
 if [ "$entry_ok" -eq 1 ]; then
+    rm -f "$ATTEMPT_FILE" 2>/dev/null || true
     systemctl disable lamboot-first-boot.service 2>/dev/null || true
     echo "boot entry confirmed; first-boot service disabled"
 else
-    echo "boot entry not yet confirmed; leaving service enabled to retry next boot"
+    attempts=$((attempts + 1))
+    echo "$attempts" > "$ATTEMPT_FILE" 2>/dev/null || true
+    if [ "$attempts" -ge "$MAX_ATTEMPTS" ]; then
+        systemctl disable lamboot-first-boot.service 2>/dev/null || true
+        echo "boot entry still absent after ${attempts} attempt(s) — giving up (non-fatal)."
+        echo "  The system remains bootable via the bootloader self-installed entry and/or the"
+        echo "  firmware removable-media entry. To add the named OS-side entry manually, run from"
+        echo "  an unconfined root shell:  ${LBI:-lamboot-install} --update ${SIGNED_FLAG} --no-mok"
+        echo "  On SELinux-enforcing systems this usually means a mislabeled payload from a"
+        echo "  non-rpm /tmp deploy; fix the labels with:  restorecon -Rv /usr/share/lamboot"
+    else
+        echo "boot entry not yet confirmed (attempt ${attempts}/${MAX_ATTEMPTS}); will retry next boot"
+    fi
 fi
 FIRSTBOOT_EOF
     # Inject the signing flag (see SIGNED_FLAG in the staged script) so the
@@ -3498,6 +3575,36 @@ normalize_kernel_install_layout() {
     fi
 }
 
+# Relabel installed files for SELinux. A hand-deployed (non-rpm) install often
+# copies the payload through /tmp, leaving files labeled user_tmp_t — a type
+# confined service domains (e.g. init_t, which runs the first-boot NVRAM service)
+# may NOT execute, so OS-side boot-entry creation fails on enforcing RHEL/Rocky/
+# Alma. Concretely: /usr/bin/lamboot-install is a symlink into /usr/share/lamboot;
+# exec'ing it follows to the payload, and if that is user_tmp_t, init_t is denied
+# execute. restorecon resets it to usr_t (∈ base_ro_file_type, which init_t may
+# execute). rpm installs label correctly already, so this is an idempotent no-op
+# there; non-SELinux distros skip it entirely. This is the correct fix — NOT a
+# custom SELinux policy module (which would needlessly loosen init_t).
+relabel_selinux_files() {
+    command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled 2>/dev/null || return 0
+    command -v restorecon >/dev/null 2>&1 || return 0
+    if (( OPT_DRY_RUN )); then
+        detail "[dry-run] would restorecon installed files (SELinux is enabled)"
+        return 0
+    fi
+    # Best-effort; a missing path is not an error. -R reaches the payload binaries
+    # + the lamboot-install symlink target the first-boot service execs.
+    restorecon -RF \
+        /usr/share/lamboot \
+        /etc/lamboot \
+        /usr/lib/systemd/system/lamboot-mark-success.service \
+        /usr/lib/systemd/system/lamboot-first-boot.service \
+        /usr/lib/kernel/install.d/90-lamboot.install \
+        /usr/local/bin/lamboot-kernel-hook \
+        >/dev/null 2>&1 || true
+    detail "restorecon: relabeled installed files for SELinux"
+}
+
 phase7_systemd_integration() {
     msg "Phase 7: Systemd integration..."
 
@@ -3516,6 +3623,8 @@ phase7_systemd_integration() {
         install_debian_kernel_hooks
         normalize_kernel_install_layout
     fi
+
+    relabel_selinux_files
 }
 
 # ============================================================================
@@ -3839,7 +3948,7 @@ EOF
             ;;
     esac
     echo
-    msg "Docs: docs/LAMBOOT-TOOLS-OVERVIEW.md (this repo) or"
+    msg "Docs: https://lamco.ai/products/lamboot/tools/ or"
     msg "      https://github.com/lamco-admin/lamboot-tools"
 }
 
@@ -5188,7 +5297,7 @@ For stock distro installs on SB-enabled systems, the correct flow is:
     lamboot-install --signed              # deploys shim + LamBoot + optional MOK prompt
     lamboot-install --signed --no-mok     # deploys shim but skips interactive mokutil
 
-See docs/SECURE-BOOT-DEPLOYMENT.md."
+See https://lamco.ai/products/lamboot/docs/secure-boot-deployment/."
     fi
 }
 

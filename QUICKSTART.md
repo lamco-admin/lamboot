@@ -1,15 +1,15 @@
 # LamBoot Quick Start
 
-**Version:** 0.12.0
+**Version:** 0.16.5
 
 ## From a release tarball (recommended)
 
 ```bash
 # Download
-curl -L -O https://github.com/lamco-admin/lamboot/releases/download/v0.8.3/lamboot-0.8.3-x86_64.tar.gz
-sha256sum -c lamboot-0.8.3-x86_64.tar.gz.sha256
+curl -L -O https://github.com/lamco-admin/lamboot/releases/download/v0.16.5/lamboot-0.16.5-x86_64.tar.gz
+sha256sum -c lamboot-0.16.5-x86_64.tar.gz.sha256
 
-tar xzf lamboot-0.8.3-x86_64.tar.gz && cd lamboot-0.8.3
+tar xzf lamboot-0.16.5-x86_64.tar.gz && cd lamboot-0.16.5
 
 # Install (Secure Boot off — homelab / dev)
 sudo ./lamboot-install
@@ -29,8 +29,8 @@ rustup target add x86_64-unknown-uefi aarch64-unknown-uefi
 # Build
 ./build.sh
 
-# Output: dist/EFI/LamBoot/lambootx64.efi (~600 KB, x86_64)
-#         dist/EFI/LamBoot/lambootaa64.efi (aarch64)
+# Output: dist/EFI/LamBoot/lambootx64.efi (~1.05 MB, x86_64)
+#         dist/EFI/LamBoot/lambootaa64.efi (~922 KB, aarch64)
 ```
 
 ## Test in QEMU

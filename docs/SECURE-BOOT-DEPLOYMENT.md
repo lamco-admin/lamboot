@@ -2,7 +2,7 @@
 
 **Audience:** system operators installing LamBoot on systems that may have UEFI Secure Boot enabled.
 **Scope:** every trust path LamBoot supports, end-to-end, with recovery procedures.
-**Version:** 0.12.0
+**Version:** 0.16.5
 
 ---
 
@@ -142,6 +142,8 @@ For richer trust evidence, configure `policy.toml` to force native PE loader on 
 
 **When this helps:** fleet deployment, headless installs, scripted bring-up — anywhere a console-keyboard MokManager confirmation is inconvenient.
 
+**Companion: bootloader-side NVRAM self-install (since v0.16.3).** Independently of how LamBoot's *signature* is trusted, LamBoot ensures its own `Boot####` entry (pointing at `\EFI\LamBoot\lambootx64.efi`) exists and is front-loaded in `BootOrder`, creating it from the UEFI environment at boot if absent. This is what keeps the entry present on headless/scripted bring-up where `efibootmgr` may be unavailable or an OS service is SELinux-confined. It touches only the non-authenticated `Boot####`/`BootOrder` variables — never the signed Secure Boot key stores (`PK`/`KEK`/`db`) — so it composes with every Secure Boot configuration here without affecting the trust path. It is idempotent (keyed on the exact `LamBoot` description) and gated by `[boot-entry] self_install` in `policy.toml` (default on; set `false` to manage boot order externally).
+
 **When it doesn't apply:** bare-metal installs on hardware you don't have firmware-key-management access to. Stick with §4's standard MOK enrollment in that case.
 
 **How to pre-enroll:** see `docs/OVMF-VARS-PROXMOX.md` §5 (fleet template approach) or §5a (in-place modification of an existing VM's firmware NVRAM). The cert needs to land in `db`, not `MOK` — see `OVMF-VARS-PROXMOX.md §1.1` for why `--add-mok` alone fails.
@@ -159,6 +161,8 @@ This optimization composes with Config 3, doesn't replace it. Skipping MokManage
 `--no-shim` is appropriate **only** when the kernel you want to boot is signed by a cert that is itself in firmware DB — typically a self-signed UKI or a kernel from a custom build shop. If that's your scenario, pair `--no-shim` with `--kernel-firmware-db-signed` to acknowledge the constraint.
 
 **When to use:** you own the hardware, can reach firmware setup, and want the firmware to trust LamBoot directly without relying on MokManager. Typical for homelab operators, developers, and Proxmox host boot (as opposed to guests).
+
+> **Legacy-MBR `/boot` is supported (since v0.16.3).** Owner-controlled hardware is often a BIOS-installed system later switched to UEFI, whose disk carries a legacy `msdos` partition table (e.g. RHEL/Rocky/Alma/CentOS with XFS `/boot` as a primary partition). LamBoot's partition discovery enumerates GPT, MBR (via `PartitionInfo.mbr_partition_record()`), and BlockIO-only logical partitions, de-duplicated by handle, so these layouts are discovered and booted natively rather than presenting an empty menu.
 
 **Procedure varies by firmware.** The general shape:
 
@@ -308,7 +312,7 @@ Only recoverable through firmware setup. Reboot into firmware, navigate to the s
 
 LamBoot supports **UKIs as first-class menu entries** in all four configurations. UKIs are single-file PE binaries that bundle a Linux kernel, initrd, cmdline, and (optionally) embedded signature per the [UAPI UKI specification](https://uapi-group.org/specifications/specs/unified_kernel_image/).
 
-LamBoot automatically discovers UKIs in `\EFI\Linux\*.efi` on the ESP. Each discovered UKI appears as a separate menu entry:
+LamBoot automatically discovers UKIs in `\EFI\Linux\*.efi` on the ESP. Its PE handling on the native path is a hand-rolled `no_std` PE/COFF reader (since v0.16.1) that parses only the load-bearing header fields — the third-party `goblin` parser was dropped from `lamboot-core`, keeping one fewer third-party parser on the boot trust surface. Each discovered UKI appears as a separate menu entry:
 
 - **Display name** is extracted from the UKI's `.osrel` section (PRETTY_NAME + kernel version when present).
 - **Command line** is extracted from the `.cmdline` section — no distro-specific knowledge needed.
@@ -317,7 +321,7 @@ LamBoot automatically discovers UKIs in `\EFI\Linux\*.efi` on the ESP. Each disc
 
 No LamBoot-side configuration required. If your distro writes UKIs (kernel-install with ukify on Arch, Fedora 41+, Debian with the `systemd-ukify` package, Ubuntu with opt-in configuration), LamBoot will discover them.
 
-**Why this matters for Secure Boot:** UKIs live on the FAT ESP. Firmware reads FAT natively — no ext4/btrfs/xfs driver needed. Under Config 3 (shim + MOK), UKIs boot even if filesystem driver loading has quirks, because the UKI itself is the kernel. On Ubuntu systems where kernels live on an ext4 root partition, converting to a UKI workflow sidesteps driver-loading issues entirely.
+**Why this matters for Secure Boot:** UKIs live on the FAT ESP. Firmware reads FAT natively. LamBoot also reads ext4/ext2/ext3, btrfs, XFS, exFAT, and ZFS with native in-binary readers (no firmware filesystem driver needed for those), so for most `/boot` layouts the driver path is already out of the picture. UKIs still give the strongest coverage under Config 3 (shim + MOK) because the UKI itself is the kernel — there is no separate kernel file to read and no driver involved at all — which is why converting to a UKI workflow is the cleanest option on any filesystem LamBoot does not read natively.
 
 **Signing UKIs:** distro ukify tooling signs UKIs with the distro's MOK or with user-enrolled custom keys. LamBoot does not need to sign UKIs — it validates the existing signature via ShimLock or firmware db (depending on config) before booting.
 
@@ -349,6 +353,32 @@ Each row must pass end-to-end on a fresh VM:
 | A Fedora VM with SB forced on | 3 | Yes | Shim chain + MOK on Fedora |
 | Any VM with `OVMF_VARS_lamboot.fd` swapped | 4 | Yes | Proxmox zero-touch |
 | At least one physical machine, manual db enrollment | 2 | Yes | Firmware db path |
+
+---
+
+## 9.5 Boot-from-ISO and Secure Boot (opt-in, off by default)
+
+v0.16.0 adds an **opt-in** capability to boot a Linux distribution directly
+from an `.iso` on a mounted volume or from a physical optical disc. It is
+disabled unless explicitly enabled in `policy.toml`:
+
+```toml
+[boot-from-iso]
+enabled = false   # boot a distro from an .iso on a mounted volume
+optical = false   # boot a distro from an inserted CD/DVD/BD
+```
+
+**Secure Boot posture.** A stock distribution kernel inside an ISO is a Linux
+EFI-stub PE that LamBoot's native PE loader cannot load, so the ISO path falls
+back to firmware `BS->LoadImage`. Verification therefore happens in firmware/
+shim (as for any `LoadImage` handoff), not via LamBoot's native
+`verified_via` trust-log evidence — the same posture as the §3.1 legacy BLS
+path. Under Config 3 the kernel still chains through shim+MOK; under Config 2/4
+it must be firmware-`db`-signed to load. **Validation status:** only Arch
+2026.05 and Fedora 44 have been live-ISO-booted end to end; the other distro
+families are recipe/table-validated, not yet live-booted. Treat this as
+experimental and keep it off on production trust paths until your distro is on
+the live-validated list.
 
 ---
 

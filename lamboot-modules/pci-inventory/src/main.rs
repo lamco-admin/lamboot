@@ -15,7 +15,9 @@ const VIRTIO_VENDOR_ID: u16 = 0x1AF4;
 
 #[entry]
 fn efi_main() -> Status {
-    uefi::helpers::init().expect("Failed to initialize UEFI");
+    if uefi::helpers::init().is_err() {
+        return Status::ABORTED;
+    }
 
     info!("PCI Device Inventory v0.1.0");
     info!("===========================");

@@ -48,21 +48,16 @@
 //! at the crate level — every byte read goes through validated tree-walk
 //! + metadata-CRC32C verification before being returned.
 
-use alloc::{boxed::Box, string::String, vec, vec::Vec};
-use core::error::Error;
+use alloc::{string::String, vec::Vec};
 
-use lambutter::{BlockRead, Btrfs, Error as LbErr, SuperblockReason};
-use uefi::{
-    boot::{self, ScopedProtocol},
-    proto::media::block::BlockIO,
-    Handle,
-};
+use lambutter::{Btrfs, Error as LbErr, SuperblockReason};
+use uefi::Handle;
 
 use crate::{
+    block_source::{BlockIoSource, BlockSource, SourceReader},
     fs_backend::{
         BackendTag, DirEntry, FileKind, FsBackend, FsError, Metadata, Path, PathBuf, Uuid,
     },
-    fs_backend_ext4::compute_aligned_read,
     partitions::FsInfo,
 };
 
@@ -77,51 +72,50 @@ const MAX_SYMLINK_DEPTH: u8 = 40;
 /// Cargo dep version per the same discipline as `EXT4_BACKEND_TAG`.
 pub(crate) const BTRFS_BACKEND_TAG: BackendTag = "lambutter@0.3.0-path";
 
-/// A mounted btrfs volume. Owns the lambutter reader (which holds the
-/// BlockIO protocol) plus probe-time identification metadata.
-pub(crate) struct BtrfsBackend {
-    fs: Btrfs<BlockIoReader>,
+/// A mounted btrfs volume. Owns the lambutter reader plus probe-time
+/// identification metadata.
+///
+/// Generic over the [`BlockSource`] beneath it: `BlockIoSource` for a whole
+/// partition, or (via the Seam-C dispatcher) a logical volume or an `.iso`
+/// loopback region. lambutter's `Btrfs<R>` holds the reader directly rather
+/// than boxing it, so the source type stays in `BtrfsBackend`'s signature —
+/// callers box the whole backend into `Box<dyn FsBackend>`.
+pub(crate) struct BtrfsBackend<S: BlockSource> {
+    fs: Btrfs<SourceReader<S>>,
     fs_uuid: Option<Uuid>,
 }
 
-impl BtrfsBackend {
-    /// Construct a btrfs backend from a block-device handle identified as
-    /// btrfs by the unified `probe_superblock`. Ownership of the BlockIO
-    /// protocol transfers into the backend for its lifetime — same
-    /// rationale as ext4: tree walks are read-frequent and per-call open
-    /// would be wasteful.
+impl BtrfsBackend<BlockIoSource> {
+    /// Construct a btrfs backend over a whole partition identified as btrfs by
+    /// the unified `probe_superblock`. Ownership of the BlockIO protocol
+    /// transfers into the backend for its lifetime — tree walks are
+    /// read-frequent and per-call open would be wasteful.
     pub(crate) fn new(handle: Handle, info: &FsInfo) -> Result<Self, FsError> {
-        let block_io = boot::open_protocol_exclusive::<BlockIO>(handle)?;
-        let media = block_io.media();
-        let media_id = media.media_id();
-        let block_size = media.block_size() as u64;
-        if block_size == 0 {
-            return Err(FsError::Unsupported("block_size=0"));
-        }
-        let last_block = media.last_block();
-        let device_size_bytes = block_size
-            .checked_mul(last_block.saturating_add(1))
-            .ok_or(FsError::Unsupported("device_size_overflow"))?;
-
-        let reader = BlockIoReader {
-            block_io,
-            media_id,
-            block_size,
-        };
-
-        let fs = Btrfs::open(reader, device_size_bytes).map_err(translate_lb_error)?;
-
-        // lambutter does not expose superblock UUID accessor (intentional
+        // lambutter does not expose a superblock UUID accessor (intentional
         // minimal v0.3.x API). Reuse the UUID the partition prober already
         // extracted from byte offset 0x20 of the superblock; both readers
         // looked at the same bytes so consistency is structural.
         let fs_uuid = info.uuid.as_deref().and_then(parse_btrfs_uuid_string);
+        Self::from_source(BlockIoSource::open(handle)?, fs_uuid)
+    }
+}
 
+impl<S: BlockSource + 'static> BtrfsBackend<S> {
+    /// Construct a btrfs backend over any [`BlockSource`]. The source is
+    /// wrapped in the shared [`SourceReader`]; its byte length (the device
+    /// size lambutter needs for end-of-volume bounds checks) is read straight
+    /// off the source. `fs_uuid` is supplied by the caller (the partition
+    /// prober for whole partitions; `None` for sources whose superblock bytes
+    /// weren't pre-peeked).
+    pub(crate) fn from_source(source: S, fs_uuid: Option<Uuid>) -> Result<Self, FsError> {
+        let reader = SourceReader::new(source);
+        let device_size_bytes = reader.byte_len();
+        let fs = Btrfs::open(reader, device_size_bytes).map_err(translate_lb_error)?;
         Ok(Self { fs, fs_uuid })
     }
 }
 
-impl BtrfsBackend {
+impl<S: BlockSource + 'static> BtrfsBackend<S> {
     /// Resolve `path` to an inode, transparently following any symlinks
     /// at the final component up to `MAX_SYMLINK_DEPTH` hops.
     ///
@@ -162,7 +156,7 @@ impl BtrfsBackend {
     }
 }
 
-impl FsBackend for BtrfsBackend {
+impl<S: BlockSource + 'static> FsBackend for BtrfsBackend<S> {
     fn tag(&self) -> BackendTag {
         BTRFS_BACKEND_TAG
     }
@@ -279,40 +273,8 @@ impl FsBackend for BtrfsBackend {
     }
 }
 
-// ---------------------------------------------------------------------------
-// BlockIoReader — the lambutter::BlockRead adapter
-// ---------------------------------------------------------------------------
-
-/// Wraps a `ScopedProtocol<BlockIO>` so lambutter can pull arbitrary byte
-/// ranges from a UEFI block device. Delegates block-alignment maths to
-/// `fs_backend_ext4::compute_aligned_read` — identical logic regardless
-/// of upper-layer filesystem.
-struct BlockIoReader {
-    block_io: ScopedProtocol<BlockIO>,
-    media_id: u32,
-    block_size: u64,
-}
-
-impl BlockRead for BlockIoReader {
-    type Error = Box<dyn Error + Send + Sync + 'static>;
-
-    fn read_at(&mut self, offset_bytes: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
-        if buf.is_empty() {
-            return Ok(());
-        }
-        let (first_lba, aligned_len, intra) =
-            compute_aligned_read(offset_bytes, buf.len(), self.block_size)
-                .ok_or_else(|| Box::<dyn Error + Send + Sync>::from("read overflow"))?;
-
-        let mut aligned = vec![0u8; aligned_len];
-        self.block_io
-            .read_blocks(self.media_id, first_lba, &mut aligned)
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
-
-        buf.copy_from_slice(&aligned[intra..intra + buf.len()]);
-        Ok(())
-    }
-}
+// The lambutter `BlockRead` adapter that used to live here is now the generic
+// `block_source::SourceReader`, shared with the ext4 and LVM backends.
 
 // ---------------------------------------------------------------------------
 // Helpers

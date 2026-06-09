@@ -179,11 +179,18 @@ pub(crate) fn write_boot_report(esp: &mut Volume, entry: &BootEntry, ctx: &BootC
             crate::boot_types::EntryKind::Chainload { .. } => "chainload",
             crate::boot_types::EntryKind::Uki { .. } => "uki",
             crate::boot_types::EntryKind::LinuxLegacy { .. } => "linux_legacy",
+            crate::boot_types::EntryKind::Iso { .. } => "iso",
         },
         json_escape(match &entry.kind {
             crate::boot_types::EntryKind::Chainload { path }
             | crate::boot_types::EntryKind::Uki { path, .. } => path,
             crate::boot_types::EntryKind::LinuxLegacy { kernel_path, .. } => kernel_path,
+            crate::boot_types::EntryKind::Iso {
+                source: crate::boot_types::IsoSource::File { iso_path },
+            } => iso_path,
+            crate::boot_types::EntryKind::Iso {
+                source: crate::boot_types::IsoSource::Optical { label, .. },
+            } => label,
         }),
         json_escape(verified_via),
         json_escape(loader),

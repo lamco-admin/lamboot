@@ -17,8 +17,9 @@
 use std::{fs, path::PathBuf};
 
 use lamboot_fs_tests::pe_loader_pure::{
-    apply_relocations_to_slice, hex_encode_32, parse_headers, sha256_of, validate_headers,
-    PeLoadError, MAX_IMAGE_SIZE, MAX_SECTIONS, PE32_PLUS_MAGIC, REL_DIR64,
+    apply_relocations_to_slice, expected_machine, hex_encode_32, parse_headers, sha256_of,
+    validate_headers, PeLoadError, MAX_IMAGE_SIZE, MAX_SECTIONS, PE32_MAGIC, PE32_PLUS_MAGIC,
+    REL_DIR64,
 };
 
 // ---------------------------------------------------------------------------
@@ -410,4 +411,125 @@ fn hex_encode_round_trip() {
         hex,
         "00112233445566778899aabbccddeeff0123456789abcdeffedcba9876543210"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Hand-rolled-parser regression coverage (v0.16.x goblin removal)
+//
+// These lock in what the goblin-0.9.3 parser got wrong and the hand-rolled
+// reader must get right:
+//   * a PE that OMITS the MSVC DOS stub (e_lfanew == 0x40) — the Linux
+//     EFI-stub layout 0.9.3's `end_offset <= start_offset` check rejected,
+//     powering archie off on every kernel select;
+//   * number_of_rva_and_sizes < 16 (Linux kernels ship ~6) bounding the
+//     data-directory accessors;
+//   * PE32 (0x10b) rejected cleanly, not misparsed with 64-bit offsets.
+// ---------------------------------------------------------------------------
+
+/// Build a minimal but fully §5.1-valid PE32+ EFI application with its PE
+/// header at `e_lfanew`. Sixteen physical data-directory slots are laid
+/// out, of which `declared_n_rva` are advertised. `tls_at_9` optionally
+/// writes a TLS directory (index 9) so a test can prove the n_rva bound.
+/// Pass `opt_magic = PE32_MAGIC` to forge a 32-bit image for rejection.
+fn build_pe(
+    e_lfanew: u32,
+    opt_magic: u16,
+    declared_n_rva: u32,
+    tls_at_9: Option<(u32, u32)>,
+) -> Vec<u8> {
+    let soh: u16 = 24 + 88 + 16 * 8; // 240: standard + windows + 16 data dirs
+    let coff = e_lfanew as usize + 4;
+    let opt = coff + 20;
+    let sec = opt + soh as usize;
+    let buf_len = (sec + 40).max(0x400);
+    let mut b = vec![0u8; buf_len];
+
+    b[0..2].copy_from_slice(b"MZ");
+    b[0x3C..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
+
+    b[e_lfanew as usize..e_lfanew as usize + 4].copy_from_slice(b"PE\0\0");
+    b[coff..coff + 2].copy_from_slice(&expected_machine().to_le_bytes());
+    b[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes()); // number_of_sections
+    b[coff + 16..coff + 18].copy_from_slice(&soh.to_le_bytes()); // size_of_optional_header
+    b[coff + 18..coff + 20].copy_from_slice(&0x0022u16.to_le_bytes()); // characteristics
+
+    b[opt..opt + 2].copy_from_slice(&opt_magic.to_le_bytes());
+    b[opt + 0x10..opt + 0x14].copy_from_slice(&0x1000u32.to_le_bytes()); // entry_rva
+    b[opt + 0x18..opt + 0x20].copy_from_slice(&0x1_4000_0000u64.to_le_bytes()); // image_base
+    b[opt + 0x38..opt + 0x3C].copy_from_slice(&0x2000u32.to_le_bytes()); // size_of_image
+    b[opt + 0x44..opt + 0x46].copy_from_slice(&10u16.to_le_bytes()); // subsystem = EFI app
+    b[opt + 0x6C..opt + 0x70].copy_from_slice(&declared_n_rva.to_le_bytes());
+    if let Some((va, size)) = tls_at_9 {
+        let slot = opt + 0x70 + 9 * 8; // data directory index 9 = TLS
+        b[slot..slot + 4].copy_from_slice(&va.to_le_bytes());
+        b[slot + 4..slot + 8].copy_from_slice(&size.to_le_bytes());
+    }
+
+    b[sec..sec + 5].copy_from_slice(b".text");
+    b[sec + 8..sec + 12].copy_from_slice(&0x1000u32.to_le_bytes()); // virtual_size
+    b[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // virtual_address
+    b[sec + 16..sec + 20].copy_from_slice(&0x200u32.to_le_bytes()); // size_of_raw_data
+    b[sec + 20..sec + 24].copy_from_slice(&0x200u32.to_le_bytes()); // pointer_to_raw_data
+    b[sec + 36..sec + 40].copy_from_slice(&0x2000_0000u32.to_le_bytes()); // IMAGE_SCN_MEM_EXECUTE
+    b
+}
+
+#[test]
+fn omitted_dos_stub_kernel_layout_parses_and_validates() {
+    // e_lfanew == 0x40: the PE header sits immediately after the DOS header
+    // with NO DOS stub — exactly archie's vmlinuz-linux. goblin 0.9.3
+    // rejected this; the hand-rolled reader must accept it.
+    let img = build_pe(0x40, PE32_PLUS_MAGIC, 16, None);
+    let s = parse_headers(&img).expect("omitted-DOS-stub PE32+ must parse");
+    validate_headers(&s, &img).expect("omitted-DOS-stub PE32+ must validate");
+    assert_eq!(s.opt_magic, PE32_PLUS_MAGIC);
+    assert_eq!(s.machine, expected_machine());
+    assert_eq!(s.num_sections, 1);
+    assert_eq!(s.size_of_image, 0x2000);
+    assert_eq!(s.entry_rva, 0x1000);
+    assert!(s.entry_in_executable_section);
+    assert_eq!(s.import_dir_size, 0);
+    assert_eq!(s.tls_dir_size, 0);
+}
+
+#[test]
+fn dos_stub_present_layout_also_parses() {
+    // The same image with a non-zero e_lfanew (a DOS stub region present)
+    // must parse identically — the reader is agnostic to the stub.
+    let img = build_pe(0x80, PE32_PLUS_MAGIC, 16, None);
+    let s = parse_headers(&img).expect("with-DOS-stub PE32+ must parse");
+    validate_headers(&s, &img).expect("with-DOS-stub PE32+ must validate");
+    assert_eq!(s.entry_rva, 0x1000);
+}
+
+#[test]
+fn data_directory_count_is_bounded_by_number_of_rva_and_sizes() {
+    // A TLS directory is physically present at index 9, but the header
+    // advertises only 6 directories. The accessor must treat index 9 as
+    // absent (Linux kernels ship < 16), so tls_dir_size == 0.
+    let bounded = build_pe(0x40, PE32_PLUS_MAGIC, 6, Some((0x9000, 0x40)));
+    let s = parse_headers(&bounded).expect("must parse");
+    assert_eq!(
+        s.tls_dir_size, 0,
+        "index 9 is beyond number_of_rva_and_sizes=6 and must read as absent"
+    );
+
+    // With the full 16 advertised, the same physical TLS entry IS read.
+    let full = build_pe(0x40, PE32_PLUS_MAGIC, 16, Some((0x9000, 0x40)));
+    let s = parse_headers(&full).expect("must parse");
+    assert_eq!(s.tls_dir_size, 0x40, "in-range directory must be read");
+}
+
+#[test]
+fn pe32_image_is_rejected_cleanly() {
+    // A 32-bit (PE32, 0x10b) optional header: parse surfaces the magic and
+    // validate rejects it with the precise token — never misparsed with
+    // 64-bit field offsets.
+    let img = build_pe(0x40, PE32_MAGIC, 16, None);
+    let s = parse_headers(&img).expect("parse must surface the magic, not panic");
+    assert_eq!(s.opt_magic, PE32_MAGIC);
+    match validate_headers(&s, &img) {
+        Err(PeLoadError::UnsupportedPe32) => {}
+        other => panic!("expected UnsupportedPe32, got {other:?}"),
+    }
 }

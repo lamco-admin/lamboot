@@ -120,14 +120,16 @@ def test_show_by_event_name():
     assert "image_verified" in r.stdout
 
 
-def test_show_missing_event_returns_exit_code_io():
+def test_show_missing_event_returns_error():
     r = run(
         "show",
         "this_event_does_not_exist",
         "--path",
         str(FIXTURES / "trust-log.jsonl"),
     )
-    assert r.returncode == 2
+    # Harmonized to the shared toolkit exit table: a missing artefact/target is
+    # EXIT_ERROR (1), not the old tool-local EXIT_IO (2).
+    assert r.returncode == 1
 
 
 def test_trust_log_strict_on_clean_fixture_returns_ok():
@@ -140,13 +142,14 @@ def test_trust_log_strict_on_clean_fixture_returns_ok():
     assert r.returncode == 0
 
 
-def test_trust_log_nonexistent_path_returns_io_error():
+def test_trust_log_nonexistent_path_returns_error():
     r = run(
         "trust-log",
         "-p",
         "/nonexistent/path/trust.log",
     )
-    assert r.returncode == 2
+    # Shared toolkit exit table: unreadable artefact is EXIT_ERROR (1).
+    assert r.returncode == 1
 
 
 def test_verify_against_current_checkout_runs_without_crash():
@@ -155,7 +158,8 @@ def test_verify_against_current_checkout_runs_without_crash():
         "--repo",
         str(HERE.parent.parent.parent),
     )
-    # Return code may be 0 or 5 depending on branch; we just check that
-    # the command finishes and prints the claim list.
-    assert r.returncode in (0, 5)
+    # Return code is 0 (all claims substantiated) or, harmonized to the shared
+    # toolkit exit table, EXIT_PARTIAL (2) when some claim is unsubstantiated —
+    # not the old tool-local EXIT_VERIFY (5).
+    assert r.returncode in (0, 2)
     assert "rust_no_std" in r.stdout

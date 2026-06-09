@@ -57,6 +57,10 @@ db-*.pem
 # readtest17c.txt). Root-level throwaways — never part of the source tree.
 readtest*.txt
 
+# Per-VM test captures (boot.log/boot.json dumps from fleet test runs, keyed by
+# VM + version). Transient diagnostic output — provenance lives in procedure_runs.
+/.test-artifacts/
+
 __pycache__/
 *.pyc
 
@@ -66,3 +70,6 @@ __pycache__/
 # test value, the file pattern is categorically credentials.
 docs/test-fixtures/**/PASSWORDS.txt
 docs/test-fixtures/**/user_credentials.json
+/lamxfs-dev/
+/lamexfat-dev/
+/lamzfs-dev/

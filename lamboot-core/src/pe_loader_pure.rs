@@ -20,10 +20,12 @@
 
 #![allow(dead_code)]
 #![allow(unreachable_pub)]
+// The `unwrap`s below are infallible: every `try_into` targets a statically
+// 2/4/8-byte slice whose bounds are validated immediately before the read.
+#![allow(clippy::unwrap_used)]
 
 use alloc::{string::String, vec, vec::Vec};
 
-use goblin::pe::{data_directories::DataDirectory, options::ParseOptions, PE};
 use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
@@ -101,7 +103,7 @@ pub enum PeLoadError {
     RelocationMalformed(&'static str),
     UnsupportedRelocationType(u16),
     EntryPointOutOfBounds,
-    /// goblin couldn't make sense of the bytes.
+    /// The hand-rolled PE header parse rejected the bytes.
     ParseFailed(&'static str),
 }
 
@@ -182,33 +184,77 @@ pub struct SectionPlan {
     pub executable: bool,
 }
 
-/// Mirror of goblin's `DataDirectory` with the two fields we need.
-/// Plain data so the pure module has no goblin-typed return surface.
+/// One PE data-directory entry (RVA + size). The pure module carries
+/// its own plain type so it has no third-party-parser dependency.
 #[derive(Debug, Clone, Copy)]
 pub struct DataDir {
     pub virtual_address: u32,
     pub size: u32,
 }
 
-impl From<DataDirectory> for DataDir {
-    fn from(d: DataDirectory) -> Self {
-        Self {
-            virtual_address: d.virtual_address,
-            size: d.size,
-        }
+// ---------------------------------------------------------------------------
+// Fixed-width little-endian readers + data-directory accessor
+//
+// Bounds-checked and non-panicking on ANY input (the fuzz target asserts
+// no panic on arbitrary bytes). A short read surfaces as `ParseFailed` so
+// the stable `pe_parse_failed` trust-log token is preserved.
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn rd_u16(b: &[u8], off: usize) -> Result<u16, PeLoadError> {
+    let s = b
+        .get(off..off + 2)
+        .ok_or(PeLoadError::ParseFailed("u16 read past end of image"))?;
+    Ok(u16::from_le_bytes([s[0], s[1]]))
+}
+
+#[inline]
+fn rd_u32(b: &[u8], off: usize) -> Result<u32, PeLoadError> {
+    let s = b
+        .get(off..off + 4)
+        .ok_or(PeLoadError::ParseFailed("u32 read past end of image"))?;
+    Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+#[inline]
+fn rd_u64(b: &[u8], off: usize) -> Result<u64, PeLoadError> {
+    let s = b
+        .get(off..off + 8)
+        .ok_or(PeLoadError::ParseFailed("u64 read past end of image"))?;
+    Ok(u64::from_le_bytes(s.try_into().unwrap()))
+}
+
+/// Read PE data directory `idx`. Matches the getter semantics LamBoot
+/// relied on: absent when `idx >= number_of_rva_and_sizes` (Linux kernels
+/// ship fewer than the full 16), when the 8-byte slot is out of bounds, or
+/// when the entry is all-zero.
+fn read_data_dir(bytes: &[u8], start: usize, n_rva: u32, idx: u32) -> Option<DataDir> {
+    if idx >= n_rva {
+        return None;
     }
+    let off = start + (idx as usize) * 8;
+    let virtual_address = rd_u32(bytes, off).ok()?;
+    let size = rd_u32(bytes, off + 4).ok()?;
+    if virtual_address == 0 && size == 0 {
+        return None;
+    }
+    Some(DataDir {
+        virtual_address,
+        size,
+    })
 }
 
 // ---------------------------------------------------------------------------
-// parse_headers — the goblin-delegating front door
+// parse_headers — hand-rolled PE/COFF header reader
 // ---------------------------------------------------------------------------
 
-/// Parse the PE headers via goblin and flatten to a `PeSummary`.
+/// Parse the PE headers and flatten to a `PeSummary`.
 ///
-/// Short-circuits TooShort / BadDosSignature / BadNtSignature before
-/// calling goblin so we always produce a specific `PeLoadError` rather
-/// than goblin's opaque `Error::Malformed`. After goblin succeeds we
-/// verify magic, machine, subsystem at the summary level.
+/// Reads only the load-bearing COFF + PE32+ optional-header fields from
+/// their fixed offsets; the MSVC DOS stub and Rich header are never
+/// touched (skipping them is what makes this robust across the Linux
+/// EFI-stub / UKI header zoo). PE32 and non-PE images are surfaced via
+/// `opt_magic` for `validate_headers` to reject with a precise token.
 pub fn parse_headers(bytes: &[u8]) -> Result<PeSummary, PeLoadError> {
     parse_headers_with_diag(bytes, None)
 }
@@ -245,42 +291,80 @@ pub fn parse_headers_with_diag(
     if bytes[nt_off..nt_off + 4] != *b"PE\0\0" {
         return Err(PeLoadError::BadNtSignature);
     }
-    diag!("PRH2 sigs_ok before_goblin_header\n");
+    diag!("PRH2 sigs_ok before_header_parse\n");
 
-    // v0.11.0: bypass goblin's full PE::parse_with_opts. It parses
-    // exports, imports, debug, exception (.pdata — huge on Linux
-    // kernels), relocations (we parse ourselves later), TLS, resources,
-    // load_config, certificates — most of which have no opt-out flags.
-    // On the ASUS G10AJ firmware (pve2) parsing the 16MB Linux kernel
-    // hung even with all available options disabled. Call only
-    // Header::parse + CoffHeader::sections — the two pieces we
-    // actually need. Skips ALL the unnecessary sub-parsers.
-    use goblin::pe::header::{Header, SIZEOF_COFF_HEADER, SIZEOF_PE_MAGIC};
-    let header = Header::parse(bytes)
-        .map_err(|_| PeLoadError::ParseFailed("goblin Header::parse failed"))?;
-    diag!("PRH3 after_goblin_header\n");
+    // Hand-rolled PE/COFF header read. We deliberately parse ONLY the
+    // fields LamBoot loads with — straight from their spec-fixed offsets —
+    // and never touch the MSVC DOS stub or the Rich header. Those two
+    // structures are exactly what goblin 0.9.3's `Header::parse` insisted
+    // on validating: its `end_offset <= start_offset` DOS-stub check
+    // rejected the Linux EFI-stub layout (e_lfanew == 0x40, no DOS stub)
+    // that every modern x86_64/aarch64 kernel uses, and its unconditional
+    // Rich-header scan underflowed on the same images. Reading only the
+    // load-bearing fields is both more robust across the header zoo and
+    // drops goblin (plus plain + scroll) from the dependency set — which
+    // is what lets lamboot-core sit in the Debian archive.
+    const SIZEOF_PE_MAGIC: usize = 4;
+    const SIZEOF_COFF_HEADER: usize = 20;
 
-    let coff = header.coff_header;
-    let num_sections = coff.number_of_sections;
+    // COFF header (20 bytes) immediately follows the 4-byte PE signature.
+    let coff_off = nt_off + SIZEOF_PE_MAGIC;
+    let machine = rd_u16(bytes, coff_off)?; // +0
+    let num_sections = rd_u16(bytes, coff_off + 2)?; // +2
+    let size_of_optional_header = rd_u16(bytes, coff_off + 16)? as usize; // +16
 
-    let oh = header
-        .optional_header
-        .ok_or(PeLoadError::BadOptionalHeaderMagic(0))?;
+    // The optional header begins immediately after the COFF header.
+    let opt_off = coff_off + SIZEOF_COFF_HEADER;
+    let opt_magic = rd_u16(bytes, opt_off)?; // +0x00
+
+    // PE32+ (0x20B) only. PE32 (0x10B) and any other magic are surfaced
+    // via `opt_magic` so `validate_headers` rejects them with the precise
+    // token (UnsupportedPe32 / BadOptionalHeaderMagic). We must NOT read
+    // the 64-bit field offsets out of a 32-bit (or junk) optional header,
+    // so short-circuit here, carrying only the fields well-defined
+    // regardless of magic (machine + section count). Section/field parsing
+    // below is therefore reached only for genuine PE32+ images.
+    if opt_magic != PE32_PLUS_MAGIC {
+        diag!("PRH3 non_pe32plus_magic\n");
+        return Ok(PeSummary {
+            machine,
+            subsystem: 0,
+            preferred_base: 0,
+            size_of_image: 0,
+            entry_rva: 0,
+            num_sections,
+            opt_magic,
+            sections: Vec::new(),
+            reloc_dir: None,
+            import_dir_size: 0,
+            tls_dir_size: 0,
+            entry_in_executable_section: false,
+        });
+    }
+    diag!("PRH3 after_header_parse\n");
+
+    // PE32+ optional-header fields, by spec offset from `opt_off`:
+    //   0x10 address_of_entry_point (u32)
+    //   0x18 image_base             (u64)
+    //   0x38 size_of_image          (u32)
+    //   0x44 subsystem              (u16)
+    //   0x6C number_of_rva_and_sizes(u32)
+    // The data directories begin at 0x70 (24-byte standard fields +
+    // 88-byte windows fields).
+    let entry_rva = rd_u32(bytes, opt_off + 0x10)?;
+    let preferred_base = rd_u64(bytes, opt_off + 0x18)?;
+    let size_of_image = u64::from(rd_u32(bytes, opt_off + 0x38)?);
+    let subsystem = rd_u16(bytes, opt_off + 0x44)?;
+    let number_of_rva_and_sizes = rd_u32(bytes, opt_off + 0x6C)?;
+    let data_dir_start = opt_off + 0x70;
+
+    // Directory indices: import = 1, base relocation = 5, TLS = 9.
+    let import_dir_size =
+        read_data_dir(bytes, data_dir_start, number_of_rva_and_sizes, 1).map_or(0, |d| d.size);
+    let reloc_dir = read_data_dir(bytes, data_dir_start, number_of_rva_and_sizes, 5);
+    let tls_dir_size =
+        read_data_dir(bytes, data_dir_start, number_of_rva_and_sizes, 9).map_or(0, |d| d.size);
     diag!("PRH4 after_optional_header\n");
-
-    let opt_magic = oh.standard_fields.magic;
-    let preferred_base = oh.windows_fields.image_base;
-    let size_of_image = oh.windows_fields.size_of_image as u64;
-    let entry_rva = oh.standard_fields.address_of_entry_point as u32;
-    let subsystem = oh.windows_fields.subsystem;
-
-    let import_dir_size = oh.data_directories.get_import_table().map_or(0, |d| d.size);
-    let tls_dir_size = oh.data_directories.get_tls_table().map_or(0, |d| d.size);
-    let reloc_dir = oh
-        .data_directories
-        .get_base_relocation_table()
-        .copied()
-        .map(DataDir::from);
 
     if num_sections > MAX_SECTIONS {
         return Err(PeLoadError::TooManySections {
@@ -290,16 +374,10 @@ pub fn parse_headers_with_diag(
     }
     diag!("PRH5 before_manual_section_parse\n");
 
-    // v0.11.0: bypass goblin's SectionTable::parse_with_opts. It does
-    // `bytes.pread::<&str>(string_table_offset + idx)` for sections
-    // with long-form names like `.eh_frame` (starting with `/`). On a
-    // Linux kernel where the string table isn't where goblin expects,
-    // this walks up to 16MB of binary kernel bytes looking for a NUL
-    // — per such section. We don't need the section names anyway;
-    // they're not in SectionPlan. Parse 40-byte entries directly.
-    let optional_header_offset =
-        header.dos_header.pe_pointer as usize + SIZEOF_PE_MAGIC + SIZEOF_COFF_HEADER;
-    let sections_offset_start = optional_header_offset + coff.size_of_optional_header as usize;
+    // Section table: 40-byte entries immediately after the optional
+    // header. Bounds-check the whole table up front so the per-field reads
+    // in the loop below cannot go out of range.
+    let sections_offset_start = opt_off + size_of_optional_header;
     let needed = (num_sections as usize).saturating_mul(40);
     if sections_offset_start.saturating_add(needed) > bytes.len() {
         return Err(PeLoadError::ParseFailed(
@@ -340,7 +418,7 @@ pub fn parse_headers_with_diag(
     diag!("PRH6 after_manual_section_parse\n");
 
     Ok(PeSummary {
-        machine: coff.machine,
+        machine,
         subsystem,
         preferred_base,
         size_of_image,
@@ -503,7 +581,7 @@ pub fn apply_relocations_to_slice(
         }
 
         let entries_bytes = size_of_block - 8;
-        if entries_bytes % 2 != 0 {
+        if !entries_bytes.is_multiple_of(2) {
             return Err(PeLoadError::RelocationMalformed("odd entries_bytes"));
         }
         let entry_count = entries_bytes / 2;

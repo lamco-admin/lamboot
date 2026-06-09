@@ -1,7 +1,7 @@
 # LamBoot Developer Guide
 
-**Version:** 0.13.0
-**Updated:** 2026-06-01
+**Version:** 0.16.5
+**Updated:** 2026-06-08
 **Audience:** new contributors, integrators, and anyone reading the LamBoot source
 
 ---
@@ -22,11 +22,24 @@ lamboot-dev/
 │       ├── boot_types.rs          Layer 3 — shared BootEntry/EntryKind/Icon + preflight result types
 │       ├── bls_parse.rs           Layer 3 — pure BLS Type 1 parser (UAPI.10 version sort)
 │       ├── bls.rs                 Layer 4 — BLS coordinator (boot counting, default selection inputs)
-│       ├── boot.rs                Chainload, UKI, Linux boot under SecurityOverride
+│       ├── boot.rs                Chainload, UKI, native PE-loaded Linux boot under SecurityOverride (firmware LoadImage fallback)
 │       ├── console.rs             Serial/text console fallback menu
 │       ├── discovery.rs           BLS-first entry discovery with ESP fallback
 │       ├── drivers.rs             EFI filesystem driver loader, trust events
 │       ├── fs.rs                  Layer 2 — ESP mount, volume I/O, multi-partition scan
+│       ├── block_source.rs        Layer 2 — BlockSource (Seam A) + SourceReader<S> (Seam B): the generic block seam every byte-addressed FS reader sits on
+│       ├── fs_backend.rs          Layer 2 — FsBackend trait + FsError; read-only by construction (writes go through fs_writer, FAT-ESP only)
+│       ├── fs_backend_ext4.rs     Layer 2 — native read-only ext4 reader
+│       ├── fs_backend_btrfs.rs    Layer 2 — native read-only btrfs reader
+│       ├── fs_backend_fat.rs      Layer 2 — firmware-served FAT (ESP)
+│       ├── fs_backend_fat_ro.rs   Layer 2 — native read-only FAT (FatRo, via lamfat) for non-ESP FAT volumes
+│       ├── fs_backend_xfs.rs      Layer 2 — native read-only XFS reader (lamxfs); also LV + .iso loopback
+│       ├── fs_backend_exfat.rs    Layer 2 — native read-only exFAT reader (lamexfat), whole partitions only
+│       ├── fs_backend_zfs.rs      Layer 2 — native read-only ZFS boot-pool reader (lamzfs); single/mirror/RAIDZ1 only
+│       ├── fs_backend_lamfold.rs  Layer 2 — native read-only media stack (lamfold): EROFS, ISO 9660, SquashFS, cramfs, romfs, UDF
+│       ├── fs_backend_lvm*.rs     Layer 2 — LVM logical-volume dispatch + per-FS LV adapters
+│       ├── distro_iso.rs          Layer 3 — boot-from-ISO Path A2 distro-family fallback table
+│       ├── loopback_cfg.rs        Layer 3 — boot-from-ISO Path A1 loopback.cfg resolver
 │       ├── gui.rs                 Double-buffered framebuffer, boot menu
 │       ├── health.rs              NVRAM state machine, Boot Loader Interface vars
 │       ├── initrd.rs              LoadFile2 provider for Linux initrd
@@ -35,9 +48,13 @@ lamboot-dev/
 │       ├── report.rs              Boot reports, audit logging
 │       ├── secure.rs              Secure Boot state detection + shim integration
 │       ├── security_override.rs   PATH F — Security/Security2 arch protocol hooks
+│       ├── pe_loader.rs            Layer 3 — native PE loader (I/O shell over pe_loader_pure)
+│       ├── pe_loader_pure.rs       Layer 3 — v0.16.1 hand-rolled no_std PE/COFF reader (load-bearing COFF + PE32+ fields from fixed offsets; no goblin, no DOS-stub parse)
 │       ├── smbios.rs              SMBIOS string extraction for diagnostics
 │       ├── tpm.rs                 TPM 2.0 measured boot (TCG2)
-│       └── trust_log.rs           v0.8.3 — JSON-lines audit log
+│       ├── trust_log.rs           v0.8.3 — JSON-lines audit log
+│       ├── boot_entry.rs          Layer 4 — v0.16.3 boot-entry identity + NVRAM Boot#### self-install
+│       └── boot_entry_pure.rs     Layer 4 — host-tested EFI_LOAD_OPTION/BootOrder byte codecs
 ├── lamboot-modules/               Chainloaded diagnostic EFI applications
 │   ├── diag-shell/
 │   ├── mem-quick/
@@ -64,8 +81,8 @@ lamboot-dev/
 ## 2. Toolchain
 
 **Required:**
-- Rust nightly (for `cargo fmt` import-ordering and `-Zbuild-std`): `rustup install nightly`
-- Rust stable (for everything else; >= 1.88)
+- Rust stable (builds everything, including both UEFI targets; >= 1.88, verified on 1.96.0). `rust-toolchain.toml` pins the `stable` channel. The UEFI crates still build `core`/`alloc`/`compiler_builtins` from source via the per-crate `-Zbuild-std` flags, but those cargo flags are unlocked on stable through `RUSTC_BOOTSTRAP=1` — no nightly toolchain required.
+- Rust nightly (only for `cargo fmt` import-ordering): `rustup install nightly`
 - Targets: `rustup target add x86_64-unknown-uefi aarch64-unknown-uefi`
 - `sbsign`, `sbverify`, `mkfs.vfat` (for testing / signing)
 - `llvm-objcopy` (strongly preferred over GNU objcopy for PE section embedding — GNU objcopy corrupts UEFI PE binaries)
@@ -129,6 +146,8 @@ See `CLAUDE.md` in the repo root for the canonical rules. Summary:
 ---
 
 ## 5. Adding a new subsystem
+
+> **Adding a filesystem reader?** The common path in the 0.16.0 era is a new Layer-2 `FsBackend`. Implement the `FsBackend` trait in `fs_backend.rs`, sit your byte-addressed reader on the `BlockSource`/`SourceReader<S>` seam in `block_source.rs` (so it reads off a whole partition, an LVM LV, or an `.iso` loopback region for free), keep it read-only by construction (the ESP writer in `fs_writer.rs` is FAT-ESP-only), and register the superblock-magic probe with the source-generic dispatcher. See the `FsBackend` trait in `lamboot-core/src/fs_backend.rs`.
 
 **Example: adding a network-boot subsystem.**
 

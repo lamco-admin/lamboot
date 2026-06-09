@@ -103,7 +103,7 @@ fn all_verified_via_lists_every_constant() {
     // Every individual V_* constant must appear in the catalog. Adding a
     // new constant means updating ALL_VERIFIED_VIA; this test catches the
     // omission.
-    let catalog: Vec<&str> = ALL_VERIFIED_VIA.iter().copied().collect();
+    let catalog: Vec<&str> = ALL_VERIFIED_VIA.to_vec();
     for expected in [
         V_SHIM_MOK,
         V_FIRMWARE_DB_FALLBACK,
@@ -161,6 +161,10 @@ fn vocabulary_tokens_are_non_empty_and_snake_case() {
 // use it.
 #[derive(Debug)]
 #[allow(non_camel_case_types)]
+#[expect(
+    clippy::upper_case_acronyms,
+    reason = "mirrors UEFI Status::SUCCESS naming in this Display test"
+)]
 enum FakeStatus {
     SUCCESS,
 }

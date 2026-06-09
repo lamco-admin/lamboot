@@ -5,8 +5,8 @@
 //! Implements `FsBackend` over the `fatfs` crate (rafalh/rust-fatfs, 0.4.0
 //! git line — the only version with a `no_std` `IoBase`/`Read`/`Write`/`Seek`
 //! surface; crates.io 0.3.6 is `std`/`core_io`-based). LamBoot feeds it disk
-//! bytes through `BlockIoFatAdapter`, the same BlockIO bridge shape used by
-//! `fs_backend_ext4::BlockIoReader` and `fs_backend_lvm::BlockIoPvReader`.
+//! bytes through `BlockIoFatAdapter`, which (like every other BlockIO reader)
+//! reuses `block_source::compute_aligned_read` for the block-alignment maths.
 //!
 //! # Why this exists
 //!
@@ -60,11 +60,11 @@ use uefi::{
 };
 
 use crate::{
+    block_source::compute_aligned_read,
     fs_backend::{
         checked_full_read_len, BackendTag, DirEntry, FileKind, FsBackend, FsError, Metadata, Path,
         Uuid,
     },
-    fs_backend_ext4::compute_aligned_read,
 };
 
 /// Backend tag surfaced via `FsBackend::tag()` and trust-log events. The

@@ -87,7 +87,7 @@ fn api_ext4_load_fails_on_zeros() {
     let zeros = vec![0u8; 1024 * 1024];
     let result = Ext4::load(Box::new(zeros));
     assert!(
-        matches!(result, Err(_)),
+        result.is_err(),
         "Ext4::load on an all-zero buffer must fail (no superblock magic)",
     );
 }

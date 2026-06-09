@@ -1,10 +1,12 @@
 //! Layer: 4 — Policy & State.
 //!
-//! Discoverable partition scanning via UEFI PartitionInfo protocol.
+//! Discoverable partition scanning via UEFI PartitionInfo + BlockIO.
 //!
-//! Implements UAPI.2 Discoverable Partitions Specification:
-//! Scans GPT partition type GUIDs to find root partitions, XBOOTLDR,
-//! and ESP — enabling automatic root= generation and XBOOTLDR mounting.
+//! Implements UAPI.2 Discoverable Partitions (GPT type GUIDs → Root/XBOOTLDR for
+//! automatic root= generation and XBOOTLDR mounting) and, for robustness across
+//! BIOS-converted and PartitionInfo-sparse firmware, also surfaces legacy-MBR
+//! primary partitions and BlockIO-only logical partitions for superblock
+//! probing by the native filesystem backends. See `scan_discoverable_partitions`.
 
 use alloc::{format, string::String, vec::Vec};
 
@@ -77,74 +79,178 @@ pub(crate) enum PartType {
     Opaque,
 }
 
-/// Scan all partitions for discoverable types (root, XBOOTLDR).
-/// Uses the UEFI PartitionInfo protocol — firmware already parsed GPT.
+/// Scan every partition the firmware (or LamBoot) can see, from three sources,
+/// de-duplicated by handle:
+///
+///   1. **GPT** via `PartitionInfo` — DPS-tagged Root/XBOOTLDR plus every other
+///      GPT partition as `Opaque` (the ESP is skipped: probing its BlockIO
+///      exclusive while `mount_esp` holds it hangs OVMF).
+///   2. **MBR** via `PartitionInfo` — a BIOS-installed disk keeps an `msdos`
+///      table whose `/boot` is a primary partition. Classified `Opaque` for
+///      superblock probing; the EFI/extended/protective/empty slots are skipped
+///      (see `partition_classify_pure::mbr_os_type_is_mountable`).
+///   3. **BlockIO-only** logical partitions the firmware described with neither
+///      `PartitionInfo` nor `SimpleFileSystem` — for firmware that installs
+///      `PartitionInfo` on the ESP alone (observed: ASUS G10AJ).
+///
+/// Callers consume the result by *superblock probe* (`probe_superblock` + the
+/// native ext4/btrfs/xfs/exfat/zfs/LVM/media loops), so the partition-table
+/// type and the partition-type GUID are irrelevant to *mounting* — they only
+/// drive Root (`auto_append_root`) and XBOOTLDR (`mount_xbootldr`) roles, both
+/// GPT-only. That is why MBR and BlockIO-only partitions are safely `Opaque`.
 pub(crate) fn scan_discoverable_partitions() -> Vec<DiscoveredPartition> {
     let mut results = Vec::new();
+    let mut seen: Vec<uefi::Handle> = Vec::new();
 
-    let Ok(handles) = uefi::boot::find_handles::<PartitionInfo>() else {
+    // Sources 1 + 2: firmware-parsed partition tables (GPT and MBR).
+    if let Ok(handles) = uefi::boot::find_handles::<PartitionInfo>() {
+        for handle in handles {
+            let Ok(part_info) = uefi::boot::open_protocol_exclusive::<PartitionInfo>(handle) else {
+                continue;
+            };
+            // Copy the Copy field out of the packed struct (by value, no
+            // reference) before matching, to avoid an unaligned reference.
+            let partition_type = part_info.partition_type;
+            let classified = match partition_type {
+                PartitionType::GPT => classify_gpt_partition(&part_info),
+                PartitionType::MBR => classify_mbr_partition(&part_info),
+                _ => None,
+            };
+            if let Some((partition_type, unique_guid)) = classified {
+                results.push(DiscoveredPartition {
+                    partition_type,
+                    unique_guid,
+                    handle,
+                });
+                seen.push(handle);
+            }
+        }
+    } else {
         log::debug!("No PartitionInfo handles found");
-        return results;
-    };
+    }
 
-    for handle in handles {
-        let Ok(part_info) = uefi::boot::open_protocol_exclusive::<PartitionInfo>(handle) else {
-            continue;
-        };
-
-        // Only GPT partitions — copy from packed struct to avoid alignment issues
-        let pt = { part_info.partition_type };
-        if pt != PartitionType::GPT {
+    // Source 3: BlockIO-only logical partitions not already described above.
+    for handle in scan_block_io_logical_partitions_without_fs() {
+        if seen.contains(&handle) {
             continue;
         }
-
-        let Some(gpt_entry) = part_info.gpt_partition_entry() else {
-            continue;
-        };
-
-        // Copy packed fields to avoid unaligned reference errors
-        let type_guid: Guid = { gpt_entry.partition_type_guid }.0;
-        let unique_guid: Guid = { gpt_entry.unique_partition_guid };
-
-        // ESP: skip entirely. Probing its handle while mount_esp already
-        // holds it hangs LamBoot on OVMF (see ESP_PARTITION_TYPE doc).
-        if type_guid == ESP_PARTITION_TYPE {
-            continue;
-        }
-
-        let part_type = if type_guid == ROOT_PARTITION_TYPE {
-            PartType::Root
-        } else if type_guid == XBOOTLDR_PARTITION_TYPE {
-            PartType::Xbootldr
-        } else {
-            PartType::Opaque
-        };
-
-        // Log at INFO so boot.log captures scanner results and real-hardware
-        // debugging stays tractable. For DPS-tagged partitions we name the
-        // semantic role; for Opaque (generic Linux filesystem GUID, EFI
-        // System, BIOS boot, Windows Recovery, etc.) we just record the
-        // type GUID so the trace reader can correlate with a GUID table.
-        match part_type {
-            PartType::Root | PartType::Xbootldr => {
-                log::info!("Discoverable partition: {part_type:?} PARTUUID={unique_guid}");
-            }
-            PartType::Opaque => {
-                log::info!(
-                    "GPT partition (opaque type={type_guid}) PARTUUID={unique_guid} — \
-                     retained for superblock probing"
-                );
-            }
-        }
-
+        log::info!("BlockIO-only partition (no PartitionInfo) — retained for superblock probing");
         results.push(DiscoveredPartition {
-            partition_type: part_type,
-            unique_guid,
+            partition_type: PartType::Opaque,
+            unique_guid: Guid::ZERO,
             handle,
         });
+        seen.push(handle);
     }
 
     results
+}
+
+/// Classify a GPT partition from its `PartitionInfo`. `None` skips the ESP —
+/// probing its BlockIO exclusive while `mount_esp` holds it hangs LamBoot on
+/// OVMF (see `ESP_PARTITION_TYPE`). All non-ESP GPT partitions are retained:
+/// DPS-tagged ones by role, the rest as `Opaque` for superblock probing.
+fn classify_gpt_partition(part_info: &PartitionInfo) -> Option<(PartType, Guid)> {
+    let gpt_entry = part_info.gpt_partition_entry()?;
+    // Copy packed fields to avoid unaligned reference errors.
+    let type_guid: Guid = { gpt_entry.partition_type_guid }.0;
+    let unique_guid: Guid = { gpt_entry.unique_partition_guid };
+
+    if type_guid == ESP_PARTITION_TYPE {
+        return None;
+    }
+
+    let part_type = if type_guid == ROOT_PARTITION_TYPE {
+        PartType::Root
+    } else if type_guid == XBOOTLDR_PARTITION_TYPE {
+        PartType::Xbootldr
+    } else {
+        PartType::Opaque
+    };
+
+    // Log at INFO so boot.log captures scanner results. DPS-tagged partitions
+    // name the semantic role; Opaque records the type GUID for GUID-table
+    // correlation by the trace reader.
+    match part_type {
+        PartType::Root | PartType::Xbootldr => {
+            log::info!("Discoverable partition: {part_type:?} PARTUUID={unique_guid}");
+        }
+        PartType::Opaque => {
+            log::info!(
+                "GPT partition (opaque type={type_guid}) PARTUUID={unique_guid} — \
+                 retained for superblock probing"
+            );
+        }
+    }
+    Some((part_type, unique_guid))
+}
+
+/// Classify a legacy-MBR partition from its `PartitionInfo`. `None` skips the
+/// slots that carry no probeable filesystem (empty / extended container / GPT
+/// protective) or are owned elsewhere (EFI System = the ESP). All others are
+/// `Opaque`; the superblock probe decides the real filesystem. MBR has no
+/// per-partition GUID, so `unique_guid` is `ZERO` — used only for display
+/// (`auto_append_root` consumes GPT Root partitions, never MBR).
+fn classify_mbr_partition(part_info: &PartitionInfo) -> Option<(PartType, Guid)> {
+    let rec = part_info.mbr_partition_record()?;
+    // Copy the single-byte newtype out of the packed record by value.
+    let os_type = { rec.os_type }.0;
+    if !crate::partition_classify_pure::mbr_os_type_is_mountable(os_type) {
+        return None;
+    }
+    log::info!("MBR partition (os_type={os_type:#04x}) — retained for superblock probing");
+    Some((PartType::Opaque, Guid::ZERO))
+}
+
+/// Enumerate logical-partition BlockIO handles the firmware described with
+/// neither `PartitionInfo` nor `SimpleFileSystem`. These carry a filesystem the
+/// firmware can't read (ext4/xfs/btrfs/LVM/…) on firmware that skips the
+/// `PartitionInfo` install for non-ESP partitions (observed: ASUS G10AJ exposes
+/// `PartitionInfo` for the ESP only).
+///
+/// Skipping `SimpleFileSystem` handles keeps the ESP and any firmware-mounted
+/// FAT out: re-opening the ESP BlockIO exclusive while `mount_esp` holds it
+/// hangs LamBoot (see `ESP_PARTITION_TYPE`), and firmware-FAT volumes are
+/// already surfaced by `enumerate_volumes`.
+fn scan_block_io_logical_partitions_without_fs() -> Vec<uefi::Handle> {
+    use uefi::boot::{OpenProtocolAttributes, OpenProtocolParams};
+
+    let mut out = Vec::new();
+    let Ok(handles) = uefi::boot::find_handles::<BlockIO>() else {
+        return out;
+    };
+    // Handles the firmware can already read as a filesystem — skip them.
+    let sfs_handles: Vec<uefi::Handle> =
+        uefi::boot::find_handles::<SimpleFileSystem>().unwrap_or_default();
+
+    let image_handle = uefi::boot::image_handle();
+    for handle in handles {
+        if sfs_handles.contains(&handle) {
+            continue;
+        }
+        let params = OpenProtocolParams {
+            handle,
+            agent: image_handle,
+            controller: None,
+        };
+        // SAFETY: GetProtocol is non-exclusive and does not invalidate the
+        // BY_DRIVER firmware FS agents. The ScopedProtocol is dropped before the
+        // next iteration, so the close is synchronous and the pointer is never
+        // retained past the drop. Same discipline as scan_block_io_partitions_for_lvm.
+        let scoped = unsafe {
+            uefi::boot::open_protocol::<BlockIO>(params, OpenProtocolAttributes::GetProtocol)
+        };
+        let Ok(block_io) = scoped else {
+            continue;
+        };
+        // Skip whole disks; we only want logical partitions.
+        if !block_io.media().is_logical_partition() {
+            continue;
+        }
+        drop(block_io);
+        out.push(handle);
+    }
+    out
 }
 
 /// Format a GUID as a lowercase UUID string for root=PARTUUID= usage.
@@ -272,6 +378,8 @@ pub(crate) enum FsType {
     Xfs,
     F2fs,
     Zfs,
+    /// exFAT on removable/utility media (USB stick, SD card). Never the ESP.
+    ExFat,
     #[expect(
         dead_code,
         reason = "fallback for unrecognized but mountable filesystems"
@@ -372,6 +480,21 @@ pub(crate) fn probe_superblock(handle: uefi::Handle) -> Option<FsInfo> {
         });
     }
 
+    // Try exFAT (boot sector at offset 0, "EXFAT   " magic at byte offset 3).
+    // The legacy FAT BPB area (bytes 11..90) is zeroed on a real exFAT volume,
+    // so this magic never collides with FAT32 (which carries "FAT32   " at 82).
+    // Reuse the sector-0 read from the XFS probe above.
+    if xfs_buf.len() >= 0x68 && xfs_buf[3..11] == *b"EXFAT   " {
+        // 32-bit VolumeSerialNumber at offset 100, shown blkid-style XXXX-XXXX.
+        let serial = u32::from_le_bytes([xfs_buf[100], xfs_buf[101], xfs_buf[102], xfs_buf[103]]);
+        let serial_str = format!("{:04X}-{:04X}", serial >> 16, serial & 0xFFFF);
+        log::info!("Probed exFAT: serial={serial_str}");
+        return Some(FsInfo {
+            fs_type: FsType::ExFat,
+            uuid: Some(serial_str),
+        });
+    }
+
     // Try F2FS (superblock at offset 1024, magic 0xF2F52010 at offset 0)
     if ext4_buf.len() >= 1024 % block_size + 4 {
         let sb_offset = 1024 % block_size;
@@ -395,22 +518,46 @@ pub(crate) fn probe_superblock(handle: uefi::Handle) -> Option<FsInfo> {
         }
     }
 
-    // Try ZFS (uberblock at offset 0x20000 = 128KB, magic 0x00BAB10C at offset 0)
+    // Try ZFS: the L0 vdev label's uberblock array spans bytes 128–256 KiB, a
+    // ring of slots each starting with `ub_magic` = 0x0000_0000_00ba_b10c (a u64
+    // in the pool's native byte order). The active uberblock rotates by
+    // `txg % slot_count` and the on-disk txg starts at 4, so slot 0 is usually
+    // empty on a freshly created pool — scan the whole array at the minimum
+    // 1 KiB slot stride (`VDEV_UBERBLOCK_SHIFT` floor) and accept the partition
+    // if any slot carries the magic in either endianness (an x86 pool is
+    // little-endian: `0c b1 ba 00 …`).
+    const ZFS_UBERBLOCK_MAGIC: u64 = 0x0000_0000_00ba_b10c;
+    const ZFS_UB_ARRAY_BYTES: usize = 128 * 1024;
+    const ZFS_UB_MIN_SLOT: usize = 1024;
     let zfs_lba = 0x20000u64 / block_size as u64;
-    let zfs_sectors = 4096usize.div_ceil(block_size);
+    let zfs_sectors = ZFS_UB_ARRAY_BYTES.div_ceil(block_size);
     let mut zfs_buf = alloc::vec![0u8; zfs_sectors * block_size];
     if block_io
         .read_blocks(media_id, zfs_lba, &mut zfs_buf)
         .is_ok()
-        && zfs_buf.len() >= 4
     {
-        let magic = u32::from_be_bytes([zfs_buf[0], zfs_buf[1], zfs_buf[2], zfs_buf[3]]);
-        if magic == 0x00BA_B10C {
-            log::info!("Probed ZFS");
-            return Some(FsInfo {
-                fs_type: FsType::Zfs,
-                uuid: None, // ZFS UUID requires parsing the label nvpair data
-            });
+        let mut off = 0usize;
+        while off + 8 <= zfs_buf.len() {
+            let m = [
+                zfs_buf[off],
+                zfs_buf[off + 1],
+                zfs_buf[off + 2],
+                zfs_buf[off + 3],
+                zfs_buf[off + 4],
+                zfs_buf[off + 5],
+                zfs_buf[off + 6],
+                zfs_buf[off + 7],
+            ];
+            if u64::from_le_bytes(m) == ZFS_UBERBLOCK_MAGIC
+                || u64::from_be_bytes(m) == ZFS_UBERBLOCK_MAGIC
+            {
+                log::info!("Probed ZFS");
+                return Some(FsInfo {
+                    fs_type: FsType::Zfs,
+                    uuid: None, // the pool GUID is surfaced by the lamzfs import
+                });
+            }
+            off += ZFS_UB_MIN_SLOT;
         }
     }
 
@@ -512,6 +659,82 @@ pub(crate) fn scan_block_io_partitions_for_lvm() -> Vec<uefi::Handle> {
         }
     }
     out
+}
+
+/// Enumerate physical optical drives (CD/DVD/BD) holding an ISO9660 disc,
+/// returning each drive's `BlockIO` handle paired with its volume label
+/// (boot-from-ISO scenario d). Mirrors `scan_block_io_partitions_for_lvm`'s
+/// non-exclusive walk: an exclusive `BlockIO` open would cascade a BY_DRIVER
+/// disconnect of the firmware FS driver mid-boot (observed on pve2), so this
+/// opens with `GetProtocol`.
+///
+/// Optical media is distinguished from other removable devices by its **2048-
+/// byte logical sector size** — universal for CD/DVD/BD, whereas USB sticks
+/// report 512. That single discriminator also keeps a dd'd isohybrid USB (a
+/// valid ISO9660 image, but 512-byte sectors) out of this list, so it is never
+/// double-listed against the ESP partition the firmware already surfaced. A
+/// whole-disk, media-present, 2048-byte handle whose LBA 16 carries the ISO9660
+/// `CD001` primary volume descriptor is an optical disc; its label is taken from
+/// the PVD Volume Identifier.
+pub(crate) fn scan_optical_handles() -> Vec<(uefi::Handle, alloc::string::String)> {
+    use uefi::boot::{OpenProtocolAttributes, OpenProtocolParams};
+
+    let mut out = Vec::new();
+    let Ok(handles) = uefi::boot::find_handles::<BlockIO>() else {
+        return out;
+    };
+    let image_handle = uefi::boot::image_handle();
+    for handle in handles {
+        let params = OpenProtocolParams {
+            handle,
+            agent: image_handle,
+            controller: None,
+        };
+        // SAFETY: GetProtocol is non-exclusive and does not disturb the
+        // BY_DRIVER agent (the firmware optical FS driver). The ScopedProtocol
+        // is dropped before the next iteration, so the close is synchronous and
+        // we never retain the pointer past the drop.
+        let scoped = unsafe {
+            uefi::boot::open_protocol::<BlockIO>(params, OpenProtocolAttributes::GetProtocol)
+        };
+        let Ok(block_io) = scoped else {
+            continue;
+        };
+        let media = block_io.media();
+        // Optical signature: media present, whole disk (not a logical
+        // partition), 2048-byte logical sectors.
+        if !media.is_media_present() || media.is_logical_partition() || media.block_size() != 2048 {
+            continue;
+        }
+        let media_id = media.media_id();
+        // The ISO9660 Primary Volume Descriptor lives at LBA 16 (byte 32768);
+        // one 2048-byte block holds it.
+        let mut buf = alloc::vec![0u8; 2048];
+        if block_io.read_blocks(media_id, 16, &mut buf).is_err() {
+            continue;
+        }
+        // PVD: descriptor type 0x01 at offset 0, standard id "CD001" at 1..6.
+        if buf[0] != 0x01 || &buf[1..6] != b"CD001" {
+            continue;
+        }
+        // Volume Identifier: 32 d-characters at offset 40, space/NUL-padded.
+        let label = parse_pvd_label(&buf[40..72]);
+        drop(block_io);
+        out.push((handle, label));
+    }
+    out
+}
+
+/// Trim an ISO9660 PVD Volume Identifier (32 bytes, space/NUL-padded ASCII
+/// d-characters) to a clean label. Stops at the first NUL, maps bytes as
+/// Latin-1 (d-characters are ASCII), and strips trailing spaces.
+fn parse_pvd_label(raw: &[u8]) -> alloc::string::String {
+    let s: alloc::string::String = raw
+        .iter()
+        .take_while(|&&b| b != 0)
+        .map(|&b| b as char)
+        .collect();
+    s.trim_end().into()
 }
 
 /// Probe a partition for an LVM2 Physical Volume label. LVM2 places the

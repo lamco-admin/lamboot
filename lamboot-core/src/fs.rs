@@ -23,19 +23,22 @@ use alloc::{
     boxed::Box,
     collections::VecDeque,
     format,
+    rc::Rc,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
 };
+use core::cell::RefCell;
 
 use log::{debug, info};
-use uefi::{boot::ScopedProtocol, proto::media::fs::SimpleFileSystem, Handle};
+use uefi::{proto::media::fs::SimpleFileSystem, Handle};
 
 use crate::{
     fs_backend::{
         BackendTag, DirEntry, FsBackend, FsError, FsStream, Metadata, Path, PathBuf, Uuid,
     },
     fs_backend_fat::FatBackend,
+    fs_shared::{BackendOwn, NullBackend, SharedBackend},
 };
 
 // ---------------------------------------------------------------------------
@@ -192,7 +195,7 @@ impl VolumeCache {
 /// to its UEFI protocol handles through its backend.
 pub(crate) struct Volume {
     identity: VolumeIdentity,
-    backend: Box<dyn FsBackend>,
+    backend: BackendOwn,
     cache: VolumeCache,
     /// FAT-only shortcut — set when the volume was constructed from a
     /// `FatBackend`. Exposes the underlying `SimpleFileSystem` handle so
@@ -208,7 +211,7 @@ impl Volume {
         let handle = backend.handle();
         Self {
             identity,
-            backend: Box::new(backend),
+            backend: BackendOwn::Owned(Box::new(backend)),
             cache: VolumeCache::new(),
             fat_handle: Some(handle),
         }
@@ -218,9 +221,42 @@ impl Volume {
     pub(crate) fn from_backend(identity: VolumeIdentity, backend: Box<dyn FsBackend>) -> Self {
         Self {
             identity,
-            backend,
+            backend: BackendOwn::Owned(backend),
             cache: VolumeCache::new(),
             fat_handle: None,
+        }
+    }
+
+    /// Run `f` with a `&mut dyn FsBackend`, whether the backend is owned outright
+    /// or shared (an ISO-holding volume). The `RefCell` borrow, if any, is held
+    /// only for the duration of `f`.
+    fn backend_mut<R>(&mut self, f: impl FnOnce(&mut dyn FsBackend) -> R) -> R {
+        match &mut self.backend {
+            BackendOwn::Owned(b) => f(&mut **b),
+            BackendOwn::Shared(rc) => {
+                let mut guard = rc.borrow_mut();
+                f(&mut **guard)
+            }
+        }
+    }
+
+    /// Promote this volume's backend to a shared handle and return an `Rc` clone,
+    /// so a `FileBlockSource` can read file-regions through the SAME open the
+    /// volume keeps using — no re-open, no second exclusive grab (ESP-safe: the
+    /// primary ESP volume keeps serving boot through the same `Rc`). Idempotent;
+    /// the `NullBackend` placeholder is swapped out and never read through.
+    pub(crate) fn share_backend(&mut self) -> SharedBackend {
+        if matches!(self.backend, BackendOwn::Owned(_)) {
+            let BackendOwn::Owned(b) =
+                core::mem::replace(&mut self.backend, BackendOwn::Owned(Box::new(NullBackend)))
+            else {
+                unreachable!("just matched Owned")
+            };
+            self.backend = BackendOwn::Shared(Rc::new(RefCell::new(b)));
+        }
+        match &self.backend {
+            BackendOwn::Shared(rc) => Rc::clone(rc),
+            BackendOwn::Owned(_) => unreachable!("promoted to Shared above"),
         }
     }
 
@@ -235,7 +271,12 @@ impl Volume {
     /// Proxmox hosts. See FatBackend::fat_sfs_mut for the cache
     /// implementation.
     pub(crate) fn fat_sfs_mut(&mut self) -> Option<&mut SimpleFileSystem> {
-        self.backend.fat_sfs_mut()
+        match &mut self.backend {
+            BackendOwn::Owned(b) => b.fat_sfs_mut(),
+            // A shared (ISO-holding) backend is a read path, never the FAT write
+            // target — the ESP write target is never promoted to Shared.
+            BackendOwn::Shared(_) => None,
+        }
     }
 
     // ---------- identity ----------
@@ -279,7 +320,7 @@ impl Volume {
         // `Arc::from(slice)` + `arc.to_vec()` copied the buffer twice — a full
         // multi-MB memcpy wasted on every kernel/initrd/UKI load (each read
         // exactly once, i.e. always a miss).
-        let data = self.backend.read(path)?;
+        let data = self.backend_mut(|b| b.read(path))?;
         self.cache.insert(key, Arc::from(data.as_slice()));
         Ok(data)
     }
@@ -301,29 +342,32 @@ impl Volume {
         }
         // Miss path: return the freshly-read bytes directly, cache one copy.
         // See `read` — avoids the redundant second full-buffer copy.
-        let data = self.backend.read_at(path, offset, len)?;
+        let data = self.backend_mut(|b| b.read_at(path, offset, len))?;
         self.cache.insert(key, Arc::from(data.as_slice()));
         Ok(data)
     }
 
     pub(crate) fn exists(&mut self, path: &Path) -> Result<bool, FsError> {
-        self.backend.exists(path)
+        self.backend_mut(|b| b.exists(path))
     }
 
     pub(crate) fn metadata(&mut self, path: &Path) -> Result<Metadata, FsError> {
-        self.backend.metadata(path)
+        self.backend_mut(|b| b.metadata(path))
     }
 
     pub(crate) fn read_dir(&mut self, path: &Path) -> Result<Vec<DirEntry>, FsError> {
-        self.backend.read_dir(path)
+        self.backend_mut(|b| b.read_dir(path))
     }
 
     pub(crate) fn open_stream(&mut self, path: &Path) -> Result<Box<dyn FsStream>, FsError> {
-        self.backend.open_stream(path)
+        self.backend_mut(|b| b.open_stream(path))
     }
 
     pub(crate) fn supports_streaming(&self) -> bool {
-        self.backend.supports_streaming()
+        match &self.backend {
+            BackendOwn::Owned(b) => b.supports_streaming(),
+            BackendOwn::Shared(rc) => rc.borrow().supports_streaming(),
+        }
     }
 
     // ---------- read surface: &str convenience wrappers ----------

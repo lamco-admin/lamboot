@@ -1,7 +1,7 @@
 # LamBoot Diagnostic Modules
 
-**Version:** 0.12.0
-**Updated:** 2026-04-21
+**Version:** 0.16.5
+**Updated:** 2026-06-08
 
 ---
 

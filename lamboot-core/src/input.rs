@@ -210,9 +210,9 @@ impl InputManager {
                 agent: image_h,
                 controller: None,
             };
-            if let Ok(mut p) = (unsafe {
+            if let Ok(mut p) = unsafe {
                 boot::open_protocol::<PointerProto>(params, OpenProtocolAttributes::GetProtocol)
-            }) {
+            } {
                 let _ = p.reset(false);
             }
         }
@@ -222,9 +222,9 @@ impl InputManager {
                 agent: image_h,
                 controller: None,
             };
-            if let Ok(mut p) = (unsafe {
+            if let Ok(mut p) = unsafe {
                 boot::open_protocol::<AbsolutePointer>(params, OpenProtocolAttributes::GetProtocol)
-            }) {
+            } {
                 let _ = p.reset(false);
             }
         }

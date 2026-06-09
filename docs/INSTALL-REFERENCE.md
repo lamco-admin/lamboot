@@ -1,6 +1,6 @@
 # lamboot-install Command Reference
 
-**Applies to:** lamboot-install as shipped with LamBoot v0.12.0
+**Applies to:** lamboot-install as shipped with LamBoot v0.16.5
 **Installer protocol:** v1 (see `--protocol-version`, `--capabilities`)
 
 `lamboot-install` installs, updates, or removes the LamBoot UEFI
@@ -8,7 +8,12 @@ bootloader on the local system, or stages it into a target root for a
 distro installer. It is a single bash script (bash 4.0+) and is the
 only supported way to put LamBoot onto an ESP — it owns the ESP file
 layout, the UEFI boot entry, BLS-entry generation, the Secure Boot
-shim chain, and the systemd integration.
+shim chain, and the systemd integration. (Since v0.16.3 the bootloader
+also self-installs its own `Boot####` NVRAM entry from the firmware
+environment as an OS-independent fallback — see `[boot-entry]
+self_install` in the [Configuration Guide](CONFIGURATION-GUIDE.md) — so a
+firmware-visible LamBoot entry no longer depends solely on the
+installer's NVRAM write.)
 
 This document is the authoritative reference for the command-line
 surface. For task walkthroughs see the [User Guide](USER-GUIDE.md) and
@@ -85,14 +90,17 @@ Grouped by purpose. Every long option the parser accepts is listed.
 
 | Flag | Effect |
 |---|---|
-| `--with-drivers-legacy=MODE` | Legacy UEFI FS-driver install policy. `auto` (default): install a driver only for a `/boot` filesystem LamBoot does **not** natively cover — ext2/3/4 are skipped (native via ext4-view), btrfs/xfs/ntfs/zfs/f2fs/iso9660 installed when applicable. `all`: install every applicable driver (v0.8.3 behavior). `none`: install no drivers |
+| `--with-drivers-legacy=MODE` | Legacy UEFI FS-driver install policy. `auto` (default): install a driver only for a `/boot` filesystem LamBoot does **not** natively cover. ext2/3/4, btrfs, XFS, and ZFS are read by native in-binary backends, so their bundled `xfs_*.efi` / `zfs_*.efi` drivers are skipped at boot (loading them would shadow the native readers); exFAT is read natively and ships no driver. A driver is still installed for filesystems without a native skip entry (e.g. ntfs, f2fs, iso9660) when applicable. `all`: install every applicable driver (v0.8.3 behavior). `none`: install no drivers |
 | `--with-drivers` | Alias for `--with-drivers-legacy=all` |
 | `--with-modules` | Install diagnostic modules to `EFI/LamBoot/modules/` |
 
 > On `--update` in `auto` mode, the installer **prunes** previously
 > deployed `ext{2,3,4}_*.efi` drivers from the ESP — they are
 > redundant under the native backend and harmful under Secure Boot
-> (loading any UEFI FS driver makes shim 15.8 uninstall ShimLock). Use
+> (loading any UEFI FS driver makes shim 15.8 uninstall ShimLock). The
+> bundled `xfs_*.efi` / `zfs_*.efi` drivers are likewise redundant —
+> XFS and ZFS are now read by native backends, so those drivers are
+> skipped at boot even when present. Use
 > `--with-drivers-legacy=all` on update to keep them for A/B testing.
 
 ### Removal modifiers
@@ -183,7 +191,7 @@ A standard install runs these phases in order. Proxmox-host and
 
 | Phase | Name | What it does |
 |---|---|---|
-| 1 | Detect environment | Arch, ESP mount, distro, existing install, ESP free space (≥ 2 MB) |
+| 1 | Detect environment | Arch, ESP mount, distro, existing install, ESP free space (≥ 2 MB); warn when the ESP parent disk differs from the OS root disk under a hypervisor (v0.16.2) — on Proxmox/QEMU OVMF a named NVRAM entry on a non-boot-indexed disk is pruned on reboot; the warning names the actionable `qm set --boot` (or `--fallback`) fix and emits an `esp_on_separate_disk` trust event |
 | 2 | Assess drivers | Determine whether a legacy FS driver is needed for `/boot` per the SDS-6 policy |
 | 3 | Discover entries | Inventory existing BLS entries + installed kernels in `/boot` |
 | 3b | Backup & migrate | Back up a prior bootloader / migrate state when relevant |
@@ -193,7 +201,7 @@ A standard install runs these phases in order. Proxmox-host and
 | 5 | Generate BLS | Write per-kernel BLS `.conf` to the ESP `loader/entries/`; gap-fill only what is missing |
 | 5b | Proxmox BLS backfill | *(PATH A)* retire the legacy root-fs `/boot/loader/entries` scheme |
 | 6 | UEFI boot entry | Create the `Boot####` entry; set/preserve `BootOrder` per `--*-default`; deferred to first boot under `--root` |
-| 7 | Systemd integration | Install + enable `lamboot-mark-success.service`; install the `90-lamboot.install` kernel-install plugin and Debian/Ubuntu hooks |
+| 7 | Systemd integration | Install + enable `lamboot-mark-success.service`; install the `90-lamboot.install` kernel-install plugin and Debian/Ubuntu hooks; when SELinux is enabled, `restorecon` the installed files + payload dir so a hand-deployed (through-`/tmp`) install isn't left `user_tmp_t` and blocked from first-boot service exec on enforcing RHEL (v0.16.3; idempotent no-op on rpm/non-SELinux) |
 | 7b | Proxmox hooks | *(Proxmox-host)* marker file, observability units, cmdline-sync hook (PATH A) |
 | 8 | Verify | Binary present, UEFI entry present, every BLS entry's kernel + initrd resolve, coverage + hook checks |
 | 8b | Proxmox drift check | *(Proxmox-host)* compare cmdline against `/etc/default/grub` |

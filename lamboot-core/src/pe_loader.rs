@@ -453,6 +453,11 @@ fn allocate_image_pages(summary: &PeSummary) -> Result<(*mut u8, usize, u64), Pe
     Ok((base, pages, actual_base))
 }
 
+/// The handle plus the leaked allocations an installed `LoadedImageProtocol`
+/// must outlive `start_image` on: the boxed protocol data and the optional
+/// load-options buffer. Returned together so the caller owns their lifetime.
+type InstalledImage = (Handle, Box<LoadedImageProtocol>, Option<Box<[u16]>>);
+
 /// Install a raw `LoadedImageProtocol` on a new handle. Returns the
 /// handle, the leaked Box holding the protocol data, and the leaked
 /// load-options buffer (if any).
@@ -462,7 +467,7 @@ fn install_loaded_image_protocol(
     image_base: *mut u8,
     image_size: u64,
     load_options: Option<Box<[u16]>>,
-) -> Result<(Handle, Box<LoadedImageProtocol>, Option<Box<[u16]>>), PeLoadError> {
+) -> Result<InstalledImage, PeLoadError> {
     // Compute load-options pointer + size. We hold the Box to prevent
     // it from being dropped before the child reads it; LoadedImage
     // keeps it alive in `load_options_guard`.

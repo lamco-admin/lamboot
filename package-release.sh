@@ -39,7 +39,7 @@ REQUIRED=(
     SECURITY.md
     LICENSE-MIT
     LICENSE-APACHE
-    README.md
+    packaging/tarball-README.md
 )
 
 missing=0
@@ -78,7 +78,12 @@ cp -a /home/greg/lamboot-dev/tools/build-ovmf-vars.sh ./build-ovmf-vars.sh 2>/de
 cp -a /home/greg/lamboot-dev/tools/lamboot-inspect ./lamboot-inspect
 cp -a /home/greg/lamboot-dev/tools/lamboot_inspect ./lamboot_inspect
 mkdir -p man/man1 completions
-cp -a /home/greg/lamboot-dev/tools/lamboot-inspect.1 ./man/man1/lamboot-inspect.1
+# Generate the man page from lamboot-inspect's help registry (--dump-registry)
+# rather than copying a tracked .1 — the tracked page drifted to 0.8.3 once. The
+# vendored generator is byte-compatible with the toolkit's, so the lamboot and
+# lamboot-tools packages ship an identical inspect(1).
+/home/greg/lamboot-dev/tools/registry-to-man \
+    /home/greg/lamboot-dev/tools/lamboot-inspect ./man/man1 >/dev/null
 cp -a /home/greg/lamboot-dev/tools/completions/lamboot-inspect.bash ./completions/lamboot-inspect.bash
 cp -a /home/greg/lamboot-dev/tools/completions/_lamboot-inspect ./completions/_lamboot-inspect
 
@@ -125,49 +130,26 @@ cp -a /home/greg/lamboot-dev/packaging/installers/openSUSE/. \
 cp -a /home/greg/lamboot-dev/packaging/aur/lamboot/95-lamboot.hook \
     packaging/aur/lamboot/95-lamboot.hook 2>/dev/null || true
 
-# Documentation
-mkdir -p docs
+# Documentation — THIN tarball (S1, 2026-06-08). The -bin tarball ships only the
+# legal files + CHANGELOG + SECURITY + a STUB README that points to the canonical
+# docs at lamco.ai. The full docs/ tree is intentionally NOT bundled: it lives in
+# the public repo and on the website, so a docs/README content or link change no
+# longer forces a tarball rebuild + re-sign. See packaging/PACKAGING.md
+# "three publish tracks" (Code / Packaging-metadata / Presentation).
 cp /home/greg/lamboot-dev/CHANGELOG.md ./CHANGELOG.md
 cp /home/greg/lamboot-dev/SECURITY.md ./SECURITY.md
-cp /home/greg/lamboot-dev/README.md ./README.md
+cp /home/greg/lamboot-dev/packaging/tarball-README.md ./README.md
 cp /home/greg/lamboot-dev/LICENSE-MIT ./LICENSE-MIT
 cp /home/greg/lamboot-dev/LICENSE-APACHE ./LICENSE-APACHE
 
-# User-facing documentation (NOT internal analysis).
-# This list must stay in sync with PUBLIC_DOCS in
-# ~/lamco-admin/pipelines/lamboot/publish/sync-to-public.sh so the tarball
-# and the public clone ship the same set of docs.
-for d in \
-    SECURE-BOOT-DEPLOYMENT.md \
-    SECURE-BOOT-AND-SIGNING-STRATEGY.md \
-    SECURITY-MODEL.md \
-    SECURITY-GUIDE.md \
-    MOK-ENROLLMENT-GUIDE.md \
-    OVMF-VARS-PROXMOX.md \
-    PROXMOX-GUIDE.md \
-    PROXMOX-GUEST-INTEGRATION-LAYER.md \
-    KEY-GENERATION.md \
-    INSTALL-REFERENCE.md \
-    CONFIGURATION-GUIDE.md \
-    TROUBLESHOOTING-GUIDE.md \
-    USER-GUIDE.md \
-    DEVELOPER-GUIDE.md \
-    DIAGNOSTIC-MODULES.md \
-    ARCHITECTURE.md \
-    ARCHITECTURE-LAYERS.md \
-    LAMBOOT-TOOLS-OVERVIEW.md \
-    LAMBOOT-INSPECT.md; do
-    if [[ -f "/home/greg/lamboot-dev/docs/$d" ]]; then
-        cp "/home/greg/lamboot-dev/docs/$d" "docs/$d"
-    fi
-done
-
 # ── Cross-reference scan ───────────────────────────────────────────────
-# Catches references in the staged tarball tree to docs that the tarball
-# does NOT include — links that would dead-end for a user who extracted
-# the tarball, or worse, advertise the existence of internal documents.
-# Mirrors the scan in lamco-admin/pipelines/lamboot/publish/sync-to-public.sh;
-# the two must allow-list the same set of doc names.
+# THIN-tarball model (S1): docs are no longer bundled — they live on the website
+# and in the public repo. The allow-list below is the set of PUBLIC doc names
+# that may legitimately be referenced (a bundled tool or CHANGELOG entry naming
+# one is fine; the user follows it to lamco.ai / the repo). Any docs/<NAME>.md
+# reference NOT in this list is an INTERNAL-doc leak and aborts the build. New
+# user-facing references should prefer a https://lamco.ai/... URL (which this
+# scan does not flag) over a docs/<NAME>.md path.
 echo
 echo "══ Cross-reference scan ══"
 TARBALL_DOCS=(

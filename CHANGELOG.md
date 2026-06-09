@@ -2,6 +2,356 @@
 
 All notable changes to LamBoot are documented here. Format inspired by Keep a Changelog; semantic versioning is loose during pre-1.0.
 
+## [0.16.5] — Dependency pins: lamfat 0.4.2 + lamzfs 0.1.1
+
+A dependency-sourcing patch with no change to boot behavior. The native FAT and
+ZFS readers move to freshly republished crate versions.
+
+### Changed
+
+- **`FatRo` now consumes `lamfat` `=0.4.2`** — a republish of the read-only
+  FAT reader without the `fscommon` dependency. Read behavior is byte-for-byte
+  identical; this trims a transitive dependency from the FAT-backend layer.
+- **`lamzfs` pinned to `=0.1.1`**, which moves its LZ4 block decompressor from
+  `lz4_flex` 0.11 to 0.13. The ZFS boot-pool reader decodes the same blocks;
+  this is a dependency refresh with no behavior change.
+
+### Infrastructure
+
+- SBAT version string aligned to `0.16.5` (generation column unchanged at `1`:
+  human-facing string only, no revocation).
+
+## [0.16.4] — Kernel-upgrade BLS entries fixed on XFS /boot (kernel hook)
+
+A kernel upgrade on an XFS `/boot` (RHEL/Rocky/Alma/CentOS — surfaced by a RHEL
+9.7 → 9.8 upgrade) produced an **unbootable, red-X** BLS entry for the new
+kernel: `lamboot-kernel-hook` (the incremental writer invoked by
+`kernel-install` / the Debian kernel hooks) had two bugs that only bit XFS and
+`kernel-install`-driven distros. The bootloader binary is unchanged; this is a
+host-side tooling fix.
+
+### Fixed
+
+- **`lamboot-kernel-hook` now writes XFS `/boot` entries in place, not on the
+  ESP.** Its `resolve_bls_dir` placement set was `vfat|ext2|ext3|ext4|btrfs` —
+  missing `xfs`, so it never picked up `lamboot-install`'s v0.16.0 "xfs →
+  `boot_in_place`" change and wrote the new kernel's entry to the ESP instead of
+  the XFS `/boot`.
+- **The `linux` path now references the `/boot` kernel copy, not kernel-install's
+  source image.** On Fedora/RHEL/CentOS, `kernel-install add` passes
+  `/lib/modules/<version>/vmlinuz` (the package staging path); the hook copied
+  that into the BLS `linux` field (mangled to `//lib/modules/...`) instead of the
+  bootable `/boot/vmlinuz-<version>` copy → LamBoot couldn't find the kernel
+  (preflight red X). It now prefers a `/boot`-located image, else
+  `/boot/vmlinuz-<version>`; `bls_path` is hardened against the `//` double-slash.
+- **Placement parity is now build-enforced.** `tools/check-fs-coverage-parity.py`
+  additionally asserts the hook's in-place set equals
+  `is_filesystem_natively_covered` minus zfs (the lamzfs read-in-place deferral).
+  The hook can no longer silently drift from the installer — the exact regression
+  class behind this fix. (zfs stays ESP-placed in both, by design.)
+
+## [0.16.3] — Robust partition discovery (MBR) + bootloader NVRAM self-install
+
+Robustness work surfaced by the first RHEL-family validation (RHEL 9.7, a BIOS
+install converted to UEFI). LamBoot now discovers and boots a Linux install whose
+`/boot` is a plain filesystem on a **legacy-MBR** disk — the canonical layout of
+a BIOS-installed RHEL/Rocky/Alma/CentOS — and manages its own persistent UEFI
+boot entry directly from the firmware environment.
+
+### Added
+
+- **Bootloader-side NVRAM self-install of the `LamBoot` boot entry.** LamBoot now
+  ensures a labeled `Boot####` entry pointing at `\EFI\LamBoot\lambootx64.efi`
+  exists, creating it (and front-loading `BootOrder`) from the UEFI environment
+  if absent. This is the OS-independent pathway for the persistent entry: no
+  `efibootmgr`, no OS, and on SELinux-enforcing distros no confined-service block
+  in the way (`Boot####`/`BootOrder` are non-authenticated, so no Secure Boot
+  keys are involved). Idempotent — it keys on the exact `LamBoot` description, so
+  it never duplicates or churns NVRAM and coexists with the OS-side `efibootmgr`
+  pathway. New module `boot_entry` (UEFI I/O) over `boot_entry_pure` (the
+  byte-exact `EFI_LOAD_OPTION`/`BootOrder` codecs, host-tested).
+- **`[boot-entry] self_install` policy gate** (default **on**; set `false` to
+  opt out for operators who manage firmware boot order externally).
+
+### Fixed
+
+- **Partition discovery now covers MBR and BlockIO-only partitions, not just
+  GPT.** `scan_discoverable_partitions` previously consumed only GPT entries from
+  the `PartitionInfo` protocol, so a BIOS-installed disk with an `msdos` table
+  (e.g. RHEL's XFS `/boot` as a primary partition) yielded zero discovered
+  partitions and its `/boot` was never mounted — LamBoot showed no entries and
+  fell into the fallback self-loop. It is now a three-source enumerator,
+  de-duplicated by handle: GPT via `PartitionInfo`, **MBR** via
+  `PartitionInfo.mbr_partition_record()` (classified by a host-tested `os_type`
+  predicate), and **BlockIO-only** logical partitions for firmware that installs
+  `PartitionInfo` on the ESP alone. Every native FS backend (lamxfs/ext4/btrfs/
+  exfat/zfs/LVM/media) picks them up unchanged.
+- **The fallback self-loop guard now actually fires.** The old guard compared the
+  on-disk `\EFI\BOOT\BOOTX64.EFI` against the **in-memory, firmware-relocated**
+  running image — hashes that never match — so a no-entries boot would offer and
+  auto-select the fallback, chainloading LamBoot into itself. Replaced with a
+  reliable path check: if LamBoot was launched from the removable fallback path,
+  that synthetic is suppressed and the recovery menu shows instead.
+- **First-boot NVRAM service no longer retries forever.** A persistently-blocked
+  write (e.g. a mislabeled binary on enforcing SELinux) now fails non-fatally
+  after a bounded number of attempts with an actionable message, instead of
+  re-running every boot.
+- **Installer relabels its files for SELinux (`restorecon`).** A hand-deployed
+  (non-rpm) install copied through `/tmp` leaves files labeled `user_tmp_t`,
+  which `init_t` may not execute — so the first-boot service's exec of
+  `lamboot-install` (a symlink into `/usr/share/lamboot`) was denied on enforcing
+  RHEL. `lamboot-install` now runs `restorecon` on its installed files +
+  payload dir when SELinux is enabled (idempotent no-op on rpm/non-SELinux).
+  This is the correct fix; no custom SELinux policy module is shipped.
+
+## [0.16.2] — Fix: installer misclassified its own old fallback as systemd-boot
+
+A point fix for the upgrade path on systems whose firmware boots LamBoot via the
+removable-media fallback `\EFI\BOOT\BOOTX64.EFI` (e.g. a Proxmox VM whose ESP
+lives on a disk not in the VM's `boot:` order, where named NVRAM entries don't
+persist). On those systems `lamboot-install --update --fallback` aborted and the
+upgrade never reached the binary the firmware actually loads.
+
+### Fixed
+
+- **`identify_bootloader` now detects LamBoot before systemd-boot.** LamBoot's
+  own binary embeds the string `systemd-boot` (its SecurityOverride mirrors
+  systemd-boot's ShimLock dance), and the loader-classifier grepped for
+  `systemd-boot` *before* the LamBoot self-check — so an existing LamBoot
+  fallback was misclassified as a foreign systemd-boot, and `install_fallback`
+  refused to refresh it without `--replace-fallback`. The LamBoot check now runs
+  first; an old LamBoot fallback is correctly recognized as our own and updated
+  in place on `--update --fallback`. Covered by a new
+  `tools/tests/installer/identify_bootloader.bats` regression suite.
+
+### Added
+
+- **Install-time warning when the ESP is on a separate disk from the OS root.**
+  On a hypervisor whose firmware only boot-indexes the disks in the VM's `boot:`
+  order (Proxmox/QEMU OVMF), a named LamBoot NVRAM entry pointing at a
+  non-boot-indexed disk is pruned on reboot — so an upgrade silently reverts to
+  booting the fallback. `lamboot-install` now detects this (ESP parent disk ≠ OS
+  root disk under `systemd-detect-virt`) in `warn_if_esp_on_separate_disk()` and
+  warns with the actionable `qm set --boot` fix (or `--fallback`), plus an
+  `esp_on_separate_disk` trust event. Tested by
+  `tools/tests/installer/warn_esp_disk.bats`.
+
+## [0.16.1] — Fix: goblin 0.9.3 could not boot Linux kernels (native PE loader)
+
+A hotfix for a boot regression introduced in 0.16.0. The `goblin` PE-parser pin was
+moved `=0.10.5 → =0.9.3` to align with the Debian archive, but goblin 0.9.3's
+`Header::parse` **rejects the Linux EFI-stub layout** — the kernel omits the MSVC DOS
+stub (`e_lfanew == 0x40`), and 0.9.3's `DosStub::parse` fails the `end_offset <=
+start_offset` check (0.10.5 relaxed it to `<`). Every native-PE Linux-kernel load
+therefore failed with `pe_parse_failed`, dead-ending the boot — observed as the VM
+powering off on kernel selection. SB-off, directly-signed, and MOK kernels booted via
+the native loader are all affected; a default-config Linux boot does not complete.
+
+### Fixed
+
+- **Native PE loader no longer depends on `goblin`.** The single `goblin::Header::parse`
+  call is replaced by a hand-rolled `no_std` PE/COFF reader that reads only the
+  load-bearing COFF + PE32+ optional-header fields from their fixed offsets and never
+  parses the MSVC DOS stub or Rich header — the structures goblin 0.9.3 mis-validated.
+  `number_of_rva_and_sizes` bounds the data-directory accessors (Linux kernels ship
+  fewer than the full 16). PE32 (`0x10b`) is rejected cleanly. `goblin` — and its
+  transitive `plain` / `scroll` deps — leave the dependency tree entirely, which is what
+  the Debian archive needs. Verified end-to-end: the exact kernel 0.16.0 rejected now
+  loads with `image_loaded_native … SUCCESS`.
+- **`boot_linux` gains a native → firmware `BS->LoadImage` fallback.** A native-PE
+  parse/load failure on a Linux kernel is no longer terminal — it degrades to a firmware
+  boot (logged as `kernel_native_load_fallback`) instead of an unbootable system. The ISO
+  path already had this; it now covers BLS kernels too.
+
+### Changed
+
+- **Installer native-filesystem coverage synced with the runtime.** `xfs`/`zfs` are now
+  native (lamxfs/lamzfs), so `lamboot-install` no longer installs their legacy GPLv3
+  drivers; a separate XFS `/boot` becomes read-in-place. ZFS `/boot` stays ESP-staged
+  until `lamzfs` is field-soaked across pool topologies (the driver-skip still applies).
+  The `--capabilities` JSON moves `xfs`/`zfs` to `native`. A new
+  `tools/check-fs-coverage-parity.py` (pre-commit + CI) pins the installer's list to
+  `lamboot-core/src/drivers.rs` so the two cannot silently drift again.
+
+## [0.16.0] — Native XFS / exFAT / ZFS readers + Boot-from-ISO + the lamfold media stack
+
+The biggest de-bundling release since the native ext4/btrfs readers landed. LamBoot
+now reads four more on-disk formats natively and read-only — XFS, exFAT, ZFS, and a
+six-filesystem read-only *media* stack (EROFS, ISO 9660, SquashFS, cramfs, romfs, UDF) —
+without leaning on a firmware filesystem driver or a GPLv3 EfiFs `*.efi` for any of them.
+Together these close the last large gaps in the de-bundling map: XFS is the default
+`/boot` and `/` across the RHEL family, ZFS covers the Ubuntu/Debian root-on-ZFS `bpool`
+pattern, exFAT covers >4 GiB removable boot media, and the media stack covers immutable
+and live-media images. A new, **opt-in** boot-from-ISO capability lets an operator boot a
+distribution directly from an `.iso` on a mounted volume or from a physical optical disc.
+Every new backend is read-only **by construction** — there is no write path and the ESP
+writer only ever targets the FAT backend — and nothing in this release changes a
+default-config boot: both boot-from-ISO gates default off.
+
+### Added
+
+- **Native read-only XFS backend (`lamxfs`).** A clean-room `no_std` XFS reader replaces
+  the GPLv3 EfiFs `xfs_x64.efi` driver path (which cannot be Microsoft-signed and trips
+  shim 15.8's `ShimLock` uninstall). It mounts a whole XFS partition and — via the
+  source-generic dispatcher — an XFS filesystem on an LVM logical volume (the default RHEL
+  root layout) or inside an `.iso` loopback region. It derives its UUID and label from the
+  mounted superblock, decodes real on-disk POSIX modes, follows leaf symlinks, caps
+  up-front allocations against a hostile inode size, and turns structural and CRC failures
+  into stable error tokens. XFS is the only one of the three new whole-partition readers
+  that exposes a real filesystem UUID/label and decodes on-disk modes. Read-only by
+  construction.
+- **Native read-only exFAT backend (`lamexfat`).** A `no_std` exFAT reader for
+  removable/utility boot media — a kernel+initrd or a boot image on an exFAT-formatted USB
+  stick or SD card, including the >4 GiB payloads FAT32 cannot hold. exFAT is never the
+  ESP and never a Linux root, so it does not overlap the ext4/btrfs/xfs/FAT backends; it
+  mounts only whole partitions identified by the `EXFAT   ` boot-sector magic and is
+  intentionally *not* wired into the LV/`.iso` dispatcher. The reader handles both
+  FAT-chained and contiguous (`NoFatChain`) files, up-case-table case-insensitive lookup,
+  and entry-set checksums, and caps allocations against a hostile `DataLength`. exFAT
+  carries no 128-bit UUID or POSIX modes, so metadata is synthesized read-only and
+  `uuid()` returns `None`. Read-only by construction.
+- **Native read-only ZFS boot-pool backend (`lamzfs`).** LamBoot can now read kernels and
+  initrds directly from an *unencrypted* ZFS boot pool (the Ubuntu/Debian root-on-ZFS
+  `bpool` pattern) with no OpenZFS kernel module and no GPL UEFI filesystem driver. A pool
+  is imported once from its member partitions — grouped by pool GUID via
+  `lamzfs::peek_pool_id` before mount — and each dataset is presented as its own read-only
+  volume; reads, stats, ranged reads, existence checks, and directory enumeration are all
+  dataset-scoped. Supported vdev topologies are **single disk, mirror, and (per spec)
+  single-parity RAIDZ1** with XOR degraded reconstruction; RAIDZ2/RAIDZ3, dRAID, multiple
+  top-level vdevs, allocation-class/special vdevs, and native encryption are rejected
+  cleanly with a typed error. All six OpenZFS block compressors (off, zle, lzjb, lz4,
+  gzip, zstd) decode, and a block whose checksum fails surfaces as an integrity error
+  rather than a generic parse failure. The backend is `forbid(unsafe_code)` and read-only
+  by construction. ZFS pools carry a 64-bit GUID rather than a 128-bit filesystem UUID, so
+  `uuid()` returns `None` and datasets are identified by label and index; on-disk metadata
+  modes are synthesized read-only. *Scope note: mirror healing and RAIDZ1 reconstruction
+  are supported per the lamzfs v0.1 spec; the live-boot validation in this release
+  exercised a single-vdev lz4 pool, so RAIDZ1/mirror-repair behavior should be treated as
+  spec-supported, not yet field-soaked.*
+- **Native read-only media filesystem stack (`lamfold`): EROFS, ISO 9660, SquashFS,
+  cramfs, romfs, UDF.** LamBoot now mounts six read-only media filesystems natively at
+  boot through the Lamco-authored `no_std` lamfold stack, without a firmware FS driver.
+  Each is identified by a superblock-magic probe (UDF via a targeted sector-256
+  Anchor-Volume-Descriptor read) and dispatched over the generic `BlockSource` seam to a
+  single `LamfoldBackend` adapter, so a standalone media-FS partition (an EROFS or
+  SquashFS root or `/boot`) is mounted as an ordinary read-only volume and scanned for
+  kernels/BLS entries. EROFS reads uncompressed, LZ4, and the compressed-COMPACT codec set
+  (deflate / zstd / MicroLZMA); SquashFS reads gzip/xz/zstd/lz4/lzo; ISO 9660 reads
+  zisofs. Every lamfold backend is read-only by construction (`read_only` is hardcoded
+  true and no write path exists). Media mounts are currently *unverified* (read-only, but
+  no integrity/trust-root verification of media content yet); a Merkle trust-root path is a
+  later pass. *cpio is linked as a lamfold frontend but is deliberately not auto-probed or
+  wired into mount dispatch — it is not a usable boot filesystem in this release.*
+- **Boot a distribution ISO from disk or a physical optical drive (opt-in, off by
+  default).** With `[boot-from-iso] enabled`, an operator can boot a Linux distribution
+  directly from an `.iso` file on a mounted volume (ext4/btrfs/xfs/FAT, including the ESP);
+  with `optical = true`, from an inserted CD/DVD/BD. ISO discovery scans `/isos` and
+  `/boot/isos` for `*.iso`; optical discovery enumerates 2048-byte-sector `BlockIO`
+  handles carrying a `CD001` primary volume descriptor (a discriminator that structurally
+  excludes a `dd`'d isohybrid USB, so it is never double-listed). A file-hosted ISO is read
+  through a `FileBlockSource` over the holding backend's already-open handle (so reading an
+  ISO off the ESP never disconnects the FAT driver); an optical disc is read through a
+  non-exclusive shared `BlockIO` open (an exclusive open is `ACCESS_DENIED` while the
+  firmware ISO9660 driver holds the disc `BY_DRIVER`). The kernel and initrd are read off
+  the mounted ISO and handed off through the same measure/verify/initrd-register path as a
+  normal Linux boot. Because a distribution kernel is a Linux EFI-stub PE that LamBoot's
+  native loader cannot load, the ISO path falls back from the native loader to firmware
+  `LoadImage` on a load error. *This is experimental and opt-in;* only Arch 2026.05 and
+  Fedora 44 are live-ISO-validated end to end (see below).
+- **`loopback.cfg` resolution (Path A1) and a per-distro-family fallback table (Path A2).**
+  For a file-hosted ISO, LamBoot first parses the distribution's own
+  `/boot/grub/loopback.cfg`, extracting the kernel, first initrd, and command line from the
+  first bootable `menuentry` and substituting `${iso_path}` with the real path — so the
+  distribution's exact iso-find token (`iso-scan/filename=`, `findiso=`, `root=live:`) is
+  reused with no per-distro knowledge. When no usable `loopback.cfg` exists (and always for
+  a directly-booted optical disc, which has no `${iso_path}`), LamBoot fingerprints the
+  distro family by marker paths and applies a static recipe table covering six families —
+  arch, ubuntu-casper, debian-live, fedora, opensuse, alpine — each transitively covering
+  its derivatives (Mint, Pop!_OS, EndeavourOS, Manjaro, CachyOS, RHEL, Rocky, Alma, Nobara,
+  and more). Each recipe carries a `media_cmdline` ({label}, disc self-locates by volume
+  label) and a `file_cmdline` ({iso}, loop-booted from a file). Kernel resolution takes the
+  first candidate that resolves (with trailing-`*` prefix-glob support for version-stamped
+  names); initrd resolution concatenates every candidate that resolves, microcode first.
+  The fedora recipe is keyed on `/LiveOS/squashfs.img` so it survives the Fedora 44 layout
+  change. NixOS and Gentoo are intentionally excluded. *Validation status: only Arch 2026.05
+  and Fedora 44 are live-booted end to end (A2 live-VM matrix pass 1); the other four
+  families and all derivatives are recipe/table-validated and host-unit-tested, not yet
+  live-booted.* El Torito chainload (Path B) is not yet wired.
+
+### Changed
+
+- **`FatRo` backend now consumes the published `lamfat` crate.** The native read-only FAT
+  backend (for non-ESP FAT volumes the firmware refuses to serve) previously depended on a
+  git-pinned commit of `rust-fatfs`; it now depends on `lamfat = "=0.4.0"` from crates.io —
+  Lamco's republish of exactly that commit — imported under the local name `fatfs`
+  (`package = "lamfat"`) so the backend code is byte-for-byte unchanged. Behavior is
+  identical; this removes the last git-pinned dependency from the filesystem-backend layer
+  and brings the FAT reader under the same exact-pin drift discipline as the other readers.
+  Still read-only by construction — the `FatRo` tag is rejected by the ESP writer.
+- **Stable Rust toolchain (nightly pin dropped).** `rust-toolchain.toml` switches its
+  channel from `nightly` to `stable`: `lamboot-core`, the diagnostic modules, and both the
+  `x86_64-unknown-uefi` and `aarch64-unknown-uefi` targets compile with zero nightly
+  feature gates (verified on rustc 1.96.0). The UEFI crates still build
+  `core`/`alloc`/`compiler_builtins` from source via the per-crate `-Z build-std` flags;
+  those unstable cargo flags are unlocked on a stable compiler through `RUSTC_BOOTSTRAP=1`
+  rather than a nightly toolchain. This is what makes a from-source build on a distribution's
+  archive rustc possible.
+- **Dependency pins aligned to the Debian archive.** The build now pins `goblin =0.9.3`
+  (down from 0.10.5 — the PE loader uses only `Header::parse` and the `data_directories`
+  getters and bypasses goblin's full parser, so 0.9 suffices and avoids a 0.10 transition
+  that breaks seven archive rdeps), `lambutter =0.3.1`, `lamlvm =0.1.1`, and `sha2 =0.10.9`.
+  Read behavior is identical; this is a provenance/buildability change so the same source
+  compiles unmodified against Debian's library set.
+
+### Fixed
+
+- **Native ZFS backend not reached at boot (driver shadowing + slot-0 uberblock probe).**
+  A live OVMF/QEMU boot against a real ZFS pool exposed two runtime-only bugs that
+  prevented the native ZFS backend from ever mounting. First, the bundled GPL EfiFs
+  filesystem drivers were loaded for any filesystem not marked natively covered; ZFS and
+  XFS were missing from that list, so the legacy EfiFs driver attached to the partition
+  `BY_DRIVER` and exposed it as a generic `SimpleFileSystem`, shadowing the native backend
+  — and the native probe's exclusive open is then refused on firmware that will not
+  force-disconnect the driver. The fix marks `zfs_`/`xfs_` driver filenames as natively
+  covered so those drivers are skipped (exFAT ships no legacy driver and needs no entry).
+  Second, the ZFS superblock probe only inspected slot 0 of the 128 KiB uberblock array,
+  but the active uberblock rotates by `txg % slot_count` and the on-disk txg starts at 4,
+  so a freshly created pool leaves slot 0 zeroed and the probe missed the pool entirely;
+  the probe now scans the whole array at the 1 KiB minimum-slot stride and accepts the
+  uberblock magic in either endianness (also fixing a prior big-endian `u32` read that
+  never matched a little-endian x86 pool). After both fixes a live boot probes the pool and
+  mounts its root, `BOOT`, and `BOOT/test` datasets end to end.
+- **Graceful abort instead of panic on UEFI-helpers init failure.** The entry point and the
+  four diagnostic modules now return `Status::ABORTED` when `uefi::helpers::init()` fails,
+  instead of panicking via `.expect(...)`. On firmware where helper init cannot complete
+  this surfaces a clean UEFI error status rather than an unwinding panic. Part of a wider
+  lint cleanup that also resolved advisory `unwrap_used`/`expect_used` sites and removed
+  three dead functions; no functional change beyond the init path.
+
+### Infrastructure
+
+- **Filesystem readers unified on one `BlockSource` seam.** The storage layer was
+  refactored onto a single block-source abstraction with no change to boot or read
+  behavior. `block_source.rs` introduces the `BlockSource` trait (Seam A) and one generic
+  `SourceReader<S>` adapter (Seam B) whose single `fill_at` loop implements both
+  `ext4-view`'s `Ext4Read` and `lambutter`'s `BlockRead`, replacing two byte-for-byte
+  duplicated LV adapters. Seam C then folds the three near-identical UEFI `BlockIO` readers
+  into one `BlockIoSource`, with the block-alignment math (`compute_aligned_read`) moved
+  verbatim and still fuzzed (71.5M execs, 0 crashes). Whole-partition ext4/btrfs now mount
+  over `SourceReader<BlockIoSource>`. A source-generic `dispatch_fs_over_source` /
+  `probe_source_superblock` API also lands; it is the plumbing the new XFS/media/boot-from-ISO
+  paths dispatch through. 168 host tests pass.
+- **Lint-clean across UEFI and host crates.** `lamboot-core` and the `lamboot-fs-tests`
+  host suite build clean of clippy and compiler warnings: unused goblin imports removed,
+  dead functions deleted, infallible-conversion and acronym lints suppressed with
+  documented `#[expect(...)]` reasons. No behavior change.
+- **Pre-commit hook brought into lockstep with CI.** The placeholder-marker scan
+  (`XX` / `FIXME` / `PLACEHOLDER` / `YYYY`) now also covers the shared `lib/` shell
+  libraries, and the pre-commit hook now runs the stricter acyclic module-graph check
+  (`check-layers.py --graph`) plus the same placeholder scan CI runs. This closes a gap
+  where a `block_source` ⇄ `fs_backend_lvm_dispatch` import cycle could pass the local hook
+  but fail CI.
+
 ## [0.15.2] — Lamco Development LLC relicense + published-crate dependencies
 
 A packaging and provenance release: no change to boot behavior. Copyright moves

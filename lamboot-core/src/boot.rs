@@ -16,7 +16,7 @@ use crate::{
     security_override,
     tpm::TpmContext,
     trust_log::{
-        self, TrustEvent, TrustLog, V_DEGRADED_TRUST_SB_DIRECT, V_DEGRADED_TRUST_SB_OFF,
+        TrustEvent, TrustLog, V_DEGRADED_TRUST_SB_DIRECT, V_DEGRADED_TRUST_SB_OFF,
         V_FIRMWARE_LOADIMAGE, V_NATIVE_PE_LOADER, V_SHIM_MOK, V_SHIM_REJECTED,
     },
 };
@@ -144,6 +144,410 @@ pub(crate) fn boot_entry(
             quirks,
             sb_state,
         ),
+        EntryKind::Iso {
+            source: crate::boot_types::IsoSource::File { iso_path },
+        } => boot_iso(
+            esp_slot,
+            rest,
+            entry.source_volume_index,
+            &iso_path,
+            current_image,
+            tpm,
+            policy,
+            trust_log,
+            quirks,
+            sb_state,
+        ),
+        EntryKind::Iso {
+            source: crate::boot_types::IsoSource::Optical { handle, label },
+        } => boot_iso_optical(
+            esp_slot,
+            handle,
+            &label,
+            current_image,
+            tpm,
+            policy,
+            trust_log,
+            quirks,
+            sb_state,
+        ),
+    }
+}
+
+/// Boot-from-ISO (SPEC-BOOT-FROM-ISO). Promotes the holding volume's backend to
+/// a shared handle, opens a loopback [`FileBlockSource`] over the `.iso`, and
+/// dispatches it as an ISO9660 volume (the M0/M1 path). Reading the ISO off the
+/// ESP is safe — `FileBlockSource` reads through the holding FAT backend's cached
+/// SFS, never a fresh exclusive open.
+///
+/// **Path A1 (preferred for a file-hosted ISO):** parse the distro's own
+/// `/boot/grub/loopback.cfg` — it carries the kernel/initrd paths and the exact
+/// iso-find token (`${iso_path}` substituted). **Path A2 (fallback):** if there
+/// is no usable `loopback.cfg`, fingerprint the distro family
+/// ([`crate::distro_iso`]) and render its `file_cmdline`. Either way the shared
+/// [`iso_boot_resolved`] tail runs the same measure → verify → initrd-register →
+/// PE-load handoff as `boot_linux`, bytes sourced from the ISO. Path B (El Torito
+/// chainload, M4) is not yet wired — it depends on the lamfat FAT-over-source arm.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors boot_linux; the boot params are threaded from boot_entry for the shared verify/load path"
+)]
+fn boot_iso(
+    esp: &mut Volume,
+    rest: &mut [Volume],
+    holding_index: usize,
+    iso_path: &str,
+    current_image: Handle,
+    tpm: &TpmContext,
+    policy: &Policy,
+    trust_log: &mut TrustLog,
+    quirks: crate::firmware_quirks::FirmwareQuirks,
+    sb_state: SecureBootState,
+) -> Result<Status> {
+    // The `.iso` lives on the volume named by `source_volume_index` (0 = ESP).
+    let holding: &mut Volume = if holding_index == 0 {
+        esp
+    } else {
+        rest.get_mut(holding_index - 1)
+            .ok_or_else(|| uefi::Error::from(Status::ABORTED))?
+    };
+
+    let shared = holding.share_backend();
+    let path = crate::fs_backend::PathBuf::from_str(iso_path)
+        .map_err(|_| uefi::Error::from(Status::INVALID_PARAMETER))?;
+    let src = crate::block_source::FileBlockSource::new(shared, path).map_err(uefi::Error::from)?;
+    let backend = crate::fs_backend_lvm_dispatch::dispatch_fs_over_source(src, None)
+        .map_err(uefi::Error::from)?;
+
+    let tag = backend.tag();
+    let mut iso_vol = crate::fs::Volume::from_backend(
+        crate::fs::VolumeIdentity {
+            partition_guid: None,
+            fs_uuid: None,
+            label: None,
+            index: u32::MAX,
+            backend_tag: tag,
+        },
+        backend,
+    );
+    log::info!("Mounted ISO {iso_path}: {}", iso_vol.identity().describe());
+    trust_log.record(TrustEvent::new("iso_mounted").with_note(&alloc::format!(
+        "iso_path={iso_path} backend={tag} holding_index={holding_index}"
+    )));
+
+    // Path A1 (file case preferred): the distro's own /boot/grub/loopback.cfg
+    // names the kernel, initrd, and the exact iso-find token (with `${iso_path}`
+    // substituted). When present it is the most faithful resolver for a
+    // file-hosted ISO, so it is tried first.
+    const LOOPBACK_CFG: &str = "/boot/grub/loopback.cfg";
+    if let Ok(cfg_bytes) = iso_vol.read_str(LOOPBACK_CFG) {
+        let cfg = String::from_utf8_lossy(&cfg_bytes);
+        if let Some(entry) = crate::loopback_cfg::parse_first_menuentry(&cfg, iso_path) {
+            log::info!(
+                "ISO {iso_path}: Path A1 (loopback.cfg) kernel={}",
+                entry.kernel
+            );
+            let initrd_paths = [entry.initrd];
+            return iso_boot_resolved(
+                iso_vol,
+                tag,
+                iso_path,
+                &entry.kernel,
+                &initrd_paths,
+                &entry.options,
+                esp,
+                current_image,
+                tpm,
+                policy,
+                trust_log,
+                quirks,
+                sb_state,
+            );
+        }
+        log::warn!(
+            "ISO {iso_path}: {LOOPBACK_CFG} present but no usable menuentry — trying Path A2"
+        );
+    }
+
+    // Path A2 (fallback): fingerprint the distro family and use its table entry.
+    // For a file-hosted ISO this renders the `file_cmdline` ({iso} = the path).
+    let Some(recipe) = crate::distro_iso::fingerprint(|p| iso_vol.exists_str(p)) else {
+        log::warn!(
+            "ISO {iso_path}: no usable loopback.cfg and unrecognized distro layout — Path B (chainload) not yet wired"
+        );
+        return Err(uefi::Error::from(Status::UNSUPPORTED));
+    };
+    let label = String::from(iso_vol.label().unwrap_or(""));
+    let options = crate::distro_iso::render_cmdline(recipe.file_cmdline, iso_path, &label);
+    let Some((kernel_path, initrd_paths)) = resolve_recipe(&mut iso_vol, recipe) else {
+        log::warn!(
+            "ISO {iso_path}: distro={} recognized but no kernel at the known paths",
+            recipe.family
+        );
+        return Err(uefi::Error::from(Status::UNSUPPORTED));
+    };
+    log::info!("ISO {iso_path}: Path A2 distro={} (file)", recipe.family);
+    trust_log.record(
+        TrustEvent::new("iso_path_a2_distro").with_note(&alloc::format!(
+            "family={} source=file iso={iso_path}",
+            recipe.family
+        )),
+    );
+    iso_boot_resolved(
+        iso_vol,
+        tag,
+        iso_path,
+        &kernel_path,
+        &initrd_paths,
+        &options,
+        esp,
+        current_image,
+        tpm,
+        policy,
+        trust_log,
+        quirks,
+        sb_state,
+    )
+}
+
+/// Boot-from-ISO via a **physical optical drive** (SPEC-BOOT-FROM-ISO scenario
+/// d). The `BlockIO` handle *is* the byte source — there is no holding
+/// filesystem — so it dispatches as an ISO9660 volume directly through
+/// [`BlockIoSource`](crate::block_source::BlockIoSource). A disc has no
+/// `${iso_path}`, so `loopback.cfg`'s iso-find token would be wrong for it; the
+/// resolver is Path A2 only, rendering the distro recipe's `media_cmdline` (the
+/// kernel self-locates on the medium by its volume label).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors boot_iso; the boot params are threaded from boot_entry for the shared verify/load path"
+)]
+fn boot_iso_optical(
+    esp: &mut Volume,
+    handle: Handle,
+    label: &str,
+    current_image: Handle,
+    tpm: &TpmContext,
+    policy: &Policy,
+    trust_log: &mut TrustLog,
+    quirks: crate::firmware_quirks::FirmwareQuirks,
+    sb_state: SecureBootState,
+) -> Result<Status> {
+    // Optical discs are held BY_DRIVER by the firmware ISO9660 FS driver, so the
+    // raw BlockIO must be opened non-exclusively (an exclusive open is
+    // ACCESS_DENIED) — see BlockIoSource::open_shared.
+    let src = crate::block_source::BlockIoSource::open_shared(handle).map_err(uefi::Error::from)?;
+    let backend = crate::fs_backend_lvm_dispatch::dispatch_fs_over_source(src, None)
+        .map_err(uefi::Error::from)?;
+    let tag = backend.tag();
+    let mut iso_vol = crate::fs::Volume::from_backend(
+        crate::fs::VolumeIdentity {
+            partition_guid: None,
+            fs_uuid: None,
+            label: None,
+            index: u32::MAX,
+            backend_tag: tag,
+        },
+        backend,
+    );
+    log::info!(
+        "Mounted optical disc [{label}]: {}",
+        iso_vol.identity().describe()
+    );
+    trust_log.record(
+        TrustEvent::new("iso_optical_mounted")
+            .with_note(&alloc::format!("label={label} backend={tag}")),
+    );
+
+    let Some(recipe) = crate::distro_iso::fingerprint(|p| iso_vol.exists_str(p)) else {
+        log::warn!(
+            "Optical [{label}]: unrecognized distro layout — Path B (chainload) not yet wired"
+        );
+        return Err(uefi::Error::from(Status::UNSUPPORTED));
+    };
+    let options = crate::distro_iso::render_cmdline(recipe.media_cmdline, "", label);
+    let Some((kernel_path, initrd_paths)) = resolve_recipe(&mut iso_vol, recipe) else {
+        log::warn!(
+            "Optical [{label}]: distro={} recognized but no kernel at the known paths",
+            recipe.family
+        );
+        return Err(uefi::Error::from(Status::UNSUPPORTED));
+    };
+    log::info!(
+        "Optical [{label}]: Path A2 distro={} (media)",
+        recipe.family
+    );
+    trust_log.record(
+        TrustEvent::new("iso_path_a2_distro").with_note(&alloc::format!(
+            "family={} source=optical label={label}",
+            recipe.family
+        )),
+    );
+    iso_boot_resolved(
+        iso_vol,
+        tag,
+        label,
+        &kernel_path,
+        &initrd_paths,
+        &options,
+        esp,
+        current_image,
+        tpm,
+        policy,
+        trust_log,
+        quirks,
+        sb_state,
+    )
+}
+
+/// Resolve a distro recipe's kernel + initrd candidates against the mounted ISO.
+/// Kernel: the **first** candidate that resolves (exact path or prefix glob).
+/// Initrd: **every** candidate that resolves, in order (microcode images before
+/// the main initramfs). `None` if no kernel candidate resolves.
+fn resolve_recipe(
+    iso_vol: &mut Volume,
+    recipe: &crate::distro_iso::DistroRecipe,
+) -> Option<(String, Vec<String>)> {
+    let kernel = recipe
+        .kernel
+        .iter()
+        .copied()
+        .find_map(|c| resolve_candidate(iso_vol, c))?;
+    let initrd = recipe
+        .initrd
+        .iter()
+        .copied()
+        .filter_map(|c| resolve_candidate(iso_vol, c))
+        .collect();
+    Some((kernel, initrd))
+}
+
+/// Resolve one recipe candidate against the mounted ISO: an exact path is
+/// returned if it exists; a trailing-`*` prefix glob is resolved against its
+/// directory listing (newest match wins). `None` if nothing matches.
+fn resolve_candidate(iso_vol: &mut Volume, candidate: &str) -> Option<String> {
+    if let Some((dir, prefix)) = crate::distro_iso::split_glob(candidate) {
+        let names = iso_vol.read_dir_str(dir).ok()?;
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let pick = crate::distro_iso::glob_pick(&refs, prefix)?;
+        Some(alloc::format!("{dir}/{pick}"))
+    } else if iso_vol.exists_str(candidate) {
+        Some(String::from(candidate))
+    } else {
+        None
+    }
+}
+
+/// Shared boot-from-ISO tail: read the kernel + initrd component(s) off the
+/// mounted ISO, drop the ISO volume (releasing its `Rc` clone of any shared
+/// holding backend) before the handoff touches `esp`, then run the same
+/// measure → verify → initrd-register → PE-load handoff as `boot_linux` with the
+/// bytes sourced from the ISO. Every initrd component is concatenated in order
+/// (microcode first); the kernel consumes the concatenation as one initrd.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared tail of the file + optical ISO boot paths; threads the same boot params as boot_linux"
+)]
+fn iso_boot_resolved(
+    mut iso_vol: Volume,
+    iso_tag: crate::fs_types::BackendTag,
+    label_for_log: &str,
+    kernel_path: &str,
+    initrd_paths: &[String],
+    options: &str,
+    esp: &mut Volume,
+    current_image: Handle,
+    tpm: &TpmContext,
+    policy: &Policy,
+    trust_log: &mut TrustLog,
+    quirks: crate::firmware_quirks::FirmwareQuirks,
+    sb_state: SecureBootState,
+) -> Result<Status> {
+    let kernel = iso_vol.read_str(kernel_path).map_err(uefi::Error::from)?;
+    let mut initrd = Vec::new();
+    for p in initrd_paths {
+        match iso_vol.read_str(p) {
+            Ok(mut bytes) => initrd.append(&mut bytes),
+            Err(_) => log::warn!("ISO [{label_for_log}]: initrd component {p} absent, skipping"),
+        }
+    }
+    log::info!(
+        "ISO Path A resolved [{label_for_log}]: kernel={kernel_path} ({} B), initrd={} comp ({} B), cmdline=[{options}]",
+        kernel.len(),
+        initrd_paths.len(),
+        initrd.len()
+    );
+    trust_log.record(
+        TrustEvent::new("iso_path_a_resolved").with_note(&alloc::format!(
+            "kernel={kernel_path} kbytes={} ibytes={} label={label_for_log}",
+            kernel.len(),
+            initrd.len()
+        )),
+    );
+
+    // Done reading the ISO — drop the loopback/optical volume so its `Rc` clone
+    // of any shared holding backend is released before the handoff touches `esp`.
+    drop(iso_vol);
+
+    measure_kernel_logged(tpm, trust_log, &kernel, kernel_path);
+    if !options.is_empty() {
+        measure_cmdline_logged(tpm, trust_log, options, kernel_path);
+    }
+    let Ok(verified) = verify_kernel_bytes(&kernel, kernel_path, trust_log, esp, sb_state) else {
+        return Err(Status::SECURITY_VIOLATION.into());
+    };
+    // The live system locates its own root via the cmdline (iso-find token or
+    // CDLABEL); LamBoot only registers this kernel's own initrd. Skip
+    // registration when no initrd component resolved.
+    let _initrd_handle = if initrd.is_empty() {
+        None
+    } else {
+        InitrdHandle::register(initrd, Some(esp)).ok()
+    };
+    let firmware_load = |trust_log: &mut TrustLog, esp: &mut Volume| {
+        firmware_load_and_start(
+            current_image,
+            &kernel,
+            options,
+            policy.loader_native_pe,
+            trust_log,
+            kernel_path,
+            esp,
+        )
+    };
+    match choose_load_path(policy.loader_native_pe, verified.sb_state) {
+        // A distro ISO kernel is a real Linux EFI-stub PE (sections .setup /
+        // .compat / .text / .data), which LamBoot's native loader does not load
+        // (LOAD_ERROR) — unlike LamBoot's own modules. The native path is still
+        // attempted (it honors an operator's SB-bypass intent and works for a
+        // PE-stub UKI on an ISO), but on a load failure we fall back to firmware
+        // `BS->LoadImage`, which loads the stub correctly. This keeps the default
+        // `Auto` policy able to boot an ISO under SB-off, where the route is
+        // Native. boot_linux keeps its native-only contract; the fallback is
+        // scoped to the ISO path, whose kernels are always foreign distro images.
+        LoadPath::Native => match native_load_and_start(
+            &verified,
+            options,
+            iso_tag,
+            kernel_path,
+            current_image,
+            trust_log,
+            esp,
+            quirks,
+        ) {
+            Err(_) => {
+                log::warn!(
+                    "ISO [{label_for_log}]: native PE load failed for {kernel_path} (Linux EFI stub) — falling back to firmware LoadImage"
+                );
+                trust_log.record(
+                    TrustEvent::new("iso_native_load_fallback")
+                        .with_path(kernel_path)
+                        .with_note("reason=native_pe_load_error route=firmware"),
+                );
+                firmware_load(trust_log, esp)
+            }
+            ok => ok,
+        },
+        LoadPath::Firmware => firmware_load(trust_log, esp),
     }
 }
 
@@ -521,7 +925,7 @@ fn boot_linux(
     match path {
         LoadPath::Native => {
             crate::diag::append(esp, "BL19 calling_native_load_and_start\n");
-            native_load_and_start(
+            match native_load_and_start(
                 &verified,
                 options,
                 backend_tag,
@@ -530,7 +934,40 @@ fn boot_linux(
                 trust_log,
                 esp,
                 quirks,
-            )
+            ) {
+                Err(_) => {
+                    // Defense-in-depth (v0.16.1): a native-PE parse/load failure
+                    // on a Linux kernel must NOT be terminal. The native loader
+                    // is preferred (it honors the SB-bypass intent and measured
+                    // boot), but a parser regression or an exotic header should
+                    // degrade to firmware BS->LoadImage — which loads the EFI
+                    // stub correctly — rather than leaving the system unbootable.
+                    // The ISO path already had this fallback; extending it here
+                    // is what would have turned the goblin-0.9.3 regression that
+                    // powered archie off into a (logged) firmware-path boot.
+                    // firmware_load_and_start carries the SecurityOverride guard,
+                    // so this is safe under SB+MOK as well as SB-off.
+                    crate::diag::append(esp, "BL19b native_failed_fallback_firmware\n");
+                    log::warn!(
+                        "native PE load failed for {kernel_path} — falling back to firmware LoadImage"
+                    );
+                    trust_log.record(
+                        TrustEvent::new("kernel_native_load_fallback")
+                            .with_path(kernel_path)
+                            .with_note("reason=native_pe_load_error route=firmware"),
+                    );
+                    firmware_load_and_start(
+                        current_image,
+                        &kernel_bytes,
+                        options,
+                        policy.loader_native_pe,
+                        trust_log,
+                        kernel_path,
+                        esp,
+                    )
+                }
+                ok => ok,
+            }
         }
         LoadPath::Firmware => {
             crate::diag::append(esp, "BL19 calling_firmware_load_and_start\n");
@@ -545,36 +982,6 @@ fn boot_linux(
             )
         }
     }
-}
-
-/// Search all volumes for a file path. Returns the index of the volume
-/// where the file exists, or None if absent from every volume. Callers must
-/// handle the None case — a misleading fallback to volume 0 hid real bugs
-/// where kernel-on-ext4 lookups silently redirected to the FAT ESP and failed
-/// later with an opaque NOT_FOUND from read_to_vec.
-fn find_volume_for_path(volumes: &mut [Volume], path: &str) -> Option<usize> {
-    for (i, vol) in volumes.iter_mut().enumerate() {
-        if vol.exists_str(path) {
-            return Some(i);
-        }
-    }
-    None
-}
-
-/// Load an EFI image from ESP with Secure Boot verification and TPM measurement
-fn load_efi_image(
-    parent_image: Handle,
-    esp: &mut Volume,
-    path: &str,
-    tpm: &TpmContext,
-) -> Result<Handle> {
-    let image_data = esp.read_str(path)?;
-
-    // Measure kernel image into TPM PCR 4 (best-effort; this helper records no
-    // trust event of its own, so the measure outcome is intentionally ignored).
-    let _ = tpm.measure_kernel(&image_data);
-
-    load_efi_image_from_buffer(parent_image, &image_data, Some(path))
 }
 
 /// Load an EFI image from an in-memory buffer.

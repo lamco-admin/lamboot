@@ -80,6 +80,36 @@ pub mod discovery_pure;
 #[path = "../../lamboot-core/src/boot_route_pure.rs"]
 pub mod boot_route_pure;
 
+// Robust-discovery extraction: pure legacy-MBR `os_type` mountability
+// classifier re-hosted verbatim so the BIOS-converted-disk truth table is
+// exercised on the host. The Volume/firmware-bound shell
+// (`partitions::scan_discoverable_partitions`, which reads PartitionInfo +
+// BlockIO) stays in lamboot-core and is covered by the QEMU/fleet harness
+// (RHEL VM 166). Lives at `../../lamboot-core/src/partition_classify_pure.rs`.
+#[path = "../../lamboot-core/src/partition_classify_pure.rs"]
+pub mod partition_classify_pure;
+
+// (b) NVRAM self-install codecs: EFI_LOAD_OPTION encode/parse + BootOrder
+// decode/encode/insert, re-hosted verbatim so the byte-exact firmware-variable
+// layout is exercised on the host (a wrong byte corrupts a Boot#### variable).
+// The UEFI I/O shell (`boot_entry::ensure_named_boot_entry`, which reads
+// LoadedImage + writes the variables) stays in lamboot-core and is covered by
+// the QEMU/fleet harness. Lives at `../../lamboot-core/src/boot_entry_pure.rs`.
+#[path = "../../lamboot-core/src/boot_entry_pure.rs"]
+pub mod boot_entry_pure;
+
+// Pure grub `loopback.cfg` menuentry extractor (boot-from-ISO Path A1). Its
+// inline `#[cfg(test)]` suite runs here on the host. Lives at
+// `../../lamboot-core/src/loopback_cfg.rs`.
+#[path = "../../lamboot-core/src/loopback_cfg.rs"]
+pub mod loopback_cfg;
+
+// Pure distro-family fingerprint + kernel/initrd/cmdline table (boot-from-ISO
+// Path A2). Its inline `#[cfg(test)]` suite runs here on the host. Lives at
+// `../../lamboot-core/src/distro_iso.rs`.
+#[path = "../../lamboot-core/src/distro_iso.rs"]
+pub mod distro_iso;
+
 #[path = "../../lamboot-core/src/read_limit_pure.rs"]
 pub mod read_limit_pure;
 

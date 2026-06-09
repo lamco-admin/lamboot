@@ -49,12 +49,15 @@ find_esp() {
     die "Cannot find ESP mount point (/boot/efi or /efi)"
 }
 
-# v0.15.0: when /boot is a separate partition LamBoot reads natively (vfat via
-# the FatRo reader; ext2/3/4 + btrfs via native backends), write the BLS entry
-# ON /boot so LamBoot sources the kernel in place — matching lamboot-install's
-# detect_bls_target. Otherwise keep ESP placement (Proxmox LVM/ZFS root; xfs/
-# f2fs/ntfs/zfs separate /boot). boot_path_prefix() already drops the /boot
-# prefix for a separate /boot, so the linux/initrd values stay correct.
+# When /boot is a separate partition LamBoot reads natively, write the BLS entry
+# ON /boot so LamBoot sources the kernel in place — this MUST match
+# lamboot-install's boot_in_place set (is_filesystem_natively_covered minus the
+# zfs deferral). The set is parity-checked by tools/check-fs-coverage-parity.py
+# so it can't silently drift from the installer again.
+#   in-place: vfat, ext2/3/4, btrfs, xfs (lamxfs, v0.16.0)
+#   ESP:      zfs (lamzfs read deferred until field-soaked), f2fs/ntfs (no
+#             native backend), and the no-separate-/boot case (Proxmox LVM root,
+#             where LamBoot reads the kernel off the root fs via the /boot/ prefix).
 resolve_bls_dir() {
     mountpoint -q /boot 2>/dev/null || return 0
     local boot_src esp_src boot_fs
@@ -63,7 +66,7 @@ resolve_bls_dir() {
     boot_fs=$(findmnt -n -o FSTYPE /boot 2>/dev/null)
     [ -n "$boot_src" ] && [ "$boot_src" != "$esp_src" ] || return 0
     case "$boot_fs" in
-        vfat|ext2|ext3|ext4|btrfs) BLS_DIR="/boot/loader/entries" ;;
+        vfat|ext2|ext3|ext4|btrfs|xfs) BLS_DIR="/boot/loader/entries" ;;
     esac
 }
 
@@ -79,10 +82,14 @@ boot_path_prefix() {
     fi
 }
 
-# Map a real /boot/<file> path to the BLS value for the current layout.
+# Map a real /boot/<file> path to the BLS value for the current layout. Strips
+# the /boot/ prefix to the bare name, then re-joins with PREFIX cleanly — the
+# leading-slash strip avoids a `//` (empty PREFIX) or `/boot//` (root-fs PREFIX)
+# when the input is not under /boot.
 bls_path() {
-    local real="$1"
-    printf '%s/%s' "$PREFIX" "${real#/boot/}"
+    local rel="${1#/boot/}"
+    rel="${rel#/}"
+    printf '%s/%s' "$PREFIX" "$rel"
 }
 
 get_distro_id() {
@@ -184,11 +191,21 @@ do_add() {
         return 0
     fi
 
+    # The BLS `linux` field must reference the kernel's /boot copy, NOT the
+    # kernel-install SOURCE image: on Fedora/RHEL/CentOS, `kernel-install add`
+    # passes /lib/modules/<version>/vmlinuz (the package's staging location),
+    # while the bootable copy it lays down is /boot/vmlinuz-<version>. Using the
+    # source image produced an unbootable `linux //lib/modules/...` entry. So:
+    # use a passed image only when it is already under /boot (Arch:
+    # /boot/vmlinuz-linux), else prefer the /boot/vmlinuz-<version> copy.
     local kernel_real=""
-    if [ -n "$kernel_image" ] && [ -f "$kernel_image" ]; then
+    if [ -n "$kernel_image" ] && [ -f "$kernel_image" ] \
+       && [ "${kernel_image#/boot/}" != "$kernel_image" ]; then
         kernel_real="$kernel_image"
     elif [ -f "/boot/vmlinuz-${version}" ]; then
         kernel_real="/boot/vmlinuz-${version}"
+    elif [ -n "$kernel_image" ] && [ -f "$kernel_image" ]; then
+        kernel_real="$kernel_image"
     else
         die "Cannot find kernel image for version ${version}"
     fi

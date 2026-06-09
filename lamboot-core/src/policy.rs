@@ -73,6 +73,24 @@ pub(crate) struct Policy {
     /// `[diagnostics] verbose = true` in policy.toml to capture a full
     /// audit-log trace of the boot for troubleshooting.
     pub diagnostics_verbose: bool,
+    /// Boot-from-ISO discovery gate (SPEC-BOOT-FROM-ISO §5). Default **false** —
+    /// LamBoot does not scan volumes for `*.iso` boot candidates unless the
+    /// operator opts in with `[boot-from-iso] enabled = true` in policy.toml.
+    pub iso_enabled: bool,
+    /// Optical-drive boot-from-ISO gate (SPEC-BOOT-FROM-ISO scenario d). Default
+    /// **false** — LamBoot does not enumerate `BlockIO` handles for inserted
+    /// CD/DVD/BD discs unless the operator opts in with
+    /// `[boot-from-iso] optical = true`. Separate from `iso_enabled` because the
+    /// optical scan touches firmware handles directly (a heavier probe than the
+    /// file-scan), so each is enabled independently.
+    pub iso_optical_enabled: bool,
+    /// Bootloader-side NVRAM self-install of the persistent `LamBoot` `Boot####`
+    /// entry. Default **true** — LamBoot ensures its own labeled boot entry
+    /// exists from the UEFI environment (idempotent; never duplicates), the
+    /// OS-independent pathway that also sidesteps RHEL/SELinux blocking the
+    /// OS-side `efibootmgr` write. Set `[boot-entry] self_install = false` to opt
+    /// out (operators who manage firmware boot order externally).
+    pub self_install_boot_entry: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +221,9 @@ impl Default for Policy {
             drivers_legacy: DriversLegacyMode::Auto,
             loader_native_pe: LoaderNativePeMode::Auto,
             diagnostics_verbose: false,
+            iso_enabled: false,
+            iso_optical_enabled: false,
+            self_install_boot_entry: true,
         }
     }
 }
@@ -433,6 +454,17 @@ fn apply_config_value(policy: &mut Policy, qualified_key: &str, raw_value: &str)
         // [diagnostics] section — v0.11.0
         "diagnostics.verbose" => {
             policy.diagnostics_verbose = value == "true";
+        }
+        "boot-from-iso.enabled" => {
+            policy.iso_enabled = value == "true";
+        }
+        "boot-from-iso.optical" => {
+            policy.iso_optical_enabled = value == "true";
+        }
+        // [boot-entry] section — (b) NVRAM self-install. Opt-out: only the
+        // literal `false` disables it, so a malformed value fails safe to on.
+        "boot-entry.self_install" => {
+            policy.self_install_boot_entry = value != "false";
         }
         _ => {
             log::debug!("Unknown config key: {qualified_key}");

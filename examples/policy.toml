@@ -139,3 +139,23 @@ native_pe = "auto"
 #                         natively covered. Asserts LamBoot will never
 #                         LoadImage a third-party UEFI binary at boot.
 legacy_uefi_drivers = "auto"
+
+[boot-entry]
+# Bootloader-side NVRAM self-install of the persistent "LamBoot" boot entry.
+#
+# LamBoot runs in the UEFI environment with unmediated Runtime-Services access,
+# so it can create its own labeled Boot#### entry + front of BootOrder directly
+# — no efibootmgr, no OS, and on SELinux-enforcing distros (RHEL/Rocky/Alma) no
+# confined-service block in the way. Boot#### / BootOrder are non-authenticated
+# variables, so no Secure Boot keys are involved.
+#
+# It is idempotent: if a "LamBoot"-described entry already exists it writes
+# nothing, so it coexists with the OS-side efibootmgr pathway (which keys on the
+# same exact description) without ever duplicating or churning NVRAM.
+#
+# Values:
+#   true   (default) — ensure the named entry exists on every boot (writes
+#                      NVRAM only on first install).
+#   false            — never touch firmware boot variables. For operators who
+#                      manage boot order externally.
+self_install = true

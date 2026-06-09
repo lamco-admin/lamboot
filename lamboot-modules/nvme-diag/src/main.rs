@@ -6,7 +6,9 @@ use uefi::prelude::*;
 
 #[entry]
 fn efi_main() -> Status {
-    uefi::helpers::init().expect("Failed to initialize UEFI");
+    if uefi::helpers::init().is_err() {
+        return Status::ABORTED;
+    }
 
     info!("NVMe Diagnostic Tool v0.1.0");
     info!("==========================");

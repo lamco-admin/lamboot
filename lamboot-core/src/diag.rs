@@ -66,11 +66,6 @@ pub(crate) fn set_coalesce(v: bool) {
 }
 
 #[inline]
-pub(crate) fn is_enabled() -> bool {
-    DIAG_ENABLED.load(Ordering::Relaxed)
-}
-
-#[inline]
 pub(crate) fn append(esp: &mut Volume, msg: &str) {
     if !DIAG_ENABLED.load(Ordering::Relaxed) {
         return;

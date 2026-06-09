@@ -5,6 +5,11 @@
 //! backend implementor: error codes for missing files, directory-vs-file
 //! distinctions, read-at offset handling, read-dir child filtering.
 
+// Test-support infrastructure: these items are exercised by the integration
+// tests in `tests/`, a separate compilation unit, so the lib build sees them
+// as dead. Removing them would delete live test scaffolding.
+#![allow(dead_code)]
+
 use alloc::{
     collections::BTreeMap,
     string::{String, ToString},
@@ -16,7 +21,7 @@ use crate::fs_types::{BackendTag, DirEntry, FileKind, Metadata, Path, PathBuf};
 /// Errors a host-side backend can produce. Mirrors the real `FsError`
 /// variants that don't require a `uefi::Error` payload.
 #[derive(Debug, Eq, PartialEq)]
-pub enum MockError {
+pub(crate) enum MockError {
     NotFound,
     IsDirectory,
     NotDirectory,
@@ -36,7 +41,7 @@ enum Node {
 /// - `read` returns full file bytes, `read_at` returns a byte range.
 /// - `exists` never errors for "absent"; only for I/O injection.
 /// - `read_dir` excludes `.` and `..`.
-pub struct MockBackend {
+pub(crate) struct MockBackend {
     tag: BackendTag,
     nodes: BTreeMap<String, Node>,
     call_counts: BTreeMap<&'static str, u32>,
@@ -44,7 +49,7 @@ pub struct MockBackend {
 }
 
 impl MockBackend {
-    pub fn new(tag: BackendTag) -> Self {
+    pub(crate) fn new(tag: BackendTag) -> Self {
         let mut nodes = BTreeMap::new();
         nodes.insert(String::from("/"), Node::Directory);
         Self {
@@ -55,7 +60,7 @@ impl MockBackend {
         }
     }
 
-    pub fn add_file(&mut self, path: &str, data: &[u8]) {
+    pub(crate) fn add_file(&mut self, path: &str, data: &[u8]) {
         let canonical = PathBuf::from_str(path)
             .expect("test paths must be valid canonical paths")
             .as_str()
@@ -80,7 +85,7 @@ impl MockBackend {
         self.nodes.insert(canonical, Node::File(data.to_vec()));
     }
 
-    pub fn add_dir(&mut self, path: &str) {
+    pub(crate) fn add_dir(&mut self, path: &str) {
         let canonical = PathBuf::from_str(path)
             .expect("test paths must be valid canonical paths")
             .as_str()
@@ -88,11 +93,11 @@ impl MockBackend {
         self.nodes.insert(canonical, Node::Directory);
     }
 
-    pub fn inject_read_failure(&mut self, fail: bool) {
+    pub(crate) fn inject_read_failure(&mut self, fail: bool) {
         self.fail_reads = fail;
     }
 
-    pub fn call_count(&self, method: &'static str) -> u32 {
+    pub(crate) fn call_count(&self, method: &'static str) -> u32 {
         self.call_counts.get(method).copied().unwrap_or(0)
     }
 
@@ -100,11 +105,11 @@ impl MockBackend {
         *self.call_counts.entry(method).or_insert(0) += 1;
     }
 
-    pub fn tag(&self) -> BackendTag {
+    pub(crate) fn tag(&self) -> BackendTag {
         self.tag
     }
 
-    pub fn read(&mut self, path: &Path) -> Result<Vec<u8>, MockError> {
+    pub(crate) fn read(&mut self, path: &Path) -> Result<Vec<u8>, MockError> {
         self.bump("read");
         if self.fail_reads {
             return Err(MockError::InjectedFailure("read disabled"));
@@ -116,7 +121,12 @@ impl MockBackend {
         }
     }
 
-    pub fn read_at(&mut self, path: &Path, offset: u64, len: usize) -> Result<Vec<u8>, MockError> {
+    pub(crate) fn read_at(
+        &mut self,
+        path: &Path,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, MockError> {
         self.bump("read_at");
         if self.fail_reads {
             return Err(MockError::InjectedFailure("read_at disabled"));
@@ -134,7 +144,7 @@ impl MockBackend {
         Ok(bytes[off..end].to_vec())
     }
 
-    pub fn exists(&mut self, path: &Path) -> Result<bool, MockError> {
+    pub(crate) fn exists(&mut self, path: &Path) -> Result<bool, MockError> {
         self.bump("exists");
         if self.fail_reads {
             return Err(MockError::InjectedFailure("exists disabled"));
@@ -142,7 +152,7 @@ impl MockBackend {
         Ok(self.nodes.contains_key(path.as_str()))
     }
 
-    pub fn metadata(&mut self, path: &Path) -> Result<Metadata, MockError> {
+    pub(crate) fn metadata(&mut self, path: &Path) -> Result<Metadata, MockError> {
         self.bump("metadata");
         let node = self
             .nodes
@@ -167,7 +177,7 @@ impl MockBackend {
         })
     }
 
-    pub fn read_dir(&mut self, path: &Path) -> Result<Vec<DirEntry>, MockError> {
+    pub(crate) fn read_dir(&mut self, path: &Path) -> Result<Vec<DirEntry>, MockError> {
         self.bump("read_dir");
         match self.nodes.get(path.as_str()) {
             Some(Node::Directory) => {}

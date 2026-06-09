@@ -1084,6 +1084,7 @@ fn entry_type_label(kind: &EntryKind, icon: Icon) -> &'static str {
         (EntryKind::Chainload { .. }, Icon::Windows) => "Windows Boot Manager",
         (EntryKind::Chainload { .. }, Icon::Tools) => "Diagnostic module",
         (EntryKind::Chainload { .. }, _) => "EFI bootloader",
+        (EntryKind::Iso { .. }, _) => "Bootable ISO image",
     }
 }
 

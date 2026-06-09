@@ -1,7 +1,7 @@
 # LamBoot Troubleshooting Guide
 
-**Version:** 0.12.0
-**Updated:** 2026-04-21
+**Version:** 0.16.5
+**Updated:** 2026-06-08
 
 ---
 
@@ -59,11 +59,11 @@ sudo lamboot-diagnose
    ```
    Fix: Run `lamboot-install` to generate BLS entries, or ensure your distro writes them to the ESP.
 
-2. **Filesystem driver missing**: If `/boot` is on ext4 or btrfs and separate from the ESP, LamBoot needs a filesystem driver.
+2. **`/boot` on an unreadable filesystem**: As of v0.16.0 LamBoot reads ext4, btrfs, XFS, exFAT, ZFS (single-disk/mirror/RAIDZ1 boot pools), and FAT natively in-binary, read-only — no firmware driver required — so a separate ext4/btrfs/xfs `/boot` is mounted directly. The bundled EfiFs `*.efi` drivers ship only as an inert fallback (the xfs/zfs ones are skipped at boot because the native readers cover those filesystems). If `/boot` is on an unsupported layout (e.g. an encrypted ZFS pool, RAIDZ2/3, or a multi-vdev pool), LamBoot rejects it cleanly rather than guessing.
    ```bash
    ls /boot/efi/EFI/LamBoot/drivers/
    ```
-   Fix: `lamboot-install --with-drivers` to install filesystem drivers.
+   Fix: confirm `/boot`'s filesystem is one of the supported readers; check `boot.log` for the mount path the native backend took.
 
 3. **Policy filtering**: The `allowlist` or `denylist` in `policy.toml` may be hiding entries. Check the policy file.
 
@@ -131,6 +131,60 @@ default_entry = "bls-fedora-6.19.9"
 ```
 
 Without `default_entry`, LamBoot selects the first boot entry by sort order (highest version, per UAPI.10 sorting).
+
+### Named UEFI boot entry vanishes after reboot (Proxmox / OVMF, ESP on a separate disk)
+
+**Symptoms**: LamBoot boots once, but after a reboot the firmware loses the `LamBoot` `Boot####` entry and boots GRUB/systemd-boot or the firmware fallback instead. Common on Proxmox/QEMU OVMF when the ESP lives on a disk that is not in the VM's boot index.
+
+**What happened**: OVMF prunes a named NVRAM `Boot####` entry that points at a disk outside the VM's `boot:` order on the next reboot. As of v0.16.1 the installer warns about this (`esp_on_separate_disk` trust event) when it detects the ESP and the OS root on different disks.
+
+**Fixes**:
+
+1. **Make the ESP disk boot-indexed on the host** (the actionable fix):
+   ```bash
+   # On the Proxmox host — add the ESP's disk to the VM boot order:
+   qm set VMID --boot order=scsi0   # use the disk that carries the ESP
+   ```
+2. **Or install via the removable-media fallback** so the firmware loads LamBoot from `\EFI\BOOT\BOOTX64.EFI` regardless of named entries:
+   ```bash
+   sudo lamboot-install --update --fallback
+   ```
+3. **Bootloader-side self-install** (v0.16.3) recreates the `LamBoot` `Boot####` entry from the UEFI environment on each boot, but it cannot override a firmware that prunes the entry on a non-boot-indexed disk — the host-side `qm set --boot` / `--fallback` fix above is still required there.
+
+### BIOS-installed RHEL/Rocky/Alma (MBR /boot) shows no entries
+
+**Symptoms**: A BIOS-installed RHEL-family system converted to UEFI shows "No bootable entries found" even though `/boot` exists.
+
+**What happened**: Before v0.16.3, partition discovery consumed only GPT entries, so a legacy-MBR (`msdos`) disk with XFS `/boot` as a primary partition yielded zero discovered partitions.
+
+**Fix**: Update to v0.16.3 or later. `scan_discoverable_partitions` is now a three-source enumerator — GPT, MBR (via `PartitionInfo.mbr_partition_record()`), and BlockIO-only logical partitions, de-duplicated by handle — so MBR `/boot` is discovered and mounted by the native readers unchanged. Check `boot.log` for the discovered partition count.
+
+### Newly installed kernel shows `X` (error) on XFS `/boot`
+
+**Symptoms**: After a kernel upgrade on a RHEL-family system with an XFS `/boot` (surfaced by a RHEL 9.7 -> 9.8 upgrade), the new kernel's entry shows a red `X` and won't boot, while the old kernel still boots.
+
+**What happened**: This was a host-side tooling bug in `lamboot-kernel-hook` (the bootloader binary was unaffected). Its placement set omitted `xfs`, so the upgrade wrote the new BLS entry to the ESP instead of in place on the XFS `/boot`, and the `linux` field referenced kernel-install's staging path rather than the bootable `/boot` kernel copy.
+
+**Fix**: Update lamboot-tools to v0.16.4 or later, then reinstall the affected kernel (e.g. `dnf reinstall kernel-core-<version>`) so the hook rewrites the entry in place. Placement parity between the hook and `lamboot-install` is now build-enforced by `tools/check-fs-coverage-parity.py`.
+
+### Boot-from-ISO: no ISO entries appear
+
+**Symptoms**: You enabled boot-from-ISO but no ISO entries show in the menu.
+
+Boot-from-ISO is **opt-in and off by default**. Both gates live in `policy.toml`:
+
+```toml
+[boot-from-iso]
+enabled = true   # boot a distro .iso from a mounted volume (default false)
+optical = true   # boot from a physical CD/DVD/BD (default false)
+```
+
+**Causes**:
+
+1. **Gate not enabled**: With `enabled = false` (the default), file-hosted ISOs are never scanned. Set `enabled = true`. For a physical disc, also set `optical = true`.
+2. **ISO not in a scanned directory**: File-hosted ISO discovery scans `/isos` and `/boot/isos` for `*.iso` on each mounted volume (ext4/btrfs/xfs/FAT, including the ESP). Move or symlink the image there.
+3. **Distro not yet live-validated**: Only Arch 2026.05 and Fedora 44 are live-ISO-booted end to end in this release. The other families (ubuntu-casper, debian-live, opensuse, alpine, and derivatives) are recipe/table-validated but not yet live-booted, so treat them as experimental.
+4. **Kernel won't load**: A distribution kernel is a Linux EFI-stub PE. Since v0.16.1 LamBoot's native loader reads the EFI-stub PE layout directly (the hand-rolled no_std PE/COFF reader accepts the DOS-stub-less image that the old goblin-based loader rejected); if the native load fails, the ISO path falls back to firmware `LoadImage`. If that fails too, check `boot.log` for the load error.
 
 ---
 
@@ -219,7 +273,7 @@ If LamBoot is first in the boot order and you need to skip it:
 | `Crash counter: N` | Health | Boot health assessment |
 | `System: ...` | SMBIOS | Hardware identification |
 | `Hypervisor: ...` | Detection | CPUID-based hypervisor detection |
-| `Loaded N filesystem driver(s)` | Drivers | ext4/btrfs driver loading |
+| `Loaded N filesystem driver(s)` | Drivers | Fallback EfiFs drivers; xfs/zfs skipped (native readers cover them) |
 | `Discovering boot entries...` | Discovery | BLS and ESP scanning |
 | `Found N boot entries` | Discovery | Entry count summary |
 | `Boot init: N ms` | Telemetry | Total init time |

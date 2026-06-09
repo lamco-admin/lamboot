@@ -7,9 +7,12 @@ extern crate alloc;
 
 mod acpi;
 mod autodiscovery;
+mod block_source;
 mod bls;
 mod bls_parse;
 mod boot;
+mod boot_entry;
+mod boot_entry_pure;
 mod boot_route_pure;
 mod boot_types;
 mod bootlog;
@@ -17,18 +20,24 @@ mod console;
 mod diag;
 mod discovery;
 mod discovery_pure;
+mod distro_iso;
 mod drivers;
 mod firmware_quirks;
 mod fs;
 mod fs_backend;
 mod fs_backend_btrfs;
+mod fs_backend_exfat;
 mod fs_backend_ext4;
 mod fs_backend_fat;
 mod fs_backend_fat_ro;
+mod fs_backend_lamfold;
 mod fs_backend_lvm;
 mod fs_backend_lvm_btrfs;
 mod fs_backend_lvm_dispatch;
 mod fs_backend_lvm_fat;
+mod fs_backend_xfs;
+mod fs_backend_zfs;
+mod fs_shared;
 mod fs_types;
 mod fs_writer;
 mod fw_cfg;
@@ -38,6 +47,8 @@ mod health;
 mod hypervisor;
 mod initrd;
 mod input;
+mod loopback_cfg;
+mod partition_classify_pure;
 mod partitions;
 mod pe_loader;
 mod pe_loader_pure;
@@ -77,7 +88,9 @@ pub(crate) const BUILD_TARGET: &str = "aarch64";
 
 #[entry]
 fn efi_main() -> Status {
-    uefi::helpers::init().expect("Failed to initialize UEFI helpers");
+    if uefi::helpers::init().is_err() {
+        return Status::ABORTED;
+    }
 
     let image = uefi::boot::image_handle();
 
@@ -377,6 +390,7 @@ fn run_bootloader(image: Handle) -> Result<Status> {
                         partitions::FsType::Xfs => "xfs",
                         partitions::FsType::F2fs => "f2fs",
                         partitions::FsType::Zfs => "zfs",
+                        partitions::FsType::ExFat => "exfat",
                         partitions::FsType::Unknown => "unknown",
                     },
                     fs_info.uuid.as_deref().unwrap_or("none"),
@@ -543,6 +557,268 @@ fn run_bootloader(image: Handle) -> Result<Status> {
             Err(e) => {
                 log::warn!(
                     "Skipping btrfs partition {:?}: {} ({})",
+                    part.partition_type,
+                    e,
+                    e.as_log_token(),
+                );
+            }
+        }
+    }
+
+    // Path B: Mount XFS partitions natively via lamxfs. Same architectural slot
+    // as the ext4/btrfs loops above; closes the #1 RHEL-family de-bundling gap
+    // (XFS is the default /boot + / on RHEL/Rocky/Alma/Oracle/Amazon), replacing
+    // the GPLv3 EfiFs `xfs_x64.efi` driver path that is untrusted for Microsoft
+    // shim-review. lamxfs holds the partition's BlockIO exclusive for the
+    // backend's lifetime, so the Step-4 media loop below skips it (no
+    // double-mount), exactly as the ext4/btrfs loops do.
+    for part in &discovered_partitions {
+        let Some(fs_info) = partitions::probe_superblock(part.handle) else {
+            continue;
+        };
+        if fs_info.fs_type != partitions::FsType::Xfs {
+            continue;
+        }
+        match fs_backend_xfs::XfsBackend::new(part.handle) {
+            Ok(backend) => {
+                use fs_backend::FsBackend as _;
+                let label = backend.label().map(alloc::string::String::from);
+                let fs_uuid = backend.uuid();
+                let identity = fs::VolumeIdentity {
+                    partition_guid: Some(part.unique_guid),
+                    fs_uuid,
+                    label,
+                    index: (extra_volumes.len() as u32) + 1,
+                    backend_tag: fs_backend_xfs::XFS_BACKEND_TAG,
+                };
+                let volume = fs::Volume::from_backend(identity, alloc::boxed::Box::new(backend));
+                info!(
+                    "Mounted native XFS volume: {}",
+                    volume.identity().describe()
+                );
+                trust_log.record(
+                    trust_log::TrustEvent::new("volume_mounted").with_note(&format!(
+                        "backend={} fs_uuid={} partition_guid={} index={}",
+                        volume.identity().backend_tag,
+                        volume
+                            .identity()
+                            .fs_uuid
+                            .as_ref()
+                            .map_or("none".into(), |u| format!("{u}")),
+                        volume
+                            .identity()
+                            .partition_guid
+                            .map_or("none".into(), |g| format!("{g}")),
+                        volume.identity().index,
+                    )),
+                );
+                extra_volumes.push(volume);
+            }
+            Err(e) => {
+                log::warn!(
+                    "Skipping XFS partition {:?}: {} ({})",
+                    part.partition_type,
+                    e,
+                    e.as_log_token(),
+                );
+            }
+        }
+    }
+
+    // Mount exFAT partitions natively via lamexfat. exFAT is removable/utility
+    // media (USB stick, SD card) carrying a kernel + initrd or a boot image —
+    // never the ESP and never a Linux root, so it does not overlap the loops
+    // above. Same exclusive-BlockIO discipline: the Step-4 media loop skips it.
+    for part in &discovered_partitions {
+        let Some(fs_info) = partitions::probe_superblock(part.handle) else {
+            continue;
+        };
+        if fs_info.fs_type != partitions::FsType::ExFat {
+            continue;
+        }
+        match fs_backend_exfat::ExFatBackend::new(part.handle) {
+            Ok(backend) => {
+                use fs_backend::FsBackend as _;
+                let label = backend.label().map(alloc::string::String::from);
+                let fs_uuid = backend.uuid();
+                let identity = fs::VolumeIdentity {
+                    partition_guid: Some(part.unique_guid),
+                    fs_uuid,
+                    label,
+                    index: (extra_volumes.len() as u32) + 1,
+                    backend_tag: fs_backend_exfat::EXFAT_BACKEND_TAG,
+                };
+                let volume = fs::Volume::from_backend(identity, alloc::boxed::Box::new(backend));
+                info!(
+                    "Mounted native exFAT volume: {}",
+                    volume.identity().describe()
+                );
+                trust_log.record(
+                    trust_log::TrustEvent::new("volume_mounted").with_note(&format!(
+                        "backend={} fs_uuid={} partition_guid={} index={}",
+                        volume.identity().backend_tag,
+                        volume
+                            .identity()
+                            .fs_uuid
+                            .as_ref()
+                            .map_or("none".into(), |u| format!("{u}")),
+                        volume
+                            .identity()
+                            .partition_guid
+                            .map_or("none".into(), |g| format!("{g}")),
+                        volume.identity().index,
+                    )),
+                );
+                extra_volumes.push(volume);
+            }
+            Err(e) => {
+                log::warn!(
+                    "Skipping exFAT partition {:?}: {} ({})",
+                    part.partition_type,
+                    e,
+                    e.as_log_token(),
+                );
+            }
+        }
+    }
+
+    // Mount ZFS boot pools natively via lamzfs. A pool spans one or more
+    // whole-partition members (mirror / raidz), so the ZFS-labeled partitions are
+    // grouped by pool GUID, each pool is imported once, and every dataset it
+    // holds (each a separate ZPL filesystem) becomes its own Volume. Same
+    // exclusive-BlockIO discipline as the loops above: a member's BlockIO is held
+    // for the pool's lifetime, so the Step-4 media loop skips it. ZFS members are
+    // never the ESP and never read by the ext4/btrfs/xfs backends, so there is no
+    // overlap.
+    {
+        type ZfsMember =
+            lamzfs::PoolMember<block_source::SourceReader<block_source::BlockIoSource>>;
+        // pool GUID -> (members held open, a representative partition GUID).
+        let mut by_pool: alloc::collections::BTreeMap<
+            u64,
+            (alloc::vec::Vec<ZfsMember>, uefi::Guid),
+        > = alloc::collections::BTreeMap::new();
+        for part in &discovered_partitions {
+            let Some(fs_info) = partitions::probe_superblock(part.handle) else {
+                continue;
+            };
+            if fs_info.fs_type != partitions::FsType::Zfs {
+                continue;
+            }
+            let Ok(source) = block_source::BlockIoSource::open(part.handle) else {
+                continue; // unreadable or already held
+            };
+            let reader = block_source::SourceReader::new(source);
+            let device_size_bytes = reader.byte_len();
+            let mut member = lamzfs::PoolMember {
+                reader,
+                device_size_bytes,
+            };
+            match lamzfs::peek_pool_id(&mut member) {
+                Ok(id) => {
+                    by_pool
+                        .entry(id.guid)
+                        .or_insert_with(|| (alloc::vec::Vec::new(), part.unique_guid))
+                        .0
+                        .push(member);
+                }
+                Err(e) => log::warn!(
+                    "Skipping ZFS partition {:?}: peek failed ({})",
+                    part.partition_type,
+                    e.token(),
+                ),
+            }
+        }
+        for (pool_guid, (members, rep_guid)) in by_pool {
+            let member_count = members.len();
+            match fs_backend_zfs::ZfsBackend::mount_pool(members) {
+                Ok(backends) => {
+                    for backend in backends {
+                        use fs_backend::FsBackend as _;
+                        let label = backend.label().map(alloc::string::String::from);
+                        let identity = fs::VolumeIdentity {
+                            partition_guid: Some(rep_guid),
+                            fs_uuid: None,
+                            label,
+                            index: (extra_volumes.len() as u32) + 1,
+                            backend_tag: fs_backend_zfs::ZFS_BACKEND_TAG,
+                        };
+                        let volume =
+                            fs::Volume::from_backend(identity, alloc::boxed::Box::new(backend));
+                        info!(
+                            "Mounted native ZFS volume: {}",
+                            volume.identity().describe()
+                        );
+                        trust_log.record(trust_log::TrustEvent::new("volume_mounted").with_note(
+                            &format!(
+                                "backend={} pool_guid={pool_guid:#018x} members={member_count} index={}",
+                                volume.identity().backend_tag,
+                                volume.identity().index,
+                            ),
+                        ));
+                        extra_volumes.push(volume);
+                    }
+                }
+                Err(e) => log::warn!(
+                    "Skipping ZFS pool {pool_guid:#018x} ({member_count} member(s)): {e} ({})",
+                    e.as_log_token(),
+                ),
+            }
+        }
+    }
+
+    // Step 4 (SPEC-LAMFOLD-INTEGRATION §5): standalone media filesystems
+    // (erofs / squashfs / iso / cramfs / romfs / udf) as read-only roots or
+    // /boot, via the lamfold stack. Runs after the ext4/btrfs loops, which hold
+    // their partitions' BlockIO *exclusive* — so `BlockIoSource::open` here fails
+    // on those handles and the partition is skipped. `dispatch_media` mounts ONLY
+    // the media variants (ext4/btrfs/FAT → `Unsupported`), so there is never a
+    // duplicate Volume. The ESP is already excluded by
+    // `scan_discoverable_partitions`, so exclusive-opening these handles is safe
+    // (the same thing the ext4 loop's `probe_superblock` does).
+    for part in &discovered_partitions {
+        let Ok(source) = block_source::BlockIoSource::open(part.handle) else {
+            continue; // held by an ext4/btrfs/FatRo mount above, or unreadable
+        };
+        match fs_backend_lvm_dispatch::dispatch_media_fs_over_source(source) {
+            Ok(backend) => {
+                // `backend` is `Box<dyn FsBackend>`, so its trait methods resolve
+                // through the trait object — no `use FsBackend` needed here.
+                let identity = fs::VolumeIdentity {
+                    partition_guid: Some(part.unique_guid),
+                    fs_uuid: backend.uuid(),
+                    label: backend.label().map(alloc::string::String::from),
+                    index: (extra_volumes.len() as u32) + 1,
+                    backend_tag: backend.tag(),
+                };
+                let volume = fs::Volume::from_backend(identity, backend);
+                info!(
+                    "Mounted native media volume: {}",
+                    volume.identity().describe()
+                );
+                trust_log.record(
+                    trust_log::TrustEvent::new("volume_mounted").with_note(&format!(
+                        "backend={} fs_uuid={} partition_guid={} index={} role=media",
+                        volume.identity().backend_tag,
+                        volume
+                            .identity()
+                            .fs_uuid
+                            .as_ref()
+                            .map_or("none".into(), |u| format!("{u}")),
+                        volume
+                            .identity()
+                            .partition_guid
+                            .map_or("none".into(), |g| format!("{g}")),
+                        volume.identity().index,
+                    )),
+                );
+                extra_volumes.push(volume);
+            }
+            Err(e) => {
+                // Not a media filesystem (ext4/btrfs/FAT/unknown) — expected for
+                // most partitions, so debug-level to keep the boot log clean.
+                log::debug!(
+                    "partition {:?} is not a lamfold media filesystem: {} ({})",
                     part.partition_type,
                     e,
                     e.as_log_token(),
@@ -758,6 +1034,47 @@ fn run_bootloader(image: Handle) -> Result<Status> {
         )),
     );
     telemetry.record("discovery", t);
+
+    // (b) Ensure the persistent named "LamBoot" NVRAM entry exists — the
+    // OS-independent boot-entry pathway (no efibootmgr, no SELinux in the way).
+    // Idempotent: a no-op when the entry already exists, so it runs every boot
+    // but writes NVRAM only on first install. Only attempted when the canonical
+    // install binary is actually present on this ESP, so we never point an entry
+    // at a missing file (e.g. a pure removable-media boot with no \EFI\LamBoot).
+    #[cfg(target_arch = "x86_64")]
+    const LAMBOOT_INSTALL_PATH: &str = "\\EFI\\LamBoot\\lambootx64.efi";
+    #[cfg(target_arch = "aarch64")]
+    const LAMBOOT_INSTALL_PATH: &str = "\\EFI\\LamBoot\\lambootaa64.efi";
+    if policy.self_install_boot_entry && esp.exists_str(LAMBOOT_INSTALL_PATH) {
+        match boot_entry::ensure_named_boot_entry(LAMBOOT_INSTALL_PATH, "LamBoot") {
+            boot_entry::SelfInstall::Created(num) => {
+                info!("Self-installed UEFI boot entry Boot{num:04X} 'LamBoot'");
+                trust_log.record(
+                    trust_log::TrustEvent::new("boot_entry_self_installed").with_note(&format!(
+                        "num={num:04X} path={LAMBOOT_INSTALL_PATH} status=created"
+                    )),
+                );
+            }
+            boot_entry::SelfInstall::AlreadyPresent(num) => {
+                trust_log.record(
+                    trust_log::TrustEvent::new("boot_entry_self_installed")
+                        .with_note(&format!("num={num:04X} status=already_present")),
+                );
+            }
+            boot_entry::SelfInstall::NoDevicePath => {
+                trust_log.record(
+                    trust_log::TrustEvent::new("boot_entry_self_install_skipped")
+                        .with_note("reason=no_loaded_image_device_path"),
+                );
+            }
+            boot_entry::SelfInstall::Failed => {
+                trust_log.record(
+                    trust_log::TrustEvent::new("boot_entry_self_install_failed")
+                        .with_note("reason=nvram_or_devicepath_error"),
+                );
+            }
+        }
+    }
 
     let bootable_count = entries
         .iter()

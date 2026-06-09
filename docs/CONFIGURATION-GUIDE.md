@@ -1,7 +1,7 @@
 # LamBoot Configuration Guide
 
-**Version:** 0.12.0
-**Updated:** 2026-05-30
+**Version:** 0.16.5
+**Updated:** 2026-06-08
 
 ---
 
@@ -146,13 +146,13 @@ See `docs/specs/SPEC-NATIVE-PE-LOADER.md` for the full spec.
 
 | Value | Behavior |
 |-------|----------|
-| `"auto"` (default) | Load drivers only for filesystems LamBoot does **not** natively support. Skips `ext4_*.efi`, `ext2_*.efi`, `ext3_*.efi` because SDS-2's `Ext4Backend` covers them natively. Drivers for `btrfs`, `xfs`, `ntfs`, `zfs`, `f2fs`, `iso9660` still load if their `.efi` binary is present. |
+| `"auto"` (default) | Load drivers only for filesystems LamBoot does **not** natively support. Skips `ext4_*.efi`, `ext2_*.efi`, `ext3_*.efi`, `btrfs_*.efi`, `xfs_*.efi`, and `zfs_*.efi` because the native in-binary readers (ext4/btrfs via SDS-2, plus XFS via `lamxfs` and ZFS via `lamzfs` in v0.16.0) cover those filesystems read-only. The bundled `xfs_x64.efi` / `zfs_x64.efi` still ship as inert fallback but are not loaded at boot (loading them would shadow the native backend). Drivers for filesystems without a native skip entry (`ntfs`, `f2fs`, `iso9660`) still load if their `.efi` binary is present. |
 | `"always"` | Load every driver in `\EFI\LamBoot\drivers\`, regardless of native coverage. v0.8.3 behavior. Useful for A/B debugging; preserves the shim-15.8 interaction pattern. Loading a natively-covered driver emits a `legacy_driver_redundant` trust event. |
 | `"never"` | Load no legacy drivers. Skip all, regardless of coverage. Security-conscious posture for systems whose filesystems are all natively covered — asserts LamBoot will never `LoadImage` a third-party UEFI binary at boot. If a required filesystem has no native backend, the boot enumerating that volume will fail. |
 
 #### Why this exists
 
-LamBoot v0.8.x loaded every driver in the drivers directory at every boot, via `LoadImage`+`StartImage` under `SecurityOverride`. Each such load triggers shim 15.8 to uninstall `ShimLock`, preventing LamBoot from verifying kernels afterward. With the native ext4 reader (SDS-2) in v0.9.x, the ext4 driver is no longer needed for the 95%-of-users case — Auto mode removes it from the load path entirely, closing the shim-uninstall window for ext4-on-/boot systems.
+LamBoot v0.8.x loaded every driver in the drivers directory at every boot, via `LoadImage`+`StartImage` under `SecurityOverride`. Each such load triggers shim 15.8 to uninstall `ShimLock`, preventing LamBoot from verifying kernels afterward. With the native ext4 reader (SDS-2) in v0.9.x, the ext4 driver is no longer needed for the 95%-of-users case — Auto mode removes it from the load path entirely, closing the shim-uninstall window for ext4-on-/boot systems. As of v0.16.0 the same applies to XFS and ZFS: the native `lamxfs` and `lamzfs` readers cover those filesystems read-only, so Auto mode skips the bundled GPL EfiFs `xfs_x64.efi` and `zfs_x64.efi` drivers entirely (they still ship as inert fallback). The native XFS, exFAT, and ZFS readers are read-only by construction; ZFS coverage is single-disk, mirror, and single-parity RAIDZ1 only.
 
 See `docs/specs/SPEC-UEFI-FSDRV-DEPRECATION.md` for the full deprecation schedule.
 
@@ -167,6 +167,42 @@ See `docs/specs/SPEC-UEFI-FSDRV-DEPRECATION.md` for the full deprecation schedul
 ```toml
 [diagnostics]
 verbose = true
+```
+
+---
+
+### `[boot-from-iso]` Section (v0.16.0+)
+
+Boot a Linux distribution directly from an `.iso` image — either a file on a mounted volume or a physical optical disc — instead of from an installed BLS/UKI entry. **Experimental and opt-in; both keys default to `false`, so a default-config boot is byte-for-byte unaffected.**
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | When `true`, LamBoot scans mounted volumes (ext4/btrfs/xfs/FAT, including the ESP) for `*.iso` boot candidates under `/isos` and `/boot/isos` and offers them in the menu. Default off — no ISO scan occurs. |
+| `optical` | boolean | `false` | When `true`, LamBoot also enumerates physical CD/DVD/BD drives (`BlockIO` handles carrying a `CD001` primary volume descriptor) and offers an inserted disc as a boot candidate. Independent of `enabled` because the optical scan probes firmware handles directly. Default off. |
+
+```toml
+[boot-from-iso]
+enabled = true
+optical = true
+```
+
+When booting an ISO, LamBoot first parses the distribution's own `/boot/grub/loopback.cfg` (Path A1) to reuse the distro's exact kernel, initrd, and `iso-scan`/`findiso`/`root=live:` command line. When no usable `loopback.cfg` exists (and always for an optical disc), it fingerprints the distro family and applies a built-in recipe table covering arch, ubuntu-casper, debian-live, fedora, opensuse, and alpine — each transitively covering its derivatives (Path A2). Distribution kernels are Linux EFI-stub PEs, so the ISO path falls back from LamBoot's native PE loader to firmware `LoadImage`.
+
+> **Validation status.** Only Arch 2026.05 and Fedora 44 are live-ISO-booted end to end. The other four families and their derivatives are recipe/table-validated and host-unit-tested, not yet live-booted. El Torito chainload (Path B) is not yet wired. Treat boot-from-ISO as experimental.
+
+---
+
+### `[boot-entry]` Section (v0.16.3+)
+
+Controls LamBoot's bootloader-side NVRAM self-install. When enabled, LamBoot ensures a labeled `LamBoot` `Boot####` entry pointing at `\EFI\LamBoot\lambootx64.efi` exists and front-loads `BootOrder`, creating it directly from the UEFI environment if absent. This is the OS-independent pathway for the persistent boot entry — no `efibootmgr`, no OS, and no SELinux-confined-service block in the way (`Boot####`/`BootOrder` are non-authenticated, so no Secure Boot keys are involved). It is idempotent: it keys on the exact `LamBoot` description, so it never duplicates or churns NVRAM and coexists with the OS-side `efibootmgr` pathway.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `self_install` | boolean | `true` | When `true` (the default), LamBoot self-installs/repairs its own `Boot####` NVRAM entry at boot. Set to `false` to opt out — for operators who manage firmware boot order externally. Only the literal `false` disables it; a malformed value fails safe to on. |
+
+```toml
+[boot-entry]
+self_install = false
 ```
 
 ---

@@ -9,6 +9,14 @@
 //!
 //! This module is `no_std`-clean. It depends only on `alloc::string::*`.
 
+// `unreachable_pub` and `dead_code` are allowed: this module is `#[path]`-included
+// into both lamboot-core (a UEFI binary with no public API, where these pub items are
+// unreachable) and lamboot-fs-tests (whose host tests reach them as an external
+// consumer, so they must stay `pub`, and `#[expect]` would go unfulfilled there).
+// `allow` is the only annotation that suits both consumers; matches pe_loader_pure.rs.
+#![allow(dead_code)]
+#![allow(unreachable_pub)]
+
 extern crate alloc;
 use alloc::string::{String, ToString};
 

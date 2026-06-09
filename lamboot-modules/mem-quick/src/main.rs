@@ -6,7 +6,9 @@ use uefi::{mem::memory_map::MemoryMap, prelude::*};
 
 #[entry]
 fn efi_main() -> Status {
-    uefi::helpers::init().expect("Failed to initialize UEFI");
+    if uefi::helpers::init().is_err() {
+        return Status::ABORTED;
+    }
 
     info!("Quick Memory Test v0.1.0");
     info!("========================");

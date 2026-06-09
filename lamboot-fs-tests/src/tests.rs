@@ -90,7 +90,7 @@ fn exists_returns_ok_true_for_present_file() {
     let mut be = MockBackend::new("mock");
     be.add_file("/here", b"");
     let pb = pb("/here");
-    assert_eq!(be.exists(pb.as_path()).unwrap(), true);
+    assert!(be.exists(pb.as_path()).unwrap());
 }
 
 #[test]
@@ -100,7 +100,7 @@ fn exists_returns_ok_false_for_absent_without_error() {
     // Must NOT be an error for "not found".
     let result = be.exists(pb.as_path());
     assert!(result.is_ok());
-    assert_eq!(result.unwrap(), false);
+    assert!(!result.unwrap());
 }
 
 #[test]

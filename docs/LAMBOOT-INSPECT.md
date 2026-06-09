@@ -16,18 +16,22 @@ EFI variables except to read them, and never uploads anything.
 tools/
 ├── lamboot-inspect              # entry-point script
 ├── lamboot_inspect/             # implementation package
-├── lamboot-inspect.1            # man page
 └── completions/
     ├── lamboot-inspect.bash     # bash completion
     └── _lamboot-inspect         # zsh completion
 ```
+
+The man page is not tracked in source — it is generated from the help registry
+(`tools/registry-to-man`) at release time, so it can't drift from the CLI. The
+release tarball ships it at `man/man1/lamboot-inspect.1`.
 
 Install system-wide:
 
 ```bash
 sudo install -m 0755 tools/lamboot-inspect /usr/local/bin/lamboot-inspect
 sudo cp -r tools/lamboot_inspect /usr/local/lib/
-sudo install -m 0644 tools/lamboot-inspect.1 /usr/local/share/man/man1/
+tools/registry-to-man tools/lamboot-inspect man/man1   # generate the man page
+sudo install -m 0644 man/man1/lamboot-inspect.1 /usr/local/share/man/man1/
 sudo install -m 0644 tools/completions/lamboot-inspect.bash \
     /etc/bash_completion.d/
 ```

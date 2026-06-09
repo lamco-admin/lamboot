@@ -1,7 +1,7 @@
 # LamBoot Layer Architecture — Authoritative Model
 
-**Version:** 0.13.0
-**Date:** 2026-06-01
+**Version:** 0.16.5
+**Date:** 2026-06-06
 **Audience:** LamBoot developers, architecture reviewers, SDS authors
 **Status:** normative — every module declares its layer, and the contract is
 mechanically enforced by `tools/check-layers.py` (run in the pre-commit hook
@@ -40,7 +40,8 @@ layers, low to high:
 ### Layer 0 — Platform Introspection
 Pure-read discovery of the environment. No side effects, no trust decisions.
 `acpi`, `hypervisor`, `smbios`, `fw_cfg`, `fw_cfg_config`, `secure` (Secure
-Boot state query), `input` (raw key/pointer event source).
+Boot state query), `sb_classify_pure` (pure SecureBoot-read classification +
+retry), `input` (raw key/pointer event source).
 
 ### Layer 1 — Firmware Boundary
 Direct UEFI protocol access that carries no policy, parsing, or UI.
@@ -50,24 +51,43 @@ Direct UEFI protocol access that carries no policy, parsing, or UI.
 ### Layer 2 — Storage & Filesystems
 A filesystem-agnostic read API plus the write path. Consumers above this layer
 do not know whether they are reading FAT, ext4, Btrfs, or LVM.
-`fs_types`, `fs_backend` (the `FsBackend` trait), the backend family
-(`fs_backend_fat`, `_ext4`, `_btrfs`, `_lvm`, `_lvm_btrfs`, `_lvm_dispatch`),
-`fs` (the coordinator that dispatches to the right backend per volume),
-`fs_writer` (the ESP write path), and `initrd` (the LoadFile2 provider, which
-reads via `fs`).
+`fs_types`, `read_limit_pure` (the pure read-size cap), `block_source` (the
+`BlockSource`/`SourceReader` seam every backend reads through), `fs_backend`
+(the `FsBackend` trait), the backend family — `fs_backend_fat`, `_fat_ro` (native
+read-only FAT for non-ESP volumes), `_ext4`, `_btrfs`, `_xfs` (native read-only
+XFS via `lamxfs`), `_exfat` (native read-only exFAT via `lamexfat`), `_zfs`
+(native read-only ZFS boot pools via `lamzfs`), `_lamfold` (the native read-only
+media stack: EROFS, ISO 9660, SquashFS, cramfs, romfs, UDF), `_lvm`, `_lvm_btrfs`,
+`_lvm_fat`, `_lvm_dispatch` — `fs` (the coordinator that dispatches to the right
+backend per volume), `fs_shared` (shared backend ownership for the boot-from-ISO
+`FileBlockSource`), `fs_writer` (the ESP write path — the only writer, and it
+only ever targets the FAT backend), and `initrd` (the LoadFile2 provider, which
+reads via `fs`). Every non-FAT backend is read-only by construction: XFS, exFAT,
+ZFS, and the lamfold media filesystems have no write path. ZFS reads single-disk,
+mirror, and single-parity RAIDZ1 boot pools only.
 
 ### Layer 3 — Parsers & Shared Types
 Pure parsers (bytes in, structured data out) and the structured types they
 yield. No I/O, no firmware calls, no state.
 `bls_parse` (the pure BLS parser), `pe_loader_pure`, `discovery_pure`,
-`boot_types` (the shared `BootEntry`/`EntryKind`/`Icon` + preflight result
-types), `uki`, and the I/O shells `pe_loader` (over `pe_loader_pure`).
+`loopback_cfg` (the pure grub `loopback.cfg` `menuentry` extractor — boot-from-ISO
+Path A1), `distro_iso` (the pure distro-family fingerprint + kernel/initrd/cmdline
+recipe table — boot-from-ISO Path A2), `boot_types` (the shared
+`BootEntry`/`EntryKind`/`Icon` + preflight result types), `uki`, and the I/O
+shell `pe_loader` (over `pe_loader_pure`).
 
 ### Layer 4 — Policy & State
 Config-driven decisions and persistent state.
 `policy` (parse + apply `policy.toml`, including `select_default_entry`),
-`autodiscovery`, `preflight`, `health` (NVRAM state machine), `partitions`
-(GPT/XBOOTLDR discovery), `drivers` (policy-gated legacy FS-driver loader), and
+`boot_route_pure` (the pure native-PE-vs-firmware-`LoadImage` load-route
+decision), `autodiscovery`, `preflight`, `health` (NVRAM state machine),
+`partitions` (GPT, MBR, and BlockIO-only partition discovery feeding
+policy/state) with its pure classifier `partition_classify_pure` (the
+host-tested legacy-MBR `os_type` mountability predicate), `drivers` (policy-gated
+legacy FS-driver loader), `boot_entry` (boot-entry identity self-loop guard plus
+the bootloader-side NVRAM `Boot####` self-install) over its pure half
+`boot_entry_pure` (the host-tested `EFI_LOAD_OPTION`/`BootOrder` byte codecs),
+and
 `bls` (the BLS discovery coordinator — an I/O shell over the Layer-3 `bls_parse`
 that drives the boot counter and autodiscovery, which is why it sits here, not
 at Layer 3).
@@ -152,23 +172,25 @@ immediately if a dependency points the wrong way.
 
 ## 7. Current module counts and layer totals
 
-46 modules, ~16,000 lines of Rust (lamboot-core). By layer:
+62 modules, ~21,200 lines of Rust (lamboot-core). By layer:
 
 | Layer | Name | Modules |
 |---|---|---|
-| 0 | Platform Introspection | acpi, hypervisor, smbios, fw_cfg, fw_cfg_config, secure, input |
+| 0 | Platform Introspection | acpi, hypervisor, smbios, fw_cfg, fw_cfg_config, secure, sb_classify_pure, input |
 | 1 | Firmware Boundary | security_override, tpm, firmware_quirks |
-| 2 | Storage & Filesystems | fs_types, fs_backend, fs_backend_{fat,ext4,btrfs,lvm,lvm_btrfs,lvm_dispatch}, fs, fs_writer, initrd |
-| 3 | Parsers & Shared Types | bls_parse, pe_loader_pure, discovery_pure, boot_types, uki, pe_loader |
-| 4 | Policy & State | policy, autodiscovery, preflight, health, partitions, drivers, bls |
+| 2 | Storage & Filesystems | fs_types, read_limit_pure, block_source, fs_backend, fs_backend_{fat,fat_ro,ext4,btrfs,xfs,exfat,zfs,lamfold,lvm,lvm_btrfs,lvm_fat,lvm_dispatch}, fs, fs_shared, fs_writer, initrd |
+| 3 | Parsers & Shared Types | bls_parse, pe_loader_pure, discovery_pure, loopback_cfg, distro_iso, boot_types, uki, pe_loader |
+| 4 | Policy & State | policy, boot_route_pure, autodiscovery, preflight, health, partitions, partition_classify_pure, drivers, boot_entry, boot_entry_pure, bls |
 | 5 | Trust & Audit | trust_log, trust_log_pure, report, bootlog, telemetry, diag, version |
 | 6 | Presentation | gui, console |
 | 7 | Orchestration | boot, discovery, main |
 
 LamBoot is a medium-sized codebase by bootloader standards (GRUB ~40kLOC of C,
 systemd-boot ~10kLOC of C, rEFInd ~30kLOC of C++) — smaller than all of them,
-with native filesystem reading none of the small ones have. A deliberate
-property, not an accident.
+while reading more filesystems natively than any of them: ext4, btrfs, FAT, XFS,
+exFAT, and ZFS boot pools, plus a read-only media stack (EROFS, ISO 9660,
+SquashFS, cramfs, romfs, UDF), all in-binary with no firmware FS driver and no
+GPLv3 EfiFs `.efi`. A deliberate property, not an accident.
 
 ---
 

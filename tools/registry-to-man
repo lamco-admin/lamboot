@@ -1,0 +1,413 @@
+#!/bin/bash
+# registry-to-man — generate man(1) pages from each tool's help registry
+#
+# VENDORED from lamboot-tools (scripts/registry-to-man). lamboot-dev bundles
+# lamboot-inspect (the canonical Python source) in the lamboot package, so it
+# needs the man-page generator at release time too. Generating from the live
+# --dump-registry rather than tracking a hand-edited .1 is what keeps the page
+# from drifting (it had gone stale at 0.8.3). Keep byte-compatible OUTPUT with
+# the toolkit copy so both packages ship an identical inspect man page.
+#
+# Per SPEC-LAMBOOT-TOOLKIT-V1.md §10: three documentation surfaces
+# (inline help / man pages / website) render from one registry source.
+# This generator is the man-page surface.
+#
+# Usage: scripts/registry-to-man <tool-path> [<output-dir>]
+#
+# Strategy: source the tool with LAMBOOT_DISABLE_MAIN=1 so `main` doesn't
+# execute, then call _register_subcommands and use the registry dump to
+# produce groff output.
+#
+# Invariant: every tool's registry has the same field order. We parse the
+# 0x1F-separated records (LAMBOOT_HELP_FS) directly rather than calling
+# dispatch_help — groff output needs explicit formatting the humans don't.
+
+set -uo pipefail
+
+TOOL="${1:-}"
+OUTPUT_DIR="${2:-man}"
+
+[[ -n "$TOOL" ]] || { echo "usage: $0 <tool-path> [<output-dir>]" >&2; exit 1; }
+[[ -f "$TOOL" ]] || { echo "tool not found: $TOOL" >&2; exit 1; }
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TOOL_NAME="$(basename "$TOOL")"
+OUTPUT_FILE="${OUTPUT_DIR}/${TOOL_NAME}.1"
+
+mkdir -p "$OUTPUT_DIR"
+
+# ── Extract static tool metadata without executing main() ───────────────
+
+# Python tools can't be sourced as bash. They emit the identical intermediate
+# envelope (TOOL_NAME=…/---REGISTRY-BEGIN---/0x1F records/---REGISTRY-END---) via
+# their --dump-registry flag (lamboot_toolkit.registry.dump), so the parser below
+# is language-agnostic — only the extraction differs.
+TOOL_SHEBANG="$(head -1 "$TOOL")"
+
+if [[ "$TOOL_SHEBANG" == *python* ]]; then
+    dump=$("$TOOL" --dump-registry 2>/dev/null)
+else
+
+# Extract via source in a subshell where we neuter `main`
+# shellcheck disable=SC1090  # dynamic source path for registry extraction
+dump=$(
+    export LAMBOOT_LIB_DIR="$REPO_ROOT/lib"
+    # Override main() BEFORE sourcing the tool so the tool doesn't execute.
+    # The tool file sources the lib then defines its own main — we shadow
+    # with a no-op main AFTER sourcing, so when the tool's main "$@" runs
+    # with empty args, it goes through our shadow (but actually the tool
+    # calls `main "$@"` at the bottom — we need a different approach).
+    #
+    # Workaround: we sed-filter the tool on-the-fly to remove the final
+    # `main "$@"` invocation, then source that into a subshell.
+    sed -e 's/^main "\$@"$/# main "$@" stripped for registry dump/' \
+        -e 's/^main "$@"$/# main "$@" stripped for registry dump/' \
+        "$TOOL" > /tmp/registry-dump-tool.$$.sh
+
+    # shellcheck disable=SC1091
+    source /tmp/registry-dump-tool.$$.sh 2>/dev/null || {
+        rm -f /tmp/registry-dump-tool.$$.sh
+        exit 1
+    }
+    rm -f /tmp/registry-dump-tool.$$.sh
+
+    # Now _register_subcommands is defined; call it
+    _register_subcommands 2>/dev/null
+
+    # Emit tool metadata followed by registry dump
+    printf 'TOOL_NAME=%s\n' "$LAMBOOT_TOOL_NAME"
+    printf 'TOOL_VERSION=%s\n' "$LAMBOOT_TOOL_VERSION"
+    printf 'TOOLKIT_VERSION=%s\n' "$LAMBOOT_TOOLKIT_VERSION"
+    printf -- '---REGISTRY-BEGIN---\n'
+    # The dispatcher (lamboot-toolkit) sources only the lib, not the help
+    # module, so LAMBOOT_HELP_REGISTRY may be unset. Default to empty —
+    # downstream logic treats an empty registry as "no subcommands".
+    printf '%s\n' "${LAMBOOT_HELP_REGISTRY:-}"
+    printf -- '---REGISTRY-END---\n'
+)
+fi
+
+[[ -z "$dump" ]] && { echo "failed to extract registry from $TOOL" >&2; exit 1; }
+
+# ── Parse metadata ──────────────────────────────────────────────────────
+
+tool_name=$(printf '%s' "$dump" | grep '^TOOL_NAME=' | head -1 | cut -d= -f2-)
+tool_version=$(printf '%s' "$dump" | grep '^TOOL_VERSION=' | head -1 | cut -d= -f2-)
+toolkit_version=$(printf '%s' "$dump" | grep '^TOOLKIT_VERSION=' | head -1 | cut -d= -f2-)
+
+[[ -z "$tool_name" ]] && { echo "failed to read tool metadata" >&2; exit 1; }
+
+# Extract registry between markers
+registry=$(printf '%s' "$dump" | sed -n '/^---REGISTRY-BEGIN---$/,/^---REGISTRY-END---$/p' | sed '1d;$d')
+
+# ── groff escape ────────────────────────────────────────────────────────
+
+groff_escape() {
+    # Escape backslashes, hyphens (troff treats leading - as minus), etc.
+    # Keep it conservative: backslash doubling + hyphen prefix
+    printf '%s' "$1" \
+        | sed 's/\\/\\\\/g' \
+        | sed 's/-/\\-/g' \
+        | sed "s/'/\\\\'/g"
+}
+
+# ── Emit groff header ───────────────────────────────────────────────────
+
+today=$(date +%Y-%m-%d)
+
+exec > "$OUTPUT_FILE"
+
+cat <<EOF
+.\" ${tool_name}(1) — auto-generated from help registry
+.\" Source: ${TOOL}
+.\" Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+.\" DO NOT EDIT — regenerate via \`make man\` or \`scripts/registry-to-man\`.
+.TH "$(printf '%s' "$tool_name" | tr '[:lower:]' '[:upper:]')" "1" "${today}" "${tool_name} ${tool_version}" "lamboot-tools"
+.SH NAME
+${tool_name} \\- part of the lamboot-tools suite
+.SH SYNOPSIS
+.B ${tool_name}
+[\\fIGLOBAL FLAGS\\fR] [\\fISUBCOMMAND\\fR] [\\fIARGS\\fR]
+.SH DESCRIPTION
+${tool_name} is part of
+.BR lamboot-tools (7),
+"The Linux UEFI boot toolkit." See that page for suite-level conventions
+and cross-tool composition.
+.PP
+This page documents every subcommand registered in ${tool_name}'s help
+registry. Every subcommand is also accessible via
+.BI "${tool_name} help " SUBCOMMAND
+at runtime.
+.SH SUBCOMMANDS
+EOF
+
+# ── Emit each subcommand ────────────────────────────────────────────────
+
+# Registry records are separated by newlines; fields by 0x1F.
+# Field order per lib/lamboot-toolkit-help.sh:
+#   1=name 2=aliases 3=category 4=summary 5=syntax 6=args
+#   7=examples 8=notes 9=offline 10=root 11=see_also 12=doc_url 13=maturity
+
+while IFS= read -r record; do
+    [[ -z "$record" ]] && continue
+
+    # Split on ASCII 0x1F
+    IFS=$'\x1f' read -r name aliases category summary syntax args \
+                       examples notes offline root see_also doc_url maturity \
+                       <<< "$record"
+
+    [[ -z "$name" ]] && continue
+
+    cat <<EOF
+.SS $(groff_escape "$name")
+EOF
+
+    # Aliases
+    if [[ -n "$aliases" ]]; then
+        cat <<EOF
+.B Aliases:
+$(groff_escape "$aliases")
+.PP
+EOF
+    fi
+
+    # Summary (italicized)
+    cat <<EOF
+.PP
+.I $(groff_escape "$summary")
+.PP
+EOF
+
+    # Category + maturity
+    cat <<EOF
+.B Category:
+$(groff_escape "$category")
+.br
+.B Maturity:
+$(groff_escape "$maturity")
+.PP
+EOF
+
+    # SYNTAX
+    cat <<EOF
+.B SYNTAX
+.PP
+.RS 4
+.nf
+$(groff_escape "$syntax")
+.fi
+.RE
+.PP
+EOF
+
+    # ARGUMENTS (pipe-separated "name:desc" pairs)
+    if [[ -n "$args" ]]; then
+        cat <<'EOF'
+.B ARGUMENTS
+.PP
+.RS 4
+EOF
+        IFS='|' read -ra arg_arr <<< "$args"
+        for a in "${arg_arr[@]}"; do
+            local_name="${a%%:*}"
+            local_desc="${a#*:}"
+            cat <<EOF
+.TP
+.B $(groff_escape "$local_name")
+$(groff_escape "$local_desc")
+EOF
+        done
+        cat <<'EOF'
+.RE
+.PP
+EOF
+    fi
+
+    # EXAMPLES (double-pipe-separated)
+    if [[ -n "$examples" ]]; then
+        cat <<'EOF'
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+EOF
+        IFS='||' read -ra ex_arr <<< "$examples"
+        for ex in "${ex_arr[@]}"; do
+            [[ -z "$ex" ]] && continue
+            printf '%s\n' "$(groff_escape "$ex")"
+        done
+        cat <<'EOF'
+.fi
+.RE
+.PP
+EOF
+    fi
+
+    # NOTES
+    if [[ -n "$notes" ]]; then
+        cat <<EOF
+.B NOTES
+.PP
+.RS 4
+$(groff_escape "$notes")
+.RE
+.PP
+EOF
+    fi
+
+    # Modes: OFFLINE / PRIVILEGE
+    local_offline_txt="No \\- requires online system"
+    [[ "$offline" == "true" ]] && local_offline_txt="Yes \\- supports \\fB\\-\\-offline\\fR \\fIDISK\\fR"
+    local_root_txt="Runs unprivileged"
+    [[ "$root" == "true" ]] && local_root_txt="Requires root (sudo)"
+
+    cat <<EOF
+.B OFFLINE:
+${local_offline_txt}
+.br
+.B PRIVILEGE:
+${local_root_txt}
+.PP
+EOF
+
+    # SEE ALSO
+    if [[ -n "$see_also" ]]; then
+        cat <<EOF
+.B SEE ALSO
+.PP
+.RS 4
+$(groff_escape "$see_also")
+.RE
+.PP
+EOF
+    fi
+
+    # DOCUMENTATION URL
+    if [[ -n "$doc_url" ]]; then
+        cat <<EOF
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR $(printf '%s' "$doc_url")
+.UE
+.RE
+.PP
+EOF
+    fi
+
+done <<< "$registry"
+
+# ── Emit global flags section ───────────────────────────────────────────
+
+cat <<EOF
+.SH GLOBAL FLAGS
+Every subcommand accepts these universal flags (documented in
+.BR lamboot-tools (7)):
+.TP
+.BR \\-\\-help ", " \\-h
+Show inline help
+.TP
+.B \\-\\-version
+Print tool and toolkit version
+.TP
+.B \\-\\-json
+Emit unified JSON output (schema v1)
+.TP
+.B \\-\\-json-schema
+Print the JSON schema this tool emits
+.TP
+.BR \\-\\-verbose ", " \\-v
+Informational output beyond the default
+.TP
+.BR \\-\\-quiet ", " \\-q
+Only warnings and errors
+.TP
+.B \\-\\-no-color
+Disable ANSI color (auto on non-TTY)
+.TP
+.B \\-\\-dry-run
+Print planned actions without executing
+.TP
+.BR \\-\\-yes ", " \\-y
+Answer yes to interactive prompts
+.TP
+.B \\-\\-force
+Skip safety checks (per-subcommand semantics)
+.TP
+.B \\-\\-auto
+Non-interactive full automation (implies \\fB\\-\\-yes\\fR)
+.TP
+.BI \\-\\-offline " DISK"
+Operate on an unmounted disk or image
+.TP
+.B \\-\\-suggest-next-command
+Print the recommended follow-up command
+.SH EXIT STATUS
+.TP
+.B 0
+Success
+.TP
+.B 1
+Fatal error
+.TP
+.B 2
+Partial \\- some operations succeeded, some failed
+.TP
+.B 3
+Nothing to do (already in requested state)
+.TP
+.B 4
+Refused due to a safety check
+.TP
+.B 5
+User declined interactive confirmation
+.TP
+.B 6
+Operation does not apply to this system
+.TP
+.B 7
+Required tool or capability is missing
+.SH FILES
+.TP
+.I /usr/lib/lamboot-tools/lamboot-toolkit-lib.sh
+Shared library sourced by every tool
+.TP
+.I /usr/lib/lamboot-tools/lamboot-toolkit-help.sh
+Help registry driver
+.TP
+.I /var/backups/lamboot-*-<timestamp>/
+Per-run backup directory (when a tool mutates state)
+.SH ENVIRONMENT
+.TP
+.B LAMBOOT_LIB_DIR
+Override shared library directory (default:
+.IR /usr/lib/lamboot-tools ).
+.TP
+.B NO_COLOR
+When set (to any value), disables ANSI color (freedesktop convention).
+.SH SEE ALSO
+.BR lamboot-tools (7),
+.BR lamboot-toolkit (1),
+.BR lamboot-diagnose (1),
+.BR lamboot-esp (1),
+.BR lamboot-backup (1),
+.BR lamboot-repair (1),
+.BR lamboot-migrate (1),
+.BR lamboot-doctor (1),
+.BR lamboot-uki-build (1),
+.BR lamboot-signing-keys (1)
+.PP
+Full documentation at
+.UR https://lamboot.dev/tools/
+.UE
+.SH AUTHORS
+The lamboot-tools suite is developed by
+.B Lamco Development LLC
+(https://lamco.io). Source:
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.SH LICENSE
+MIT OR Apache-2.0
+EOF
+
+exit 0

@@ -20,11 +20,11 @@ publish = false
 
 [dependencies]
 # SDS-3 PR-2: the pe_loader_pure module we verbatim-include via #[path]
-# imports goblin + sha2. Version-pin MUST match lamboot-core/Cargo.toml
-# so the `#[path]`-included module compiles against the same versions
-# as production. Upgrade procedure: bump both Cargo.toml files in lockstep.
-goblin = { version = "=0.10.5", default-features = false, features = ["pe64", "endian_fd"] }
-sha2 = { version = "=0.10.8", default-features = false }
+# imports sha2. Version-pin MUST match lamboot-core/Cargo.toml so the
+# `#[path]`-included module compiles against the same version as
+# production. (goblin was removed in the v0.16.x fix — the PE loader now
+# hand-rolls its header read, so the test crate needs no PE parser either.)
+sha2 = { version = "=0.10.9", default-features = false }
 # SDS-4 PR-4: trust_log_pure uses log::info! in TrustLog::record(). Same
 # workspace version as lamboot-core.
 log.workspace = true
